@@ -1,6 +1,7 @@
 // src/pkg/package_manager.cpp
 #include <pingdart/pkg/package_manager.h>
 #include <pingdart/pkg/archive.h>
+#include <pingdart/pkg/security_scanner.h>
 #include <fstream>
 #include <sstream>
 #include <iostream>
@@ -164,6 +165,14 @@ core::Status PackageManager::publish() {
 
     auto pack_res = ArchiveUtil::pack_package_directory(project_root_);
     if (!pack_res.has_value()) return pack_res.status();
+
+    // PKG-109: Pre-flight client security scan before network submission
+    SecurityScanner scanner;
+    auto scan = scanner.scan_archive_payload(pack_res.value(), &m_res.value());
+    if (!scan.is_clean) {
+        return core::Status(core::StatusCode::PermissionDenied,
+                            "Pre-flight security scan failed: " + scan.findings.front().description);
+    }
 
     return registry_->publish_package(m_res.value(), pack_res.value(), token_res.value());
 }

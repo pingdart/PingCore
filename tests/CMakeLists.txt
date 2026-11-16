@@ -428,4 +428,26 @@ if(TARGET gtest_main)
         GTest::gtest_main
     )
     add_test(NAME PackageManagerGoogleTest COMMAND test_pkg_manager)
+
+    # PKG-108: Public Registry API and Developer Portal Tests
+    add_executable(test_pkg_registry_api
+        pkg/test_pkg_registry_api.cpp
+    )
+    target_link_libraries(test_pkg_registry_api PRIVATE
+        PingDart::PKG
+        PingDart::Core
+        GTest::gtest_main
+    )
+    add_test(NAME PkgRegistryApiGoogleTest COMMAND test_pkg_registry_api)
+
+    # PKG-109: Package Scanning, Advisories and Publisher Security Tests
+    add_executable(test_pkg_security_scanner
+        pkg/test_pkg_security_scanner.cpp
+    )
+    target_link_libraries(test_pkg_security_scanner PRIVATE
+        PingDart::PKG
+        PingDart::Core
+        GTest::gtest_main
+    )
+    add_test(NAME PkgSecurityScannerGoogleTest COMMAND test_pkg_security_scanner)
 endif()

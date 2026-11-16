@@ -260,3 +260,159 @@ TEST(PackageManagerGoogleTest, CreateReusableLibraryScaffold) {
     EXPECT_TRUE(std::filesystem::exists(lib_dir / "src" / "pingdart_charts.cpp", ec));
     EXPECT_TRUE(std::filesystem::exists(lib_dir / "tests" / "pingdart_charts_test.cpp", ec));
 }
+
+// ============================================================================
+// PKG-103: SemVer 2.0.0 Pre-release Precedence & Constraints
+// ============================================================================
+
+TEST(PackageManagerGoogleTest, SemVerPreReleasePrecedenceAndConstraintFiltering) {
+    auto v_alpha = SemVersion::parse("1.0.0-alpha").value();
+    auto v_alpha1 = SemVersion::parse("1.0.0-alpha.1").value();
+    auto v_beta = SemVersion::parse("1.0.0-beta").value();
+    auto v_rc1 = SemVersion::parse("1.0.0-rc.1").value();
+    auto v_norm = SemVersion::parse("1.0.0").value();
+
+    EXPECT_TRUE(v_alpha < v_alpha1);
+    EXPECT_TRUE(v_alpha1 < v_beta);
+    EXPECT_TRUE(v_beta < v_rc1);
+    EXPECT_TRUE(v_rc1 < v_norm);
+    EXPECT_TRUE(v_norm > v_rc1);
+
+    // Standard constraints must NOT match pre-releases without explicit pre-release tag
+    auto c_caret = VersionConstraint::parse("^1.0.0").value();
+    EXPECT_FALSE(c_caret.is_satisfied_by(v_rc1));
+    EXPECT_TRUE(c_caret.is_satisfied_by(v_norm));
+
+    auto c_any = VersionConstraint::parse("*").value();
+    EXPECT_FALSE(c_any.is_satisfied_by(v_rc1));
+    EXPECT_TRUE(c_any.is_satisfied_by(v_norm));
+}
+
+// ============================================================================
+// PKG-103: Transitive Dependencies, Cycle & Conflict Detection
+// ============================================================================
+
+class MockGraphRegistryBackend : public IRegistryBackend {
+public:
+    core::Result<std::vector<PackageInfo>> search(std::string_view) override { return std::vector<PackageInfo>{}; }
+    core::Result<PackageInfo> get_package(std::string_view name) override {
+        auto it = packages_.find(std::string(name));
+        if (it == packages_.end()) return core::Status(core::StatusCode::NotFound, "Not found");
+        return it->second;
+    }
+    core::Result<PackageVersionInfo> get_version_info(std::string_view name, const SemVersion& v) override {
+        auto pkg = get_package(name);
+        if (!pkg.has_value()) return pkg.status();
+        for (const auto& ver : pkg.value().versions) {
+            if (ver.version == v) return ver;
+        }
+        return core::Status(core::StatusCode::NotFound, "Version not found");
+    }
+    core::Result<std::vector<uint8_t>> download_archive(std::string_view, const SemVersion&) override {
+        return std::vector<uint8_t>{};
+    }
+    core::Status publish_package(const PackageManifest&, const std::vector<uint8_t>&, std::string_view) override {
+        return core::Status{};
+    }
+    core::Result<std::vector<SecurityAdvisory>> get_security_advisories() override {
+        return std::vector<SecurityAdvisory>{};
+    }
+
+    void add_pkg(const std::string& name, const SemVersion& version, const std::map<std::string, std::string>& deps) {
+        PackageVersionInfo v_info{
+            .version = version,
+            .dependencies = deps
+        };
+        packages_[name].name = name;
+        packages_[name].latest_version = version;
+        packages_[name].versions.push_back(v_info);
+    }
+
+private:
+    std::map<std::string, PackageInfo> packages_;
+};
+
+TEST(PackageManagerGoogleTest, TransitiveDependencyResolution) {
+    auto backend = std::make_shared<MockGraphRegistryBackend>();
+    // A -> B (^1.0.0) -> C (^2.0.0)
+    backend->add_pkg("lib-c", SemVersion{2, 1, 0, ""}, {});
+    backend->add_pkg("lib-b", SemVersion{1, 2, 0, ""}, {{"lib-c", "^2.0.0"}});
+    backend->add_pkg("lib-a", SemVersion{1, 0, 0, ""}, {{"lib-b", "^1.0.0"}});
+
+    RegistryClient client(backend);
+    PackageManifest root;
+    root.add_dependency("lib-a", "^1.0.0");
+
+    DependencyResolver resolver;
+    auto res = resolver.resolve(root, client);
+    ASSERT_TRUE(res.has_value());
+
+    const auto& pkgs = res.value().packages;
+    EXPECT_EQ(pkgs.size(), 3u); // lib-a, lib-b, and transitive lib-c
+    EXPECT_EQ(pkgs[0].name, "lib-a");
+    EXPECT_EQ(pkgs[1].name, "lib-b");
+    EXPECT_EQ(pkgs[2].name, "lib-c");
+}
+
+TEST(PackageManagerGoogleTest, DependencyCycleDetection) {
+    auto backend = std::make_shared<MockGraphRegistryBackend>();
+    // Cycle: X -> Y -> X
+    backend->add_pkg("pkg-x", SemVersion{1, 0, 0, ""}, {{"pkg-y", "^1.0.0"}});
+    backend->add_pkg("pkg-y", SemVersion{1, 0, 0, ""}, {{"pkg-x", "^1.0.0"}});
+
+    RegistryClient client(backend);
+    PackageManifest root;
+    root.add_dependency("pkg-x", "^1.0.0");
+
+    DependencyResolver resolver;
+    auto res = resolver.resolve(root, client);
+    EXPECT_FALSE(res.has_value());
+    EXPECT_NE(res.status().message().find("Circular dependency"), std::string::npos);
+}
+
+TEST(PackageManagerGoogleTest, DependencyVersionConflictDetection) {
+    auto backend = std::make_shared<MockGraphRegistryBackend>();
+    backend->add_pkg("common-lib", SemVersion{1, 5, 0, ""}, {});
+    backend->add_pkg("common-lib", SemVersion{2, 0, 0, ""}, {});
+    backend->add_pkg("pkg-1", SemVersion{1, 0, 0, ""}, {{"common-lib", "^1.0.0"}});
+    backend->add_pkg("pkg-2", SemVersion{1, 0, 0, ""}, {{"common-lib", "^2.0.0"}});
+
+    RegistryClient client(backend);
+    PackageManifest root;
+    root.add_dependency("pkg-1", "^1.0.0");
+    root.add_dependency("pkg-2", "^1.0.0");
+
+    DependencyResolver resolver;
+    auto res = resolver.resolve(root, client);
+    EXPECT_FALSE(res.has_value());
+    EXPECT_NE(res.status().message().find("Dependency conflict"), std::string::npos);
+}
+
+// ============================================================================
+// PKG-106 / Audit Finding C: Path Traversal Zip-Slip Defense
+// ============================================================================
+
+TEST(PackageManagerGoogleTest, ArchiveZipSlipPathTraversalRejection) {
+    std::vector<uint8_t> malicious_archive;
+    uint32_t magic = 0x52414450; // PDAR
+    const uint8_t* m_ptr = reinterpret_cast<const uint8_t*>(&magic);
+    malicious_archive.insert(malicious_archive.end(), m_ptr, m_ptr + 4);
+
+    // Entry with path traversal: "../../system_leak.txt"
+    std::string bad_path = "../../system_leak.txt";
+    uint32_t path_len = static_cast<uint32_t>(bad_path.size());
+    const uint8_t* pl_ptr = reinterpret_cast<const uint8_t*>(&path_len);
+    malicious_archive.insert(malicious_archive.end(), pl_ptr, pl_ptr + 4);
+    malicious_archive.insert(malicious_archive.end(), bad_path.begin(), bad_path.end());
+
+    std::string payload = "evil payload";
+    uint64_t file_len = static_cast<uint64_t>(payload.size());
+    const uint8_t* fl_ptr = reinterpret_cast<const uint8_t*>(&file_len);
+    malicious_archive.insert(malicious_archive.end(), fl_ptr, fl_ptr + 8);
+    malicious_archive.insert(malicious_archive.end(), payload.begin(), payload.end());
+
+    std::filesystem::path dest = "build/test_unzip_safe";
+    auto status = ArchiveUtil::unpack_package_archive(malicious_archive, dest);
+    EXPECT_FALSE(status.ok());
+    EXPECT_NE(status.message().find("Path traversal"), std::string::npos);
+}
