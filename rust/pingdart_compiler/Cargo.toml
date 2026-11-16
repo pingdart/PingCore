@@ -1,0 +1,10 @@
+[package]
+name = "pingdart_compiler"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "pingdart_compiler"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]

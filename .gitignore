@@ -1,0 +1,16 @@
+# PingDartCore .gitignore
+build/
+build-*/
+dist/
+dist-*/
+.cache/
+compile_commands.json
+.DS_Store
+*.swp
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+rust/**/target/

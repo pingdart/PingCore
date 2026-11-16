@@ -1,0 +1,11 @@
+#!/bin/sh
+# PingDart CLI Launcher Wrapper
+DIR="$(cd "$(dirname "$0")" && pwd)"
+BIN="$DIR/build/tools/pd/pd"
+
+if [ ! -f "$BIN" ]; then
+    echo "PingDart CLI binary not found. Building with ninja..."
+    ninja -C "$DIR/build" pd || exit 1
+fi
+
+exec "$BIN" "$@"
