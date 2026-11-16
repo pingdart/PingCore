@@ -374,22 +374,32 @@ HttpResponse RegistryServer::handle_request(const HttpRequest& request) {
     // Parameterized API paths: /api/v1/packages/:name...
     if (path.starts_with("/api/v1/packages/")) {
         std::string sub = path.substr(17); // after "/api/v1/packages/"
-        size_t slash1 = sub.find('/');
+        size_t slash1 = std::string::npos;
+        if (sub.starts_with("@")) {
+            // Scoped package name has an embedded slash, e.g. @scope/name/1.0.0/download
+            size_t scope_slash = sub.find('/');
+            if (scope_slash != std::string::npos) {
+                slash1 = sub.find('/', scope_slash + 1);
+            }
+        } else {
+            slash1 = sub.find('/');
+        }
+
         if (slash1 == std::string::npos) {
-            return handle_api_package_detail(sub);
+            return handle_api_package_detail(request, sub);
         }
 
         std::string pkg_name = sub.substr(0, slash1);
         std::string rest = sub.substr(slash1 + 1);
         size_t slash2 = rest.find('/');
         if (slash2 == std::string::npos) {
-            return handle_api_version_detail(pkg_name, rest);
+            return handle_api_version_detail(request, pkg_name, rest);
         }
 
         std::string version_str = rest.substr(0, slash2);
         std::string action = rest.substr(slash2 + 1);
         if (action == "download") {
-            return handle_api_download(pkg_name, version_str);
+            return handle_api_download(request, pkg_name, version_str);
         }
     }
 
@@ -424,7 +434,37 @@ HttpResponse RegistryServer::handle_api_health() {
     return HttpResponse::json(200, ss.str());
 }
 
+bool RegistryServer::check_read_authorization(const HttpRequest& req, std::string_view pkg_name) const {
+    if (!is_package_private(pkg_name)) {
+        return true;
+    }
+    std::string token = req.get_header("Authorization");
+    if (token.starts_with("Bearer ")) {
+        token = token.substr(7);
+    } else {
+        token = req.get_header("X-PingDart-Token");
+    }
+    if (token.empty()) {
+        return false;
+    }
+    auto auth_res = publisher_security_.authenticate_token(token, "pkg:read");
+    if (auth_res.has_value()) return true;
+    auto pub_res = publisher_security_.authenticate_token(token, "pkg:publish");
+    return pub_res.has_value();
+}
+
 HttpResponse RegistryServer::handle_api_packages(const HttpRequest& req) {
+    if (is_private_registry_) {
+        std::string token = req.get_header("Authorization");
+        if (token.starts_with("Bearer ")) token = token.substr(7);
+        else token = req.get_header("X-PingDart-Token");
+
+        if (token.empty() || (!publisher_security_.authenticate_token(token, "pkg:read").has_value() &&
+                              !publisher_security_.authenticate_token(token, "pkg:publish").has_value())) {
+            return HttpResponse::error(401, "Authentication required to query private package registry catalog");
+        }
+    }
+
     std::string q = req.get_query("q");
     auto res = search(q);
     if (!res.has_value()) return HttpResponse::error(500, res.status().message());
@@ -444,7 +484,11 @@ HttpResponse RegistryServer::handle_api_packages(const HttpRequest& req) {
     return HttpResponse::json(200, ss.str());
 }
 
-HttpResponse RegistryServer::handle_api_package_detail(std::string_view pkg_name) {
+HttpResponse RegistryServer::handle_api_package_detail(const HttpRequest& req, std::string_view pkg_name) {
+    if (!check_read_authorization(req, pkg_name)) {
+        return HttpResponse::error(401, "Authentication required: package '" + std::string(pkg_name) + "' is private or registry requires credentials");
+    }
+
     auto res = get_package(pkg_name);
     if (!res.has_value()) return HttpResponse::error(404, "Package not found: " + std::string(pkg_name));
 
@@ -473,7 +517,11 @@ HttpResponse RegistryServer::handle_api_package_detail(std::string_view pkg_name
     return HttpResponse::json(200, ss.str());
 }
 
-HttpResponse RegistryServer::handle_api_version_detail(std::string_view pkg_name, std::string_view version_str) {
+HttpResponse RegistryServer::handle_api_version_detail(const HttpRequest& req, std::string_view pkg_name, std::string_view version_str) {
+    if (!check_read_authorization(req, pkg_name)) {
+        return HttpResponse::error(401, "Authentication required: package '" + std::string(pkg_name) + "' is private or registry requires credentials");
+    }
+
     auto v_res = SemVersion::parse(version_str);
     if (!v_res.has_value()) return HttpResponse::error(400, "Invalid SemVer version string");
 
@@ -491,7 +539,11 @@ HttpResponse RegistryServer::handle_api_version_detail(std::string_view pkg_name
     return HttpResponse::json(200, ss.str());
 }
 
-HttpResponse RegistryServer::handle_api_download(std::string_view pkg_name, std::string_view version_str) {
+HttpResponse RegistryServer::handle_api_download(const HttpRequest& req, std::string_view pkg_name, std::string_view version_str) {
+    if (!check_read_authorization(req, pkg_name)) {
+        return HttpResponse::error(401, "Authentication required: package '" + std::string(pkg_name) + "' is private or registry requires credentials");
+    }
+
     auto v_res = SemVersion::parse(version_str);
     if (!v_res.has_value()) return HttpResponse::error(400, "Invalid SemVer version");
 
@@ -752,6 +804,23 @@ core::Status RegistryServer::publish_package(
     }
 
     std::string hash = ArchiveUtil::compute_sha256(archive_data);
+    std::string storage_key = "cas://" + meta.name + "/" + meta.version.to_string() + ".pdar";
+
+    // 5. Persistent Storage & Relational Database Commit (PKG-111C/D)
+    if (storage_) {
+        auto st_res = storage_->put_archive(storage_key, archive_data);
+        if (!st_res.ok()) {
+            return st_res;
+        }
+    }
+
+    if (db_) {
+        auto db_res = db_->publish_package_version_tx(manifest, hash, storage_key, publisher);
+        if (!db_res.ok()) {
+            return db_res;
+        }
+    }
+
     PackageVersionInfo v_info{
         .version = meta.version,
         .description = meta.description,

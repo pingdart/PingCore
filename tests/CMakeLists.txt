@@ -461,4 +461,15 @@ if(TARGET gtest_main)
         GTest::gtest_main
     )
     add_test(NAME PkgScopedRegistriesGoogleTest COMMAND test_pkg_scoped_registries)
+
+    # PKG-111: Production Security & Staging Deployment Suite
+    add_executable(test_pkg_production_security
+        pkg/test_pkg_production_security.cpp
+    )
+    target_link_libraries(test_pkg_production_security PRIVATE
+        PingDart::PKG
+        PingDart::Core
+        GTest::gtest_main
+    )
+    add_test(NAME PkgProductionSecurityGoogleTest COMMAND test_pkg_production_security)
 endif()

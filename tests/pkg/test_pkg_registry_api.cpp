@@ -80,7 +80,7 @@ TEST(RegistryApiGoogleTest, ScopedTokenGenerationAndAuthentication) {
     };
     auto resp = server.handle_request(req);
     EXPECT_EQ(resp.status_code, 200);
-    EXPECT_NE(resp.body_as_string().find("\"token\": \"pd_tok_pingdart-team_"), std::string::npos);
+    EXPECT_NE(resp.body_as_string().find("\"token\": \"pd_live_"), std::string::npos);
 }
 
 TEST(RegistryApiGoogleTest, PublishingEnforcesAuthenticationAndOwnership) {

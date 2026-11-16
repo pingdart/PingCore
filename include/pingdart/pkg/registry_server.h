@@ -12,6 +12,8 @@
 #include <pingdart/pkg/manifest.h>
 #include <pingdart/pkg/registry_client.h>
 #include <pingdart/pkg/security_scanner.h>
+#include <pingdart/pkg/database.h>
+#include <pingdart/pkg/object_storage.h>
 
 namespace pingdart::pkg {
 
@@ -117,6 +119,27 @@ public:
     [[nodiscard]] size_t total_packages() const noexcept;
     [[nodiscard]] uint64_t total_downloads() const noexcept;
 
+    // PKG-111E: Server-side Private Registry & Scoped Package Access Control
+    void set_private_registry(bool is_private) noexcept { is_private_registry_ = is_private; }
+    [[nodiscard]] bool is_private_registry() const noexcept { return is_private_registry_; }
+
+    void set_package_visibility(std::string_view pkg_name, bool is_private) {
+        package_privacy_[std::string(pkg_name)] = is_private;
+    }
+    [[nodiscard]] bool is_package_private(std::string_view pkg_name) const {
+        if (is_private_registry_) return true;
+        if (pkg_name.starts_with("@")) return true;
+        auto it = package_privacy_.find(std::string(pkg_name));
+        return it != package_privacy_.end() && it->second;
+    }
+
+    // PKG-111C/D: Relational Database & Object Storage Integration
+    void set_persistent_database(std::shared_ptr<IPersistentPackageDatabase> db) { db_ = std::move(db); }
+    [[nodiscard]] std::shared_ptr<IPersistentPackageDatabase> persistent_database() const noexcept { return db_; }
+
+    void set_object_storage(std::shared_ptr<IObjectStorage> storage) { storage_ = std::move(storage); }
+    [[nodiscard]] std::shared_ptr<IObjectStorage> object_storage() const noexcept { return storage_; }
+
 private:
     std::map<std::string, PackageInfo> packages_;
     PublisherSecurity publisher_security_;
@@ -124,13 +147,20 @@ private:
     SecurityScanner scanner_;
     uint64_t total_downloads_{125430};
 
+    bool is_private_registry_{false};
+    std::map<std::string, bool> package_privacy_;
+    std::shared_ptr<IPersistentPackageDatabase> db_;
+    std::shared_ptr<IObjectStorage> storage_;
+
     void seed_ecosystem();
+
+    [[nodiscard]] bool check_read_authorization(const HttpRequest& req, std::string_view pkg_name) const;
 
     // Internal Route Handlers
     HttpResponse handle_api_packages(const HttpRequest& req);
-    HttpResponse handle_api_package_detail(std::string_view pkg_name);
-    HttpResponse handle_api_version_detail(std::string_view pkg_name, std::string_view version_str);
-    HttpResponse handle_api_download(std::string_view pkg_name, std::string_view version_str);
+    HttpResponse handle_api_package_detail(const HttpRequest& req, std::string_view pkg_name);
+    HttpResponse handle_api_version_detail(const HttpRequest& req, std::string_view pkg_name, std::string_view version_str);
+    HttpResponse handle_api_download(const HttpRequest& req, std::string_view pkg_name, std::string_view version_str);
     HttpResponse handle_api_publish(const HttpRequest& req);
     HttpResponse handle_api_auth_token(const HttpRequest& req);
     HttpResponse handle_api_advisories();

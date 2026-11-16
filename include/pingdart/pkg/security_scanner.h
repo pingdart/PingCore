@@ -137,6 +137,8 @@ struct TokenCreationResult {
     std::string plaintext_secret; // Returned ONCE to client
 };
 
+[[nodiscard]] std::string generate_csprng_token();
+
 struct SecurityAuditEntry {
     std::string timestamp;
     std::string actor;           // publisher username or system
@@ -145,6 +147,10 @@ struct SecurityAuditEntry {
     std::string version;
     std::string status;          // "success", "failed", "rejected", "denied"
     std::string details;
+    std::string prev_hash;       // Cryptographic tamper-detection hash chain
+    std::string entry_hash;
+
+    [[nodiscard]] std::string compute_hash() const;
 };
 
 class PublisherSecurity {
@@ -177,6 +183,7 @@ public:
     // Audit Logging
     void record_audit_event(SecurityAuditEntry entry);
     [[nodiscard]] std::vector<SecurityAuditEntry> get_audit_log(std::string_view package_name = "") const;
+    [[nodiscard]] bool verify_audit_log_integrity() const;
 
 private:
     struct PublisherRecord {

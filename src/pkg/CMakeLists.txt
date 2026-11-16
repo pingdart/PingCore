@@ -14,6 +14,9 @@ add_library(pingdart_pkg STATIC
     scoped_package.cpp
     multi_registry.cpp
     build_sandbox.cpp
+    os_sandbox.cpp
+    database.cpp
+    object_storage.cpp
 )
 
 target_include_directories(pingdart_pkg

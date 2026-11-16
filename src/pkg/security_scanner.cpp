@@ -8,8 +8,59 @@
 #include <cstring>
 #include <chrono>
 #include <iomanip>
+#include <random>
+
+#if defined(_WIN32)
+#include <windows.h>
+#include <bcrypt.h>
+#endif
 
 namespace pingdart::pkg {
+
+std::vector<uint8_t> generate_csprng_bytes(size_t num_bytes) {
+    std::vector<uint8_t> bytes(num_bytes);
+#if defined(_WIN32)
+    NTSTATUS status = BCryptGenRandom(
+        NULL,
+        bytes.data(),
+        static_cast<ULONG>(bytes.size()),
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG
+    );
+    if (BCRYPT_SUCCESS(status)) {
+        return bytes;
+    }
+#endif
+    std::ifstream urandom("/dev/urandom", std::ios::binary);
+    if (urandom.is_open()) {
+        urandom.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(num_bytes));
+        if (urandom.gcount() == static_cast<std::streamsize>(num_bytes)) {
+            return bytes;
+        }
+    }
+
+    std::random_device rd;
+    for (size_t i = 0; i < num_bytes; ++i) {
+        bytes[i] = static_cast<uint8_t>(rd() & 0xFF);
+    }
+    return bytes;
+}
+
+std::string generate_csprng_token() {
+    auto random_bytes = generate_csprng_bytes(32); // 256 bits of cryptographic entropy
+    std::ostringstream ss;
+    ss << "pd_live_";
+    for (uint8_t b : random_bytes) {
+        ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(b);
+    }
+    return ss.str();
+}
+
+std::string SecurityAuditEntry::compute_hash() const {
+    std::ostringstream ss;
+    ss << prev_hash << ":" << timestamp << ":" << actor << ":" << action
+       << ":" << package_name << ":" << version << ":" << status << ":" << details;
+    return ArchiveUtil::compute_string_sha256(ss.str());
+}
 
 std::string scan_severity_to_string(ScanSeverity sev) {
     switch (sev) {
@@ -468,16 +519,25 @@ core::Result<TokenCreationResult> PublisherSecurity::create_token(
         return core::Status(core::StatusCode::NotFound, "Publisher account not found: " + std::string(username));
     }
 
-    static uint64_t token_counter = 1000;
-    std::string secret = "pd_tok_" + std::string(username) + "_" + std::to_string(++token_counter) + "_sec987xyz";
+    // PKG-111A: 256 bits of cryptographically secure randomness via OS CSPRNG
+    std::string secret = generate_csprng_token();
     std::string hash = ArchiveUtil::compute_string_sha256(secret);
+
+    // Cryptographically random opaque token ID
+    auto id_bytes = generate_csprng_bytes(8);
+    std::ostringstream id_ss;
+    id_ss << "tok_";
+    for (uint8_t b : id_bytes) {
+        id_ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(b);
+    }
+    std::string token_id = id_ss.str();
 
     auto now = std::chrono::system_clock::now();
     uint64_t now_sec = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count());
     uint64_t expire_sec = now_sec + static_cast<uint64_t>(valid_days) * 86400ULL;
 
     PublishingToken tok{
-        .token_id = "tok_" + std::to_string(token_counter),
+        .token_id = token_id,
         .token_hash = hash,
         .publisher_username = std::string(username),
         .scopes = scopes,
@@ -625,7 +685,23 @@ core::Status PublisherSecurity::add_collaborator(
 }
 
 void PublisherSecurity::record_audit_event(SecurityAuditEntry entry) {
+    if (audit_log_.empty()) {
+        entry.prev_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+    } else {
+        entry.prev_hash = audit_log_.back().entry_hash;
+    }
+    entry.entry_hash = entry.compute_hash();
     audit_log_.push_back(std::move(entry));
+}
+
+bool PublisherSecurity::verify_audit_log_integrity() const {
+    std::string expected_prev = "0000000000000000000000000000000000000000000000000000000000000000";
+    for (const auto& entry : audit_log_) {
+        if (entry.prev_hash != expected_prev) return false;
+        if (entry.entry_hash != entry.compute_hash()) return false;
+        expected_prev = entry.entry_hash;
+    }
+    return true;
 }
 
 std::vector<SecurityAuditEntry> PublisherSecurity::get_audit_log(std::string_view package_name) const {
