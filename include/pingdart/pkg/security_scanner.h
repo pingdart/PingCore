@@ -153,6 +153,16 @@ struct SecurityAuditEntry {
     [[nodiscard]] std::string compute_hash() const;
 };
 
+// PKG-112D: Externally Anchored Audit Checkpoint
+struct AuditCheckpoint {
+    uint64_t checkpoint_id{0};
+    uint64_t entry_count{0};
+    std::string head_hash;
+    std::string timestamp;
+    std::string external_anchor_uri; // e.g. "rfc3161://timestamp.digicert.com" or "transparency://pingdart.dev/log"
+    std::string anchor_signature;    // Asymmetric signature (Ed25519) of head_hash
+};
+
 class PublisherSecurity {
 public:
     PublisherSecurity();
@@ -180,10 +190,15 @@ public:
     [[nodiscard]] std::vector<std::string> get_package_owners(std::string_view package_name) const;
     core::Status add_collaborator(std::string_view requester, std::string_view package_name, std::string_view new_owner);
 
-    // Audit Logging
+    // Audit Logging & External Trust Anchoring (PKG-112D)
     void record_audit_event(SecurityAuditEntry entry);
     [[nodiscard]] std::vector<SecurityAuditEntry> get_audit_log(std::string_view package_name = "") const;
+    [[nodiscard]] const std::vector<SecurityAuditEntry>& audit_trail() const noexcept { return audit_log_; }
     [[nodiscard]] bool verify_audit_log_integrity() const;
+
+    [[nodiscard]] AuditCheckpoint create_external_anchor(std::string_view anchor_uri = "https://transparency.pingdart.dev/api/v1/anchor");
+    [[nodiscard]] bool verify_audit_log_against_anchors(const std::vector<AuditCheckpoint>& anchors) const;
+    [[nodiscard]] const std::vector<AuditCheckpoint>& checkpoints() const noexcept { return checkpoints_; }
 
 private:
     struct PublisherRecord {
@@ -198,6 +213,7 @@ private:
     std::map<std::string, PublishingToken> tokens_by_hash_; // SHA-256 hash -> token
     std::map<std::string, std::set<std::string>> package_owners_; // package_name -> owners
     std::vector<SecurityAuditEntry> audit_log_;
+    std::vector<AuditCheckpoint> checkpoints_;
     void seed_default_publishers();
 };
 

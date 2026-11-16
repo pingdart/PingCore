@@ -448,37 +448,64 @@ bool RegistryServer::check_read_authorization(const HttpRequest& req, std::strin
         return false;
     }
     auto auth_res = publisher_security_.authenticate_token(token, "pkg:read");
-    if (auth_res.has_value()) return true;
-    auto pub_res = publisher_security_.authenticate_token(token, "pkg:publish");
-    return pub_res.has_value();
+    if (!auth_res.has_value()) {
+        auth_res = publisher_security_.authenticate_token(token, "pkg:publish");
+    }
+    if (!auth_res.has_value()) {
+        return false;
+    }
+
+    std::string user = auth_res.value();
+    // Enforce Organization & Team Access Control List (PKG-112C)
+    if (db_) {
+        return db_->can_access_package(user, pkg_name, "read");
+    }
+
+    return true;
 }
 
 HttpResponse RegistryServer::handle_api_packages(const HttpRequest& req) {
-    if (is_private_registry_) {
-        std::string token = req.get_header("Authorization");
-        if (token.starts_with("Bearer ")) token = token.substr(7);
-        else token = req.get_header("X-PingDart-Token");
+    std::string token = req.get_header("Authorization");
+    if (token.starts_with("Bearer ")) token = token.substr(7);
+    else token = req.get_header("X-PingDart-Token");
 
-        if (token.empty() || (!publisher_security_.authenticate_token(token, "pkg:read").has_value() &&
-                              !publisher_security_.authenticate_token(token, "pkg:publish").has_value())) {
-            return HttpResponse::error(401, "Authentication required to query private package registry catalog");
-        }
+    std::string requester;
+    if (!token.empty()) {
+        auto r = publisher_security_.authenticate_token(token, "pkg:read");
+        if (!r.has_value()) r = publisher_security_.authenticate_token(token, "pkg:publish");
+        if (r.has_value()) requester = r.value();
+    }
+
+    if (is_private_registry_ && requester.empty()) {
+        return HttpResponse::error(401, "Authentication required to query private package registry catalog");
     }
 
     std::string q = req.get_query("q");
-    auto res = search(q);
-    if (!res.has_value()) return HttpResponse::error(500, res.status().message());
+    std::vector<PackageInfo> results;
+
+    if (db_) {
+        auto db_res = db_->search_for_user(requester, q);
+        if (db_res.has_value()) {
+            results = db_res.value();
+        } else {
+            return HttpResponse::error(500, db_res.status().message());
+        }
+    } else {
+        auto res = search(q);
+        if (!res.has_value()) return HttpResponse::error(500, res.status().message());
+        results = res.value();
+    }
 
     std::ostringstream ss;
-    ss << "{\n  \"count\": " << res.value().size() << ",\n  \"packages\": [\n";
-    for (size_t i = 0; i < res.value().size(); ++i) {
-        const auto& p = res.value()[i];
+    ss << "{\n  \"count\": " << results.size() << ",\n  \"packages\": [\n";
+    for (size_t i = 0; i < results.size(); ++i) {
+        const auto& p = results[i];
         ss << "    {\n"
            << "      \"name\": \"" << p.name << "\",\n"
            << "      \"latest_version\": \"" << p.latest_version.to_string() << "\",\n"
            << "      \"description\": \"" << p.description << "\",\n"
            << "      \"license\": \"" << p.license << "\"\n"
-           << "    }" << (i + 1 < res.value().size() ? "," : "") << "\n";
+           << "    }" << (i + 1 < results.size() ? "," : "") << "\n";
     }
     ss << "  ]\n}";
     return HttpResponse::json(200, ss.str());
@@ -804,9 +831,9 @@ core::Status RegistryServer::publish_package(
     }
 
     std::string hash = ArchiveUtil::compute_sha256(archive_data);
-    std::string storage_key = "cas://" + meta.name + "/" + meta.version.to_string() + ".pdar";
+    std::string storage_key = "sha256:" + hash;
 
-    // 5. Persistent Storage & Relational Database Commit (PKG-111C/D)
+    // 5. Persistent Storage & Relational Database Commit (PKG-112B/C)
     if (storage_) {
         auto st_res = storage_->put_archive(storage_key, archive_data);
         if (!st_res.ok()) {

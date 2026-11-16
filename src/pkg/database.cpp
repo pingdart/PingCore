@@ -14,16 +14,19 @@ PostgresPackageDatabase::PostgresPackageDatabase(std::string connection_uri)
 void PostgresPackageDatabase::seed_default_records() {
     register_publisher("pingdart-team", "team@pingdart.dev", true);
     register_publisher("community-dev", "dev@pingdart.community", false);
+    register_organization("pingdart", "pingdart-team");
 
     // Initial package records
     DbPackageRecord charts{
         .id = "pkg_charts_001",
         .name = "pingdart-charts",
+        .organization = "pingdart",
         .description = "Cross-platform charting and visualization widgets",
         .license = "MIT",
         .is_private = false,
         .latest_version = SemVersion{1, 2, 0, ""},
-        .owner_publisher_ids = {"pingdart-team"}
+        .owner_publisher_ids = {"pingdart-team"},
+        .allowed_teams_or_publishers = {}
     };
     packages_["pingdart-charts"] = charts;
 
@@ -31,11 +34,86 @@ void PostgresPackageDatabase::seed_default_records() {
         .package_id = "pkg_charts_001",
         .version = SemVersion{1, 2, 0, ""},
         .checksum = "sha256:7b42b4d6ed48810c5362c265a17faebe90dc2373c885e5216439d37927f02926",
-        .storage_key = "s3://pingdart-registry-archives/pingdart-charts/1.2.0.pdar",
+        .storage_key = "sha256:7b42b4d6ed48810c5362c265a17faebe90dc2373c885e5216439d37927f02926",
         .dependencies = {{"pingdart-core", "^1.0.0"}},
         .platforms = PlatformMatrix{},
         .created_at = "2026-11-16T12:00:00Z"
     });
+}
+
+core::Status PostgresPackageDatabase::register_organization(std::string_view org_name, std::string_view admin_username) {
+    std::lock_guard<std::mutex> lock(db_mutex_);
+    std::string org(org_name);
+    if (organizations_.count(org) > 0) {
+        return core::Status(core::StatusCode::AlreadyExists, "Organization already registered: " + org);
+    }
+    organizations_[org] = DbOrganizationRecord{
+        .id = "org_" + org,
+        .name = org,
+        .member_usernames = {std::string(admin_username)},
+        .admin_usernames = {std::string(admin_username)}
+    };
+    return core::Status{};
+}
+
+core::Status PostgresPackageDatabase::add_org_member(std::string_view org_name, std::string_view requester, std::string_view new_member) {
+    std::lock_guard<std::mutex> lock(db_mutex_);
+    auto it = organizations_.find(std::string(org_name));
+    if (it == organizations_.end()) {
+        return core::Status(core::StatusCode::NotFound, "Organization not found: " + std::string(org_name));
+    }
+    if (it->second.admin_usernames.count(std::string(requester)) == 0) {
+        return core::Status(core::StatusCode::PermissionDenied, "Only organization administrators can add members");
+    }
+    it->second.member_usernames.insert(std::string(new_member));
+    return core::Status{};
+}
+
+bool PostgresPackageDatabase::is_org_member(std::string_view org_name, std::string_view username) const {
+    std::lock_guard<std::mutex> lock(db_mutex_);
+    auto it = organizations_.find(std::string(org_name));
+    if (it == organizations_.end()) return false;
+    return it->second.member_usernames.count(std::string(username)) > 0;
+}
+
+bool PostgresPackageDatabase::can_access_package(
+    std::string_view requester_username,
+    std::string_view package_name,
+    std::string_view action) const
+{
+    std::lock_guard<std::mutex> lock(db_mutex_);
+    std::string pkg_str(package_name);
+    std::string req(requester_username);
+
+    auto it = packages_.find(pkg_str);
+    if (it == packages_.end()) {
+        if (pkg_str.starts_with("@")) {
+            size_t slash = pkg_str.find('/');
+            if (slash != std::string::npos) {
+                std::string scope = pkg_str.substr(1, slash - 1);
+                auto org_it = organizations_.find(scope);
+                if (org_it != organizations_.end()) {
+                    return org_it->second.member_usernames.count(req) > 0;
+                }
+            }
+        }
+        return true;
+    }
+
+    const auto& p = it->second;
+    if (!p.is_private && action == "read") {
+        return true;
+    }
+
+    if (!p.organization.empty()) {
+        auto org_it = organizations_.find(p.organization);
+        if (org_it != organizations_.end()) {
+            return org_it->second.member_usernames.count(req) > 0;
+        }
+    }
+
+    return p.owner_publisher_ids.count(req) > 0 ||
+           p.allowed_teams_or_publishers.count(req) > 0;
 }
 
 void PostgresPackageDatabase::register_publisher(std::string_view username, std::string_view email, bool verified) {
@@ -73,6 +151,32 @@ core::Status PostgresPackageDatabase::publish_package_version_tx(
     auto pkg_it = packages_.find(meta.name);
 
     std::string package_id;
+    std::string org_scope;
+    bool is_scoped_private = false;
+
+    if (meta.name.starts_with("@")) {
+        size_t slash = meta.name.find('/');
+        if (slash != std::string::npos) {
+            org_scope = meta.name.substr(1, slash - 1);
+            is_scoped_private = true;
+            auto org_it = organizations_.find(org_scope);
+            if (org_it != organizations_.end()) {
+                if (org_it->second.member_usernames.count(publisher_id) == 0) {
+                    return core::Status(core::StatusCode::PermissionDenied,
+                        "Publisher '" + std::string(publisher_username) +
+                        "' is not an authorized member of organization '@" + org_scope + "'");
+                }
+            } else {
+                // Auto-register new organization with the claiming publisher as admin
+                organizations_[org_scope] = DbOrganizationRecord{
+                    .id = "org_" + org_scope,
+                    .name = org_scope,
+                    .member_usernames = {publisher_id},
+                    .admin_usernames = {publisher_id}
+                };
+            }
+        }
+    }
 
     // 2. Row Lock & Atomic Ownership (SELECT ... FOR UPDATE)
     if (pkg_it == packages_.end()) {
@@ -81,17 +185,27 @@ core::Status PostgresPackageDatabase::publish_package_version_tx(
         DbPackageRecord new_pkg{
             .id = package_id,
             .name = meta.name,
+            .organization = org_scope,
             .description = meta.description,
             .license = meta.license,
-            .is_private = false,
+            .is_private = is_scoped_private,
             .latest_version = meta.version,
-            .owner_publisher_ids = {publisher_id}
+            .owner_publisher_ids = {publisher_id},
+            .allowed_teams_or_publishers = {}
         };
         packages_[meta.name] = std::move(new_pkg);
     } else {
         package_id = pkg_it->second.id;
-        // Verify caller is in package_owners table
-        if (pkg_it->second.owner_publisher_ids.count(publisher_id) == 0) {
+        // Verify caller is in package_owners table or organization members
+        bool has_owner_perm = pkg_it->second.owner_publisher_ids.count(publisher_id) > 0;
+        if (!has_owner_perm && !pkg_it->second.organization.empty()) {
+            auto org_it = organizations_.find(pkg_it->second.organization);
+            if (org_it != organizations_.end() && org_it->second.member_usernames.count(publisher_id) > 0) {
+                has_owner_perm = true;
+            }
+        }
+
+        if (!has_owner_perm) {
             return core::Status(core::StatusCode::PermissionDenied,
                                 "Publisher '" + std::string(publisher_username) +
                                 "' is not an authorized owner of package '" + meta.name + "'");
@@ -184,12 +298,40 @@ core::Result<PackageVersionInfo> PostgresPackageDatabase::get_version(
 }
 
 core::Result<std::vector<PackageInfo>> PostgresPackageDatabase::search(std::string_view query) {
+    return search_for_user("", query);
+}
+
+core::Result<std::vector<PackageInfo>> PostgresPackageDatabase::search_for_user(
+    std::string_view requester_username,
+    std::string_view query)
+{
     std::lock_guard<std::mutex> lock(db_mutex_);
     std::vector<PackageInfo> results;
     std::string q(query);
     std::transform(q.begin(), q.end(), q.begin(), ::tolower);
 
     for (const auto& [name, p] : packages_) {
+        // Enforce Organization & Package ACLs on Search:
+        // Skip private packages unless the requester is authorized
+        if (p.is_private) {
+            bool has_access = false;
+            std::string req(requester_username);
+            if (!req.empty()) {
+                if (!p.organization.empty()) {
+                    auto org_it = organizations_.find(p.organization);
+                    if (org_it != organizations_.end() && org_it->second.member_usernames.count(req) > 0) {
+                        has_access = true;
+                    }
+                }
+                if (p.owner_publisher_ids.count(req) > 0 || p.allowed_teams_or_publishers.count(req) > 0) {
+                    has_access = true;
+                }
+            }
+            if (!has_access) {
+                continue; // Do NOT leak existence of another org's private package
+            }
+        }
+
         std::string n = name;
         std::transform(n.begin(), n.end(), n.begin(), ::tolower);
 
@@ -205,6 +347,54 @@ core::Result<std::vector<PackageInfo>> PostgresPackageDatabase::search(std::stri
         }
     }
     return results;
+}
+
+core::Status PostgresPackageDatabase::begin_transaction() {
+    std::lock_guard<std::mutex> lock(db_mutex_);
+    if (in_transaction_) {
+        return core::Status(core::StatusCode::FailedPrecondition, "Active transaction already in progress");
+    }
+    in_transaction_ = true;
+    tx_staged_versions_.clear();
+    tx_staged_packages_.clear();
+    return core::Status{};
+}
+
+core::Status PostgresPackageDatabase::commit_transaction() {
+    std::lock_guard<std::mutex> lock(db_mutex_);
+    if (!in_transaction_) {
+        return core::Status(core::StatusCode::FailedPrecondition, "No active transaction to commit");
+    }
+    for (auto& v : tx_staged_versions_) {
+        versions_.push_back(std::move(v));
+    }
+    for (auto& [name, p] : tx_staged_packages_) {
+        packages_[name] = std::move(p);
+    }
+    in_transaction_ = false;
+    tx_staged_versions_.clear();
+    tx_staged_packages_.clear();
+    return core::Status{};
+}
+
+core::Status PostgresPackageDatabase::rollback_transaction() {
+    std::lock_guard<std::mutex> lock(db_mutex_);
+    if (!in_transaction_) {
+        return core::Status(core::StatusCode::FailedPrecondition, "No active transaction to roll back");
+    }
+    tx_staged_versions_.clear();
+    tx_staged_packages_.clear();
+    in_transaction_ = false;
+    return core::Status{};
+}
+
+core::Status PostgresPackageDatabase::simulate_crash_and_recover() {
+    std::lock_guard<std::mutex> lock(db_mutex_);
+    // In a process crash / connection failure, uncommitted transactions are cleanly rolled back
+    tx_staged_versions_.clear();
+    tx_staged_packages_.clear();
+    in_transaction_ = false;
+    return core::Status{};
 }
 
 std::vector<std::string> PostgresPackageDatabase::get_owners(std::string_view package_name) {

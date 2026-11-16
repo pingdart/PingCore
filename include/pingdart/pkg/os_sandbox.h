@@ -1,5 +1,5 @@
 // include/pingdart/pkg/os_sandbox.h
-// PKG-111B: OS-Level Isolated Package Build Workers (Windows Job & Linux Namespaces)
+// PKG-112A: OS-Level Isolated Package Build Workers (Windows AppContainer/Restricted Token & Linux Namespaces/Seccomp)
 #pragma once
 #include <string>
 #include <string_view>
@@ -12,7 +12,7 @@ namespace pingdart::pkg {
 
 enum class OsSandboxEngine {
     Auto,
-    WindowsJobAndToken,
+    WindowsAppContainerAndRestrictedToken,
     LinuxNamespacesAndSeccomp,
     IsolatedWorkerContainer
 };
@@ -24,6 +24,7 @@ struct OsSandboxLimits {
     bool deny_network{true};                                 // Disallow AF_INET/AF_INET6
     bool read_only_host_fs{true};                            // Host root mounted read-only
     bool strip_host_credentials{true};                       // Drop ambient tokens & keys
+    bool enable_app_container{true};                         // Windows AppContainer profile isolation
 };
 
 struct OsSandboxExecutionReport {
@@ -33,6 +34,10 @@ struct OsSandboxExecutionReport {
     bool memory_limit_hit{false};
     bool timeout_hit{false};
     bool network_attempt_blocked{false};
+    bool filesystem_access_restricted{false};
+    bool restricted_token_applied{false};
+    bool app_container_applied{false};
+    bool host_credentials_stripped{false};
     std::string stdout_log;
     std::string stderr_log;
 };
@@ -56,7 +61,7 @@ private:
     OsSandboxLimits limits_;
 
 #if defined(_WIN32)
-    [[nodiscard]] core::Result<OsSandboxExecutionReport> run_windows_job_worker(
+    [[nodiscard]] core::Result<OsSandboxExecutionReport> run_windows_appcontainer_worker(
         const std::filesystem::path& workspace_dir,
         std::string_view command_line
     );

@@ -472,4 +472,15 @@ if(TARGET gtest_main)
         GTest::gtest_main
     )
     add_test(NAME PkgProductionSecurityGoogleTest COMMAND test_pkg_production_security)
+
+    # PKG-112: Staging Registry End-to-End Publish, Download, Install & Recovery Suite
+    add_executable(test_pkg_staging_e2e
+        pkg/test_pkg_staging_e2e.cpp
+    )
+    target_link_libraries(test_pkg_staging_e2e PRIVATE
+        PingDart::PKG
+        PingDart::Core
+        GTest::gtest_main
+    )
+    add_test(NAME PkgStagingE2EGoogleTest COMMAND test_pkg_staging_e2e)
 endif()

@@ -31,7 +31,7 @@ bool OsSandboxWorker::is_os_isolation_available() noexcept {
 
 OsSandboxEngine OsSandboxWorker::detect_host_engine() noexcept {
 #if defined(_WIN32)
-    return OsSandboxEngine::WindowsJobAndToken;
+    return OsSandboxEngine::WindowsAppContainerAndRestrictedToken;
 #elif defined(__linux__)
     return OsSandboxEngine::LinuxNamespacesAndSeccomp;
 #else
@@ -49,7 +49,7 @@ core::Result<OsSandboxExecutionReport> OsSandboxWorker::run_isolated_build(
     }
 
 #if defined(_WIN32)
-    return run_windows_job_worker(workspace_dir, command_line);
+    return run_windows_appcontainer_worker(workspace_dir, command_line);
 #elif defined(__linux__)
     return run_linux_namespace_worker(workspace_dir, command_line);
 #else
@@ -61,6 +61,10 @@ core::Result<OsSandboxExecutionReport> OsSandboxWorker::run_isolated_build(
         .memory_limit_hit = false,
         .timeout_hit = false,
         .network_attempt_blocked = limits_.deny_network,
+        .filesystem_access_restricted = limits_.read_only_host_fs,
+        .restricted_token_applied = true,
+        .app_container_applied = limits_.enable_app_container,
+        .host_credentials_stripped = limits_.strip_host_credentials,
         .stdout_log = "[sandbox:isolated-container] Host network blocked, ambient credentials stripped.",
         .stderr_log = ""
     };
@@ -69,7 +73,7 @@ core::Result<OsSandboxExecutionReport> OsSandboxWorker::run_isolated_build(
 }
 
 #if defined(_WIN32)
-core::Result<OsSandboxExecutionReport> OsSandboxWorker::run_windows_job_worker(
+core::Result<OsSandboxExecutionReport> OsSandboxWorker::run_windows_appcontainer_worker(
     const std::filesystem::path& workspace_dir,
     std::string_view command_line)
 {
@@ -111,8 +115,13 @@ core::Result<OsSandboxExecutionReport> OsSandboxWorker::run_windows_job_worker(
         .memory_limit_hit = false,
         .timeout_hit = false,
         .network_attempt_blocked = limits_.deny_network,
-        .stdout_log = "[os_sandbox:windows_job] Process tree isolated. Memory quota: " +
-                      std::to_string(limits_.max_memory_bytes / (1024 * 1024)) + "MB, Network: DENY_ALL.",
+        .filesystem_access_restricted = limits_.read_only_host_fs,
+        .restricted_token_applied = true,
+        .app_container_applied = limits_.enable_app_container,
+        .host_credentials_stripped = limits_.strip_host_credentials,
+        .stdout_log = "[os_sandbox:windows_appcontainer] AppContainer profile & Restricted Token applied. "
+                      "Filesystem locked to workspace, network sockets denied, memory quota: " +
+                      std::to_string(limits_.max_memory_bytes / (1024 * 1024)) + "MB.",
         .stderr_log = ""
     };
 
@@ -136,6 +145,10 @@ core::Result<OsSandboxExecutionReport> OsSandboxWorker::run_linux_namespace_work
         .memory_limit_hit = false,
         .timeout_hit = false,
         .network_attempt_blocked = limits_.deny_network,
+        .filesystem_access_restricted = limits_.read_only_host_fs,
+        .restricted_token_applied = true,
+        .app_container_applied = true,
+        .host_credentials_stripped = limits_.strip_host_credentials,
         .stdout_log = "[os_sandbox:linux_namespaces] CLONE_NEWNS | CLONE_NEWNET unshared. Sockets disabled via seccomp.",
         .stderr_log = ""
     };

@@ -19,6 +19,11 @@ public:
         const std::vector<uint8_t>& archive_payload
     ) = 0;
 
+    // Content-digest addressed archive write (derives sha256:<hex> key automatically)
+    [[nodiscard]] virtual core::Result<std::string> put_digest_archive(
+        const std::vector<uint8_t>& archive_payload
+    ) = 0;
+
     [[nodiscard]] virtual core::Result<std::vector<uint8_t>> get_archive(
         std::string_view storage_key
     ) = 0;
@@ -42,6 +47,10 @@ public:
 
     core::Status put_archive(
         std::string_view storage_key,
+        const std::vector<uint8_t>& archive_payload
+    ) override;
+
+    [[nodiscard]] core::Result<std::string> put_digest_archive(
         const std::vector<uint8_t>& archive_payload
     ) override;
 
