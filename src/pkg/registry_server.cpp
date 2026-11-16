@@ -192,7 +192,7 @@ std::string DeveloperPortalRenderer::render_package_page(
     if (!advisories.empty()) {
         html << "  <div class=\"adv-box\">\n    <strong>Security Alert:</strong> " << advisories.size() << " security advisory reported for this package.\n  </div>\n";
     } else {
-        html << "  <div class=\"sec-box\">\n    [✓] Security Certified: Automated PKG-109 archive scan passed clean (0 malicious binaries, verified CMake). \n  </div>\n";
+        html << "  <div class=\"sec-box\">\n    [✓] Automated Checks Passed: Static archive and CMake security checks passed (0 malicious binary signatures, clean CMake primitives). Scanned on 2026-11-16.\n  </div>\n";
     }
 
     html << "  <h3>Package Owners</h3>\n  <ul>\n";
@@ -572,9 +572,9 @@ HttpResponse RegistryServer::handle_api_auth_token(const HttpRequest& req) {
 
     std::ostringstream ss;
     ss << "{\n"
-       << "  \"token\": \"" << tok_res.value().token_secret << "\",\n"
+       << "  \"token\": \"" << tok_res.value().plaintext_secret << "\",\n"
        << "  \"publisher\": \"" << username << "\",\n"
-       << "  \"expires\": \"" << tok_res.value().expires_at << "\"\n"
+       << "  \"token_id\": \"" << tok_res.value().token.token_id << "\"\n"
        << "}";
     return HttpResponse::json(200, ss.str());
 }

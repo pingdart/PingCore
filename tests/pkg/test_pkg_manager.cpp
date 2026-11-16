@@ -416,3 +416,55 @@ TEST(PackageManagerGoogleTest, ArchiveZipSlipPathTraversalRejection) {
     EXPECT_FALSE(status.ok());
     EXPECT_NE(status.message().find("Path traversal"), std::string::npos);
 }
+
+TEST(PackageManagerGoogleTest, ArchivePrefixEscapeVulnerabilityRejection) {
+    // Audit Finding A: Destination beginning with /app-evil should NOT pass containment of /app
+    std::filesystem::path target = "build/test_sandbox_app";
+    std::error_code ec;
+    std::filesystem::create_directories(target, ec);
+
+    std::vector<uint8_t> payload_archive;
+    uint32_t magic = 0x52414450;
+    const uint8_t* m_ptr = reinterpret_cast<const uint8_t*>(&magic);
+    payload_archive.insert(payload_archive.end(), m_ptr, m_ptr + 4);
+
+    // Prefix exploit attempt
+    std::string prefix_attack = "../test_sandbox_app_evil/hack.txt";
+    uint32_t path_len = static_cast<uint32_t>(prefix_attack.size());
+    const uint8_t* pl_ptr = reinterpret_cast<const uint8_t*>(&path_len);
+    payload_archive.insert(payload_archive.end(), pl_ptr, pl_ptr + 4);
+    payload_archive.insert(payload_archive.end(), prefix_attack.begin(), prefix_attack.end());
+
+    std::string payload = "malicious content";
+    uint64_t file_len = static_cast<uint64_t>(payload.size());
+    const uint8_t* fl_ptr = reinterpret_cast<const uint8_t*>(&file_len);
+    payload_archive.insert(payload_archive.end(), fl_ptr, fl_ptr + 8);
+    payload_archive.insert(payload_archive.end(), payload.begin(), payload.end());
+
+    auto status = ArchiveUtil::unpack_package_archive(payload_archive, target);
+    EXPECT_FALSE(status.ok());
+    EXPECT_FALSE(std::filesystem::exists("build/test_sandbox_app_evil/hack.txt", ec));
+}
+
+TEST(PackageManagerGoogleTest, SimultaneousPublicationOfIdenticalVersions) {
+    // Production Readiness Gate: Concurrent / duplicate publication test
+    RegistryServer server;
+    auto tok_res = server.publisher_security().create_token("pingdart-team", {"pkg:publish"});
+    ASSERT_TRUE(tok_res.has_value());
+
+    PackageManifest manifest;
+    manifest.metadata().name = "pingdart-concurrency-test";
+    manifest.metadata().version = SemVersion{1, 0, 0, ""};
+
+    std::vector<uint8_t> dummy_archive = {0x50, 0x44, 0x41, 0x52, 0x00, 0x00, 0x00, 0x00}; // valid magic + empty
+
+    // First publish succeeds
+    auto s1 = server.publish_package(manifest, dummy_archive, tok_res.value().plaintext_secret);
+    EXPECT_TRUE(s1.ok());
+
+    // Second publish of identical version fails atomically with AlreadyExists
+    auto s2 = server.publish_package(manifest, dummy_archive, tok_res.value().plaintext_secret);
+    EXPECT_FALSE(s2.ok());
+    EXPECT_EQ(s2.code(), core::StatusCode::AlreadyExists);
+    EXPECT_NE(s2.message().find("immutable"), std::string::npos);
+}

@@ -450,4 +450,15 @@ if(TARGET gtest_main)
         GTest::gtest_main
     )
     add_test(NAME PkgSecurityScannerGoogleTest COMMAND test_pkg_security_scanner)
+
+    # PKG-110: Private Registries, Scoped Packages & Isolated Sandbox Tests
+    add_executable(test_pkg_scoped_registries
+        pkg/test_pkg_scoped_registries.cpp
+    )
+    target_link_libraries(test_pkg_scoped_registries PRIVATE
+        PingDart::PKG
+        PingDart::Core
+        GTest::gtest_main
+    )
+    add_test(NAME PkgScopedRegistriesGoogleTest COMMAND test_pkg_scoped_registries)
 endif()

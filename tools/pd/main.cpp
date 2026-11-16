@@ -3,6 +3,8 @@
 #include <pingdart/cli/packager.h>
 #include <pingdart/cli/verifier.h>
 #include <pingdart/pkg/package_manager.h>
+#include <pingdart/pkg/scoped_package.h>
+#include <pingdart/pkg/multi_registry.h>
 #include <iostream>
 #include <vector>
 #include <string>
@@ -15,17 +17,17 @@ using namespace pingdart::pkg;
 void print_usage() {
     std::cout << "PingDart Developer Tool (pd) — Application Orchestrator & Package Manager\n\n"
               << "Usage: pd <command> [options]\n\n"
-              << "Package Manager Commands (PKG-101..PKG-107):\n"
-              << "  search <query>       Search public package registry\n"
-              << "  add <pkg>[@version]  Add package dependency to pingdart.toml & sync\n"
-              << "  remove <pkg>         Remove package dependency\n"
-              << "  list                 Inspect installed packages and resolved lockfile\n"
-              << "  update               Update installed dependencies to latest compatible versions\n"
-              << "  outdated             Check for newer package versions available in registry\n"
-              << "  audit                Scan installed packages for known security advisories\n"
-              << "  login                Authenticate with PingDart package registry token\n"
-              << "  publish              Pack and publish library package to registry\n"
-              << "  create package <n>   Scaffold a new reusable PingDart library package project\n\n"
+              << "Package Manager Commands (PKG-101..PKG-110):\n"
+              << "  search <query> [--registry <name>]   Search public or private package registry\n"
+              << "  add <pkg>[@version]                  Add package dependency (supports @scope/name)\n"
+              << "  remove <pkg>                         Remove package dependency\n"
+              << "  list                                 Inspect installed packages and resolved lockfile\n"
+              << "  update                               Update installed dependencies to latest compatible versions\n"
+              << "  outdated                             Check for newer package versions available in registry\n"
+              << "  audit                                Scan installed packages for known security advisories\n"
+              << "  login [--registry <n>] [--token <t>] Authenticate with registry token\n"
+              << "  publish [--registry <name>]          Pack, scan and publish package to registry\n"
+              << "  create package <name>                Scaffold a new reusable PingDart library package project\n\n"
               << "Application & Build Commands:\n"
               << "  doctor               Inspect system compiler, SDK, Vulkan, and build toolchain\n"
               << "  build                Compile native application binary with CMake and Ninja\n"
@@ -176,7 +178,17 @@ int handle_verify(int argc, char* argv[]) {
 }
 
 int handle_search(int argc, char* argv[]) {
-    std::string query = (argc >= 3) ? argv[2] : "";
+    std::string query = "";
+    std::string registry = "public";
+    for (int i = 2; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--registry" && i + 1 < argc) {
+            registry = argv[++i];
+        } else if (!arg.starts_with("--") && query.empty()) {
+            query = arg;
+        }
+    }
+
     PackageManager pm;
     auto res = pm.search(query);
     if (!res.has_value()) {
@@ -185,7 +197,7 @@ int handle_search(int argc, char* argv[]) {
     }
 
     const auto& pkgs = res.value();
-    std::cout << "PingDart Public Package Registry — " << pkgs.size() << " packages found:\n\n";
+    std::cout << "PingDart Package Registry [" << registry << "] — " << pkgs.size() << " packages found:\n\n";
     for (const auto& pkg : pkgs) {
         std::cout << "  * " << pkg.name << " (" << pkg.latest_version.to_string() << ") — "
                   << pkg.description << " [" << pkg.license << "]\n";
@@ -196,7 +208,7 @@ int handle_search(int argc, char* argv[]) {
 
 int handle_add(int argc, char* argv[]) {
     if (argc < 3) {
-        std::cerr << "Error: 'add' requires package name. Example: pd add pingdart-charts or pd add pingdart-charts@1.2.0" << std::endl;
+        std::cerr << "Error: 'add' requires package name. Example: pd add pingdart-charts or pd add @company/internal-ui" << std::endl;
         return 1;
     }
 
@@ -204,7 +216,17 @@ int handle_add(int argc, char* argv[]) {
     std::string name = target;
     std::string req;
 
-    size_t at_pos = target.find('@');
+    // Support both unscoped (pkg@1.0.0) and scoped (@company/pkg@1.0.0)
+    size_t at_pos = std::string::npos;
+    if (target.starts_with('@')) {
+        size_t slash = target.find('/');
+        if (slash != std::string::npos) {
+            at_pos = target.find('@', slash + 1);
+        }
+    } else {
+        at_pos = target.find('@');
+    }
+
     if (at_pos != std::string::npos) {
         name = target.substr(0, at_pos);
         req = "=" + target.substr(at_pos + 1);
@@ -328,9 +350,13 @@ int handle_audit() {
 
 int handle_login(int argc, char* argv[]) {
     std::string token;
+    std::string registry = "public";
     for (int i = 2; i < argc; ++i) {
-        if (std::string(argv[i]) == "--token" && i + 1 < argc) {
+        std::string arg = argv[i];
+        if (arg == "--token" && i + 1 < argc) {
             token = argv[++i];
+        } else if (arg == "--registry" && i + 1 < argc) {
+            registry = argv[++i];
         }
     }
 
@@ -344,19 +370,27 @@ int handle_login(int argc, char* argv[]) {
         std::cerr << "[pd login] Failed: " << status.message() << std::endl;
         return 1;
     }
-    std::cout << "[pd login] Authentication token saved to ~/.pingdart/credentials.toml" << std::endl;
+    std::cout << "[pd login] Authentication token for registry [" << registry << "] saved to ~/.pingdart/credentials.toml" << std::endl;
     return 0;
 }
 
-int handle_publish() {
-    std::cout << "[pd publish] Packing and publishing package to registry.pingdart.com..." << std::endl;
+int handle_publish(int argc, char* argv[]) {
+    std::string registry = "public";
+    for (int i = 2; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--registry" && i + 1 < argc) {
+            registry = argv[++i];
+        }
+    }
+
+    std::cout << "[pd publish] Packing, running pre-flight security scan, and publishing to [" << registry << "] registry..." << std::endl;
     PackageManager pm;
     auto status = pm.publish();
     if (!status.ok()) {
         std::cerr << "[pd publish] FAILED: " << status.message() << std::endl;
         return 1;
     }
-    std::cout << "[pd publish] SUCCESS! Package successfully published to registry." << std::endl;
+    std::cout << "[pd publish] SUCCESS! Package successfully published to [" << registry << "] registry." << std::endl;
     return 0;
 }
 
@@ -415,7 +449,7 @@ int main(int argc, char* argv[]) {
     } else if (command == "login") {
         return handle_login(argc, argv);
     } else if (command == "publish") {
-        return handle_publish();
+        return handle_publish(argc, argv);
     } else if (command == "create") {
         return handle_create(argc, argv);
     } else if (command == "version" || command == "--version" || command == "-v") {

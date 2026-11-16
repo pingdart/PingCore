@@ -394,8 +394,12 @@ bool PublishingToken::has_scope(std::string_view scope) const {
     return false;
 }
 
-bool PublishingToken::is_valid() const {
-    return !is_revoked && !token_secret.empty();
+bool PublishingToken::is_valid(uint64_t current_epoch) const {
+    if (is_revoked || token_hash.empty()) return false;
+    if (current_epoch > 0 && expires_at_epoch > 0 && current_epoch >= expires_at_epoch) {
+        return false;
+    }
+    return true;
 }
 
 PublisherSecurity::PublisherSecurity() {
@@ -412,17 +416,20 @@ void PublisherSecurity::seed_default_publishers() {
     package_owners_["pingdart-sqlite"] = {"pingdart-team"};
     package_owners_["pingdart-camera"] = {"pingdart-team"};
 
-    // Default development publishing token
+    // Default development publishing token (stored as SHA-256 hash, secret not stored)
+    const std::string default_secret = "pd_token_live_sec_99a8b7c6d5e4f3a2b1";
+    std::string hash = ArchiveUtil::compute_string_sha256(default_secret);
+
     PublishingToken default_tok{
         .token_id = "tok_pingdart_team_001",
-        .token_secret = "pd_token_live_sec_99a8b7c6d5e4f3a2b1",
+        .token_hash = hash,
         .publisher_username = "pingdart-team",
         .scopes = {"pkg:publish", "pkg:read", "admin"},
         .created_at = "2026-01-01T00:00:00Z",
-        .expires_at = "2027-01-01T00:00:00Z",
+        .expires_at_epoch = 1893456000ULL, // year 2030
         .is_revoked = false
     };
-    tokens_[default_tok.token_secret] = default_tok;
+    tokens_by_hash_[hash] = default_tok;
 }
 
 core::Status PublisherSecurity::register_publisher(
@@ -451,29 +458,36 @@ bool PublisherSecurity::is_verified_publisher(std::string_view username) const {
     return it != publishers_.end() && it->second.is_verified;
 }
 
-core::Result<PublishingToken> PublisherSecurity::create_token(
+core::Result<TokenCreationResult> PublisherSecurity::create_token(
     std::string_view username,
     const std::vector<std::string>& scopes,
-    uint32_t /*valid_days*/)
+    uint32_t valid_days)
 {
+    std::lock_guard<std::mutex> lock(token_mutex_);
     if (!publisher_exists(username)) {
         return core::Status(core::StatusCode::NotFound, "Publisher account not found: " + std::string(username));
     }
 
     static uint64_t token_counter = 1000;
-    std::string secret = "pd_tok_" + std::string(username) + "_" + std::to_string(++token_counter) + "_xyz789";
+    std::string secret = "pd_tok_" + std::string(username) + "_" + std::to_string(++token_counter) + "_sec987xyz";
+    std::string hash = ArchiveUtil::compute_string_sha256(secret);
+
+    auto now = std::chrono::system_clock::now();
+    uint64_t now_sec = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count());
+    uint64_t expire_sec = now_sec + static_cast<uint64_t>(valid_days) * 86400ULL;
 
     PublishingToken tok{
         .token_id = "tok_" + std::to_string(token_counter),
-        .token_secret = secret,
+        .token_hash = hash,
         .publisher_username = std::string(username),
         .scopes = scopes,
         .created_at = "2026-11-16T20:00:00Z",
-        .expires_at = "2027-02-16T20:00:00Z",
+        .expires_at_epoch = expire_sec,
         .is_revoked = false
     };
 
-    tokens_[secret] = tok;
+    tokens_by_hash_[hash] = tok;
+
     record_audit_event(SecurityAuditEntry{
         .timestamp = "2026-11-16T20:00:00Z",
         .actor = std::string(username),
@@ -481,19 +495,28 @@ core::Result<PublishingToken> PublisherSecurity::create_token(
         .package_name = "",
         .version = "",
         .status = "success",
-        .details = "Scoped API token generated"
+        .details = "Scoped API token generated: " + tok.token_id // secret is never logged
     });
 
-    return tok;
+    return TokenCreationResult{tok, secret};
 }
 
 core::Result<std::string> PublisherSecurity::authenticate_token(
-    std::string_view token_secret,
+    std::string_view raw_token_secret,
     std::string_view required_scope)
 {
-    auto it = tokens_.find(std::string(token_secret));
-    if (it == tokens_.end() || !it->second.is_valid()) {
-        return core::Status(core::StatusCode::Unauthenticated, "Invalid or expired registry authentication token");
+    std::lock_guard<std::mutex> lock(token_mutex_);
+    std::string hash = ArchiveUtil::compute_string_sha256(raw_token_secret);
+    auto it = tokens_by_hash_.find(hash);
+    if (it == tokens_by_hash_.end()) {
+        return core::Status(core::StatusCode::Unauthenticated, "Invalid or unrecognized registry authentication token");
+    }
+
+    auto now = std::chrono::system_clock::now();
+    uint64_t now_sec = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count());
+
+    if (!it->second.is_valid(now_sec)) {
+        return core::Status(core::StatusCode::Unauthenticated, "Authentication token has expired or been revoked");
     }
 
     if (!required_scope.empty() && !it->second.has_scope(required_scope)) {
@@ -504,22 +527,34 @@ core::Result<std::string> PublisherSecurity::authenticate_token(
     return it->second.publisher_username;
 }
 
-core::Status PublisherSecurity::revoke_token(std::string_view token_secret) {
-    auto it = tokens_.find(std::string(token_secret));
-    if (it == tokens_.end()) {
-        return core::Status(core::StatusCode::NotFound, "Token not found");
+core::Status PublisherSecurity::revoke_token(std::string_view token_secret_or_id) {
+    std::lock_guard<std::mutex> lock(token_mutex_);
+    // Try hash first
+    std::string hash = ArchiveUtil::compute_string_sha256(token_secret_or_id);
+    auto it = tokens_by_hash_.find(hash);
+    if (it != tokens_by_hash_.end()) {
+        it->second.is_revoked = true;
+        return core::Status{};
     }
-    it->second.is_revoked = true;
-    return core::Status{};
+
+    // Try token_id
+    for (auto& [h, tok] : tokens_by_hash_) {
+        if (tok.token_id == token_secret_or_id) {
+            tok.is_revoked = true;
+            return core::Status{};
+        }
+    }
+    return core::Status(core::StatusCode::NotFound, "Token not found for revocation");
 }
 
 core::Status PublisherSecurity::claim_or_verify_ownership(std::string_view username, std::string_view package_name) {
+    std::lock_guard<std::mutex> lock(ownership_mutex_);
     std::string pkg(package_name);
     std::string user(username);
 
     auto it = package_owners_.find(pkg);
     if (it == package_owners_.end()) {
-        // First publish claims package ownership
+        // Atomic claim on first publish
         package_owners_[pkg] = {user};
         record_audit_event(SecurityAuditEntry{
             .timestamp = "2026-11-16T20:00:00Z",
@@ -542,6 +577,7 @@ core::Status PublisherSecurity::claim_or_verify_ownership(std::string_view usern
 }
 
 bool PublisherSecurity::can_publish(std::string_view username, std::string_view package_name) const {
+    std::lock_guard<std::mutex> lock(ownership_mutex_);
     std::string pkg(package_name);
     std::string user(username);
 
@@ -551,6 +587,7 @@ bool PublisherSecurity::can_publish(std::string_view username, std::string_view 
 }
 
 std::vector<std::string> PublisherSecurity::get_package_owners(std::string_view package_name) const {
+    std::lock_guard<std::mutex> lock(ownership_mutex_);
     auto it = package_owners_.find(std::string(package_name));
     if (it == package_owners_.end()) return {};
     return std::vector<std::string>(it->second.begin(), it->second.end());
@@ -561,11 +598,13 @@ core::Status PublisherSecurity::add_collaborator(
     std::string_view package_name,
     std::string_view new_owner)
 {
+    std::lock_guard<std::mutex> lock(ownership_mutex_);
     std::string pkg(package_name);
     std::string req(requester);
     std::string target(new_owner);
 
-    if (!can_publish(req, pkg)) {
+    auto it = package_owners_.find(pkg);
+    if (it != package_owners_.end() && it->second.count(req) == 0) {
         return core::Status(core::StatusCode::PermissionDenied, "Only package maintainers can add collaborators");
     }
     if (!publisher_exists(target)) {

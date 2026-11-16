@@ -79,7 +79,8 @@ core::Result<std::vector<uint8_t>> ArchiveUtil::pack_package_directory(
 
     // 2. Iterate and pack eligible files
     for (const auto& entry : std::filesystem::recursive_directory_iterator(package_dir, ec)) {
-        if (!entry.is_regular_file(ec)) {
+        // Skip symlinks, special files, and directories (only pack regular files)
+        if (entry.is_symlink(ec) || !entry.is_regular_file(ec)) {
             continue;
         }
 
@@ -145,23 +146,41 @@ core::Status ArchiveUtil::unpack_package_archive(
 
         if (offset + file_len > archive_data.size()) break;
 
-        // Path Traversal / Zip Slip Protection (PKG-109 / Security Audit Finding C)
+        // Path Traversal / Zip Slip Protection (Component-aware containment & symlink hardening)
         if (rel_path.empty() ||
             rel_path.starts_with("/") || rel_path.starts_with("\\") ||
             rel_path.find("..") != std::string::npos ||
-            (rel_path.size() >= 2 && rel_path[1] == ':') ||
+            rel_path.find(':') != std::string::npos ||
             rel_path.find('\0') != std::string::npos) {
             return core::Status(core::StatusCode::PermissionDenied,
                                 "Path traversal attempt detected in archive payload: " + rel_path);
         }
 
-        std::filesystem::path dest_file = (target_dest / rel_path).lexically_normal();
         std::filesystem::path normal_target = target_dest.lexically_normal();
-        std::string dest_str = dest_file.generic_string();
-        std::string base_str = normal_target.generic_string();
-        if (!dest_str.starts_with(base_str)) {
+        std::filesystem::path dest_file = (normal_target / rel_path).lexically_normal();
+
+        // 1. Path-component-aware containment check (prevents /app matching /app-evil prefix exploit)
+        auto t_it = normal_target.begin();
+        auto d_it = dest_file.begin();
+        for (; t_it != normal_target.end(); ++t_it, ++d_it) {
+            if (d_it == dest_file.end() || *t_it != *d_it) {
+                return core::Status(core::StatusCode::PermissionDenied,
+                                    "Archive path traversal violation (component mismatch): " + rel_path);
+            }
+        }
+        if (d_it == dest_file.end()) {
             return core::Status(core::StatusCode::PermissionDenied,
-                                "Archive path escapes target destination directory: " + rel_path);
+                                "Archive path cannot overwrite target destination root: " + rel_path);
+        }
+
+        // 2. Symlink rejection: ensure no component in path is a symlink
+        std::filesystem::path check_path = normal_target;
+        for (auto it = d_it; it != dest_file.end(); ++it) {
+            check_path /= *it;
+            if (std::filesystem::exists(check_path, ec) && std::filesystem::is_symlink(check_path, ec)) {
+                return core::Status(core::StatusCode::PermissionDenied,
+                                    "Archive extraction through filesystem link rejected: " + check_path.string());
+            }
         }
 
         std::filesystem::create_directories(dest_file.parent_path(), ec);

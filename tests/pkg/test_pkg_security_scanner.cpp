@@ -110,26 +110,32 @@ TEST(PublisherSecurityGoogleTest, ScopedTokensAndAuditTrail) {
     // 1. Create scoped token with publish scope
     auto tok_res = sec.create_token("community-dev", {"pkg:publish"});
     ASSERT_TRUE(tok_res.has_value());
-    const auto& tok = tok_res.value();
+    const auto& tok = tok_res.value().token;
+    const auto& secret = tok_res.value().plaintext_secret;
     EXPECT_TRUE(tok.has_scope("pkg:publish"));
     EXPECT_FALSE(tok.has_scope("admin"));
 
-    // 2. Authenticate token
-    auto auth_res = sec.authenticate_token(tok.token_secret, "pkg:publish");
+    // Verify token secret is hashed nonreversibly (hash != plaintext)
+    EXPECT_NE(tok.token_hash, secret);
+    EXPECT_TRUE(tok.token_hash.starts_with("sha256:"));
+
+    // 2. Authenticate token using plaintext secret
+    auto auth_res = sec.authenticate_token(secret, "pkg:publish");
     ASSERT_TRUE(auth_res.has_value());
     EXPECT_EQ(auth_res.value(), "community-dev");
 
     // Fails when requesting higher scope
-    auto admin_res = sec.authenticate_token(tok.token_secret, "admin");
+    auto admin_res = sec.authenticate_token(secret, "admin");
     EXPECT_FALSE(admin_res.has_value());
 
     // 3. Revoke token
-    EXPECT_TRUE(sec.revoke_token(tok.token_secret).ok());
-    auto revoked_auth = sec.authenticate_token(tok.token_secret, "pkg:publish");
+    EXPECT_TRUE(sec.revoke_token(secret).ok());
+    auto revoked_auth = sec.authenticate_token(secret, "pkg:publish");
     EXPECT_FALSE(revoked_auth.has_value());
 
-    // 4. Verify audit log captures actions
+    // 4. Verify audit log captures actions without leaking raw secret
     auto audit = sec.get_audit_log();
     EXPECT_FALSE(audit.empty());
     EXPECT_EQ(audit.back().actor, "community-dev");
+    EXPECT_EQ(audit.back().details.find(secret), std::string::npos); // Secret never exposed
 }

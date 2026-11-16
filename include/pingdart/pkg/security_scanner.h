@@ -12,6 +12,8 @@
 #include <pingdart/pkg/semver.h>
 #include <pingdart/pkg/manifest.h>
 
+#include <mutex>
+
 namespace pingdart::pkg {
 
 enum class ScanSeverity {
@@ -119,15 +121,20 @@ private:
 
 struct PublishingToken {
     std::string token_id;
-    std::string token_secret;
+    std::string token_hash; // SHA-256 hash of secret (stored nonreversibly)
     std::string publisher_username;
     std::vector<std::string> scopes; // e.g. "pkg:publish", "pkg:read", "admin"
     std::string created_at;
-    std::string expires_at;
+    uint64_t expires_at_epoch{0};
     bool is_revoked{false};
 
     [[nodiscard]] bool has_scope(std::string_view scope) const;
-    [[nodiscard]] bool is_valid() const;
+    [[nodiscard]] bool is_valid(uint64_t current_epoch = 0) const;
+};
+
+struct TokenCreationResult {
+    PublishingToken token;
+    std::string plaintext_secret; // Returned ONCE to client
 };
 
 struct SecurityAuditEntry {
@@ -149,19 +156,19 @@ public:
     [[nodiscard]] bool publisher_exists(std::string_view username) const;
     [[nodiscard]] bool is_verified_publisher(std::string_view username) const;
 
-    // Tokens
-    [[nodiscard]] core::Result<PublishingToken> create_token(
+    // Tokens (Finding C: Nonreversible hashing, expiry, revocation, concurrency protection)
+    [[nodiscard]] core::Result<TokenCreationResult> create_token(
         std::string_view username,
         const std::vector<std::string>& scopes,
         uint32_t valid_days = 90
     );
     [[nodiscard]] core::Result<std::string> authenticate_token(
-        std::string_view token_secret,
+        std::string_view raw_token_secret,
         std::string_view required_scope = "pkg:publish"
     );
-    core::Status revoke_token(std::string_view token_secret);
+    core::Status revoke_token(std::string_view token_secret_or_id);
 
-    // Ownership & Collaboration
+    // Ownership & Collaboration (Finding C: Transactional mutex)
     core::Status claim_or_verify_ownership(std::string_view username, std::string_view package_name);
     [[nodiscard]] bool can_publish(std::string_view username, std::string_view package_name) const;
     [[nodiscard]] std::vector<std::string> get_package_owners(std::string_view package_name) const;
@@ -178,8 +185,10 @@ private:
         bool is_verified{false};
     };
 
+    mutable std::mutex ownership_mutex_;
+    mutable std::mutex token_mutex_;
     std::map<std::string, PublisherRecord> publishers_;
-    std::map<std::string, PublishingToken> tokens_; // token_secret -> token
+    std::map<std::string, PublishingToken> tokens_by_hash_; // SHA-256 hash -> token
     std::map<std::string, std::set<std::string>> package_owners_; // package_name -> owners
     std::vector<SecurityAuditEntry> audit_log_;
     void seed_default_publishers();

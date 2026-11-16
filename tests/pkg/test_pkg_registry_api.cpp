@@ -127,7 +127,7 @@ TEST(RegistryApiGoogleTest, PublishingEnforcesAuthenticationAndOwnership) {
     ASSERT_TRUE(tok_res.has_value());
 
     HttpRequest hijack_req = valid_req;
-    hijack_req.headers["Authorization"] = "Bearer " + tok_res.value().token_secret;
+    hijack_req.headers["Authorization"] = "Bearer " + tok_res.value().plaintext_secret;
     hijack_req.headers["X-Package-Version"] = "1.1.0";
     auto hijack_resp = server.handle_request(hijack_req);
     EXPECT_EQ(hijack_resp.status_code, 403);
@@ -168,6 +168,6 @@ TEST(RegistryApiGoogleTest, DeveloperPortalPackageDetailRendering) {
     std::string html = resp.body_as_string();
     EXPECT_NE(html.find("<h1>pingdart-charts"), std::string::npos);
     EXPECT_NE(html.find("Verified Publisher"), std::string::npos);
-    EXPECT_NE(html.find("Security Certified"), std::string::npos);
+    EXPECT_NE(html.find("Automated Checks Passed"), std::string::npos);
     EXPECT_NE(html.find("v1.2.0"), std::string::npos);
 }
