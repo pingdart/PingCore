@@ -2,8 +2,78 @@
 #include <pingdart/pkg/semver.h>
 #include <sstream>
 #include <charconv>
+#include <algorithm>
+#include <vector>
 
 namespace pingdart::pkg {
+
+namespace {
+
+std::strong_ordering compare_prereleases(const std::string& a, const std::string& b) {
+    if (a.empty() && b.empty()) return std::strong_ordering::equal;
+    // Normal release has higher precedence than pre-release
+    if (a.empty() && !b.empty()) return std::strong_ordering::greater;
+    if (!a.empty() && b.empty()) return std::strong_ordering::less;
+
+    // Both are pre-releases: split by dot
+    auto split_dots = [](const std::string& s) {
+        std::vector<std::string> parts;
+        size_t start = 0;
+        while (start < s.size()) {
+            size_t dot = s.find('.', start);
+            if (dot == std::string::npos) {
+                parts.push_back(s.substr(start));
+                break;
+            }
+            parts.push_back(s.substr(start, dot - start));
+            start = dot + 1;
+        }
+        return parts;
+    };
+
+    auto parts_a = split_dots(a);
+    auto parts_b = split_dots(b);
+    size_t min_len = std::min(parts_a.size(), parts_b.size());
+
+    for (size_t i = 0; i < min_len; ++i) {
+        const auto& pa = parts_a[i];
+        const auto& pb = parts_b[i];
+
+        bool a_num = !pa.empty() && std::all_of(pa.begin(), pa.end(), ::isdigit);
+        bool b_num = !pb.empty() && std::all_of(pb.begin(), pb.end(), ::isdigit);
+
+        if (a_num && b_num) {
+            uint64_t na = 0;
+            uint64_t nb = 0;
+            std::from_chars(pa.data(), pa.data() + pa.size(), na);
+            std::from_chars(pb.data(), pb.data() + pb.size(), nb);
+            if (na != nb) return na <=> nb;
+        } else if (a_num && !b_num) {
+            // Numeric identifiers always have lower precedence than non-numeric identifiers
+            return std::strong_ordering::less;
+        } else if (!a_num && b_num) {
+            return std::strong_ordering::greater;
+        } else {
+            // Lexical ASCII comparison
+            if (pa != pb) return pa <=> pb;
+        }
+    }
+
+    return parts_a.size() <=> parts_b.size();
+}
+
+} // namespace
+
+std::strong_ordering SemVersion::operator<=>(const SemVersion& other) const noexcept {
+    if (auto cmp = major <=> other.major; cmp != 0) return cmp;
+    if (auto cmp = minor <=> other.minor; cmp != 0) return cmp;
+    if (auto cmp = patch <=> other.patch; cmp != 0) return cmp;
+    return compare_prereleases(prerelease, other.prerelease);
+}
+
+bool SemVersion::operator==(const SemVersion& other) const noexcept {
+    return (*this <=> other) == std::strong_ordering::equal;
+}
 
 std::string SemVersion::to_string() const {
     std::ostringstream ss;
@@ -131,11 +201,23 @@ core::Result<VersionConstraint> VersionConstraint::parse(std::string_view req_st
 }
 
 bool VersionConstraint::is_satisfied_by(const SemVersion& v) const noexcept {
+    // SemVer 2.0.0 Pre-release filtering:
+    if (!v.prerelease.empty()) {
+        // If constraint has no pre-release tag, pre-releases are never matched
+        if (version_.prerelease.empty()) {
+            return false;
+        }
+        // If constraint has a pre-release tag, only match versions with the exact same (major, minor, patch)
+        if (v.major != version_.major || v.minor != version_.minor || v.patch != version_.patch) {
+            return false;
+        }
+    }
+
     switch (op_) {
         case ConstraintOp::Any:
-            return true;
+            return v.prerelease.empty();
         case ConstraintOp::Exact:
-            return v.major == version_.major && v.minor == version_.minor && v.patch == version_.patch;
+            return v == version_;
         case ConstraintOp::GreaterThan:
             return v > version_;
         case ConstraintOp::GreaterEqual:

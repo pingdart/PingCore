@@ -1,5 +1,5 @@
 # src/pkg/CMakeLists.txt
-# PingDart Package Manager Library (PKG-101..PKG-107)
+# PingDart Package Manager Library (PKG-101..PKG-109)
 
 add_library(pingdart_pkg STATIC
     semver.cpp
@@ -9,6 +9,8 @@ add_library(pingdart_pkg STATIC
     registry_client.cpp
     resolver.cpp
     package_manager.cpp
+    security_scanner.cpp
+    registry_server.cpp
 )
 
 target_include_directories(pingdart_pkg

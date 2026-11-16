@@ -46,11 +46,26 @@ IRegistryBackend* RegistryClient::backend() const noexcept {
     return backend_.get();
 }
 
-core::Status RegistryClient::save_auth_token(std::string_view token, const std::string& registry_url) {
-    const char* home = std::getenv("HOME");
-    if (!home) return core::Status(core::StatusCode::Internal, "HOME directory not found");
+namespace {
 
-    std::filesystem::path config_dir = std::filesystem::path(home) / ".pingdart";
+std::filesystem::path get_user_home_dir() {
+    const char* home = std::getenv("HOME");
+    if (home && home[0] != '\0') return std::filesystem::path(home);
+#if defined(_WIN32)
+    const char* userprofile = std::getenv("USERPROFILE");
+    if (userprofile && userprofile[0] != '\0') return std::filesystem::path(userprofile);
+    const char* homedrive = std::getenv("HOMEDRIVE");
+    const char* homepath = std::getenv("HOMEPATH");
+    if (homedrive && homepath) return std::filesystem::path(std::string(homedrive) + homepath);
+#endif
+    return std::filesystem::current_path();
+}
+
+} // namespace
+
+core::Status RegistryClient::save_auth_token(std::string_view token, const std::string& registry_url) {
+    std::filesystem::path home_path = get_user_home_dir();
+    std::filesystem::path config_dir = home_path / ".pingdart";
     std::error_code ec;
     std::filesystem::create_directories(config_dir, ec);
 
@@ -67,10 +82,8 @@ core::Status RegistryClient::save_auth_token(std::string_view token, const std::
 }
 
 core::Result<std::string> RegistryClient::load_auth_token(const std::string& /*registry_url*/) {
-    const char* home = std::getenv("HOME");
-    if (!home) return core::Status(core::StatusCode::NotFound, "HOME directory not found");
-
-    std::filesystem::path cred_file = std::filesystem::path(home) / ".pingdart" / "credentials.toml";
+    std::filesystem::path home_path = get_user_home_dir();
+    std::filesystem::path cred_file = home_path / ".pingdart" / "credentials.toml";
     std::ifstream in(cred_file);
     if (!in.is_open()) {
         return core::Status(core::StatusCode::NotFound, "No credentials file found. Please run 'pd login'");

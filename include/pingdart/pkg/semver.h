@@ -4,6 +4,7 @@
 #include <string>
 #include <string_view>
 #include <optional>
+#include <compare>
 #include <pingdart/core/result.h>
 
 namespace pingdart::pkg {
@@ -17,7 +18,8 @@ struct SemVersion {
     [[nodiscard]] std::string to_string() const;
     [[nodiscard]] static core::Result<SemVersion> parse(std::string_view str);
 
-    auto operator<=>(const SemVersion& other) const = default;
+    [[nodiscard]] bool operator==(const SemVersion& other) const noexcept;
+    [[nodiscard]] std::strong_ordering operator<=>(const SemVersion& other) const noexcept;
 };
 
 enum class ConstraintOp {

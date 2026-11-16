@@ -145,7 +145,25 @@ core::Status ArchiveUtil::unpack_package_archive(
 
         if (offset + file_len > archive_data.size()) break;
 
-        std::filesystem::path dest_file = target_dest / rel_path;
+        // Path Traversal / Zip Slip Protection (PKG-109 / Security Audit Finding C)
+        if (rel_path.empty() ||
+            rel_path.starts_with("/") || rel_path.starts_with("\\") ||
+            rel_path.find("..") != std::string::npos ||
+            (rel_path.size() >= 2 && rel_path[1] == ':') ||
+            rel_path.find('\0') != std::string::npos) {
+            return core::Status(core::StatusCode::PermissionDenied,
+                                "Path traversal attempt detected in archive payload: " + rel_path);
+        }
+
+        std::filesystem::path dest_file = (target_dest / rel_path).lexically_normal();
+        std::filesystem::path normal_target = target_dest.lexically_normal();
+        std::string dest_str = dest_file.generic_string();
+        std::string base_str = normal_target.generic_string();
+        if (!dest_str.starts_with(base_str)) {
+            return core::Status(core::StatusCode::PermissionDenied,
+                                "Archive path escapes target destination directory: " + rel_path);
+        }
+
         std::filesystem::create_directories(dest_file.parent_path(), ec);
 
         std::ofstream out(dest_file, std::ios::binary);
