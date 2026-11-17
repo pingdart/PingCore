@@ -15,6 +15,7 @@
 
 #if defined(_WIN32)
 #include <conio.h>
+#include <windows.h>
 #endif
 
 using namespace pingdart;
@@ -22,7 +23,7 @@ using namespace pingdart::cli;
 using namespace pingdart::pkg;
 
 void print_usage() {
-    std::cout << "PingDart Developer Tool (pd) — Application Orchestrator & Package Manager\n\n"
+    std::cout << "PingDart Developer Tool (pd) - Application Orchestrator & Package Manager\n\n"
               << "Usage: pd <command> [options]\n\n"
               << "Package Manager Commands (PKG-101..PKG-110):\n"
               << "  init [--registry <url>]              Interactive onboarding: log in or create developer account\n"
@@ -205,9 +206,9 @@ int handle_search(int argc, char* argv[]) {
     }
 
     const auto& pkgs = res.value();
-    std::cout << "PingDart Package Registry [" << registry << "] — " << pkgs.size() << " packages found:\n\n";
+    std::cout << "PingDart Package Registry [" << registry << "] - " << pkgs.size() << " packages found:\n\n";
     for (const auto& pkg : pkgs) {
-        std::cout << "  * " << pkg.name << " (" << pkg.latest_version.to_string() << ") — "
+        std::cout << "  * " << pkg.name << " (" << pkg.latest_version.to_string() << ") - "
                   << pkg.description << " [" << pkg.license << "]\n";
     }
     std::cout << std::endl;
@@ -343,13 +344,13 @@ int handle_audit() {
     const auto& report = res.value();
     std::cout << "Scanned " << report.packages_scanned << " packages.\n";
     if (report.detected_vulnerabilities.empty()) {
-        std::cout << "[✓] 0 known vulnerabilities found.\n" << std::endl;
+        std::cout << "[OK] 0 known vulnerabilities found.\n" << std::endl;
         return 0;
     }
 
     std::cout << "[!] " << report.detected_vulnerabilities.size() << " security advisories found:\n\n";
     for (const auto& adv : report.detected_vulnerabilities) {
-        std::cout << "  [" << adv.severity << "] " << adv.package_name << " — " << adv.advisory_id << "\n"
+        std::cout << "  [" << adv.severity << "] " << adv.package_name << " - " << adv.advisory_id << "\n"
                   << "    Description: " << adv.description << "\n"
                   << "    Patched Version: " << adv.patched_version << "\n\n";
     }
@@ -393,7 +394,12 @@ std::string extract_json_field(const std::string& json, const std::string& key) 
 }
 
 int handle_init(int argc, char* argv[]) {
-    std::string registry_url = "https://registry.pingdart.com";
+    std::string registry_url = "http://localhost:8080";
+    if (const char* env = std::getenv("PINGDART_REGISTRY_URL")) {
+        registry_url = env;
+    } else if (const char* env2 = std::getenv("PINGDART_REGISTRY")) {
+        registry_url = env2;
+    }
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--registry" && i + 1 < argc) {
@@ -402,7 +408,7 @@ int handle_init(int argc, char* argv[]) {
     }
 
     std::cout << "================================================================================\n"
-              << "       PingDart Framework — Developer CLI Initialization & Onboarding          \n"
+              << "       PingDart Framework - Developer CLI Initialization & Onboarding          \n"
               << "================================================================================\n"
               << "Welcome to PingDart! Setting up your local developer environment.\n"
               << "Target Registry: " << registry_url << "\n\n";
@@ -416,16 +422,16 @@ int handle_init(int argc, char* argv[]) {
         std::string reauth;
         std::getline(std::cin, reauth);
         if (reauth != "y" && reauth != "Y") {
-            std::cout << "\n[✓] PingDart Framework is initialized and ready to use!\n"
-                      << "    - Run 'pd create package <name>' to start your first library.\n"
-                      << "    - Run 'pd search <term>' to find packages.\n";
+            std::cout << "\n[OK] PingDart Framework is initialized and ready to use!\n"
+                      << "     - Run 'pd create package <name>' to start your first library.\n"
+                      << "     - Run 'pd search <term>' to find packages.\n";
             return 0;
         }
     }
 
     std::cout << "Please select how you want to connect:\n"
-              << "  [1] Existing User — Log in with Email / Username & Password\n"
-              << "  [2] New User — Create a new PingDart Developer Account\n"
+              << "  [1] Existing User - Log in with Email / Username & Password\n"
+              << "  [2] New User - Create a new PingDart Developer Account\n"
               << "  [3] Enter Access Token Directly (pd_live_...)\n\n"
               << "Selection [1-3] (Default: 1): ";
 
@@ -493,9 +499,9 @@ int handle_init(int argc, char* argv[]) {
         }
 
         RegistryClient::save_auth_token(token, registry_url);
-        std::cout << "\n[✓] Successfully authenticated as '" << (username.empty() ? ident : username) << "'!\n"
-                  << "[✓] Session token saved to ~/.pingdart/credentials.toml\n"
-                  << "[✓] PingDart Framework is initialized and ready on your PC.\n";
+        std::cout << "\n[OK] Successfully authenticated as '" << (username.empty() ? ident : username) << "'!\n"
+                  << "[OK] Session token saved to ~/.pingdart/credentials.toml\n"
+                  << "[OK] PingDart Framework is initialized and ready on your PC.\n";
         return 0;
 
     } else if (choice == "2") {
@@ -575,9 +581,9 @@ int handle_init(int argc, char* argv[]) {
         }
 
         RegistryClient::save_auth_token(token, registry_url);
-        std::cout << "\n[✓] Welcome to PingDart, " << username << " (" << email << ")!\n"
-                  << "[✓] Account created and token saved to ~/.pingdart/credentials.toml\n"
-                  << "[✓] PingDart Framework is initialized and ready on your PC.\n";
+        std::cout << "\n[OK] Welcome to PingDart, " << username << " (" << email << ")!\n"
+                  << "[OK] Account created and token saved to ~/.pingdart/credentials.toml\n"
+                  << "[OK] PingDart Framework is initialized and ready on your PC.\n";
         return 0;
 
     } else if (choice == "3") {
@@ -590,18 +596,23 @@ int handle_init(int argc, char* argv[]) {
             return 1;
         }
         RegistryClient::save_auth_token(tok, registry_url);
-        std::cout << "\n[✓] Token saved to ~/.pingdart/credentials.toml\n"
-                  << "[✓] PingDart Framework initialization complete.\n";
+        std::cout << "\n[OK] Token saved to ~/.pingdart/credentials.toml\n"
+                  << "[OK] PingDart Framework initialization complete.\n";
         return 0;
     } else {
-        std::cout << "\n[✓] Skipping registry authentication. Local offline mode enabled.\n";
+        std::cout << "\n[OK] Skipping registry authentication. Local offline mode enabled.\n";
         return 0;
     }
 }
 
 int handle_login(int argc, char* argv[]) {
     std::string token;
-    std::string registry_url = "https://registry.pingdart.com";
+    std::string registry_url = "http://localhost:8080";
+    if (const char* env = std::getenv("PINGDART_REGISTRY_URL")) {
+        registry_url = env;
+    } else if (const char* env2 = std::getenv("PINGDART_REGISTRY")) {
+        registry_url = env2;
+    }
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--token" && i + 1 < argc) {
@@ -703,6 +714,10 @@ int handle_create(int argc, char* argv[]) {
 }
 
 int main(int argc, char* argv[]) {
+#if defined(_WIN32)
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#endif
     if (argc < 2) {
         print_usage();
         return 1;
