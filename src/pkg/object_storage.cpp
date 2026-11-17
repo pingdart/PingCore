@@ -117,7 +117,7 @@ core::Result<std::vector<uint8_t>> ContentAddressableStorage::get_archive(std::s
     if (expected_key.starts_with("sha256:")) {
         std::string expected_hash = expected_key.substr(7);
         if (actual_hash != expected_hash) {
-            return core::Status(core::StatusCode::Internal,
+            return core::Status(core::StatusCode::DataLoss,
                                 "Storage corruption or tampering detected: retrieved archive does not match expected digest (expected: " +
                                 expected_hash + ", got: " + actual_hash + ")");
         }

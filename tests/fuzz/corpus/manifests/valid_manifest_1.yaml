@@ -1,0 +1,12 @@
+name: "my_package"
+version: "1.2.3"
+description: "A standard package"
+homepage: "https://pingdart.dev"
+repository: "https://github.com/pingdart/my_package"
+authors:
+  - "Core Team <core@pingdart.dev>"
+dependencies:
+  core_ui: "^1.0.0"
+  network: ">=2.1.0 <3.0.0"
+dev_dependencies:
+  test_harness: "0.1.0"

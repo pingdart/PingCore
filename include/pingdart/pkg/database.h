@@ -62,6 +62,7 @@ public:
     virtual core::Status add_org_member(std::string_view org_name, std::string_view requester, std::string_view new_member) = 0;
     [[nodiscard]] virtual bool is_org_member(std::string_view org_name, std::string_view username) const = 0;
     [[nodiscard]] virtual bool can_access_package(std::string_view requester_username, std::string_view package_name, std::string_view action = "read") const = 0;
+    [[nodiscard]] virtual bool has_publisher(std::string_view username) const { (void)username; return false; }
 
     // Transactional publish enforcing UNIQUE(package_id, version) & atomic ownership
     virtual core::Status publish_package_version_tx(
@@ -101,6 +102,7 @@ public:
     core::Status add_org_member(std::string_view org_name, std::string_view requester, std::string_view new_member) override;
     [[nodiscard]] bool is_org_member(std::string_view org_name, std::string_view username) const override;
     [[nodiscard]] bool can_access_package(std::string_view requester_username, std::string_view package_name, std::string_view action = "read") const override;
+    [[nodiscard]] bool has_publisher(std::string_view username) const override;
 
     core::Status publish_package_version_tx(
         const PackageManifest& manifest,

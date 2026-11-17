@@ -7,4 +7,7 @@ target_link_libraries(pd
         PingDart::CLI
         PingDart::PKG
         PingDart::Core
+        PingDart::UI
+        PingDart::Text
+        pingcore_server
 )

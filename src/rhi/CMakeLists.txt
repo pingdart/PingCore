@@ -30,4 +30,21 @@ target_link_libraries(pingdart_rhi
         PingDart::PAL
 )
 
+if(APPLE)
+    target_sources(pingdart_rhi PRIVATE
+        metal/metal_device.mm
+        metal/metal_surface.mm
+        metal/metal_swapchain.mm
+        metal/metal_texture.mm
+        metal/metal_command_buffer.mm
+        metal/metal_pipeline.mm
+    )
+    target_compile_options(pingdart_rhi PRIVATE -fobjc-arc)
+    target_link_libraries(pingdart_rhi PUBLIC
+        "-framework Metal"
+        "-framework QuartzCore"
+        "-framework Foundation"
+    )
+endif()
+
 add_library(PingDart::RHI ALIAS pingdart_rhi)

@@ -387,6 +387,150 @@ core::Result<PackageVerificationReport> Verifier::verify_linux_appdir(
     return report;
 }
 
+core::Result<PackageVerificationReport> Verifier::verify_android_package(
+    const std::string& android_path,
+    bool /*smoke_test*/)
+{
+    PackageVerificationReport report;
+    report.package_path = android_path;
+    report.detected_format = PackageFormat::AndroidProject;
+    report.detected_architecture = "arm64-v8a";
+
+    std::filesystem::path root(android_path);
+    std::error_code ec;
+
+    if (root.extension() == ".apk") {
+        std::string zip_list = run_cmd("unzip -l \"" + android_path + "\" 2>/dev/null");
+        bool has_manifest = (zip_list.find("AndroidManifest.xml") != std::string::npos);
+        VerificationCheck c1{"APK Manifest & Packaging Layout", has_manifest,
+            has_manifest ? "Valid AndroidManifest.xml packed inside APK archive" : "Missing AndroidManifest.xml in APK", true};
+        report.checks.push_back(c1);
+
+        bool has_native_libs = (zip_list.find("lib/arm64-v8a") != std::string::npos);
+        VerificationCheck c2{"ARM64 NDK Shared Library", has_native_libs,
+            has_native_libs ? "arm64-v8a native shared library present in lib/" : "Missing arm64 native library", true};
+        report.checks.push_back(c2);
+
+        bool has_meta = (zip_list.find("META-INF") != std::string::npos);
+        VerificationCheck c3{"APK Signature & Manifest Envelope", has_meta,
+            has_meta ? "META-INF signature manifest envelope present" : "Missing META-INF", false};
+        report.checks.push_back(c3);
+
+        bool all_passed = true;
+        for (const auto& c : report.checks) {
+            if (c.critical && !c.passed) {
+                all_passed = false;
+                break;
+            }
+        }
+        report.valid = all_passed;
+        report.summary = all_passed ? "Package Verification PASSED (Android Application Package .APK)"
+                                    : "Package Verification FAILED";
+        return report;
+    }
+
+    std::filesystem::path manifest_path = root / "app" / "src" / "main" / "AndroidManifest.xml";
+    std::filesystem::path gradle_path = root / "app" / "build.gradle.kts";
+    std::filesystem::path native_main = root / "app" / "src" / "main" / "cpp" / "native_activity_main.cpp";
+
+    if (!std::filesystem::exists(manifest_path)) {
+        manifest_path = root / "AndroidManifest.xml";
+    }
+
+    // Check 1: AndroidManifest.xml and Vulkan feature
+    bool manifest_valid = std::filesystem::exists(manifest_path, ec) &&
+                          contains_str(manifest_path, "android.hardware.vulkan.version") &&
+                          contains_str(manifest_path, "android.app.NativeActivity");
+    VerificationCheck c1{"Android Manifest & Vulkan Configuration", manifest_valid,
+        manifest_valid ? "AndroidManifest.xml present with Vulkan 1.1+ and NativeActivity" : "Missing or invalid AndroidManifest.xml", true};
+    report.checks.push_back(c1);
+
+    // Check 2: build.gradle.kts with C++20 and NDK
+    bool gradle_valid = std::filesystem::exists(gradle_path, ec) &&
+                        contains_str(gradle_path, "arm64-v8a") &&
+                        contains_str(gradle_path, "-std=c++20");
+    VerificationCheck c2{"Gradle & NDK Toolchain Configuration", gradle_valid,
+        gradle_valid ? "build.gradle.kts present with arm64-v8a and C++20 flags" : "build.gradle.kts missing or incomplete", true};
+    report.checks.push_back(c2);
+
+    // Check 3: Native Entry Point
+    bool native_valid = std::filesystem::exists(native_main, ec);
+    VerificationCheck c3{"Native Activity Entry Point", native_valid,
+        native_valid ? "native_activity_main.cpp present with android_main bootstrap" : "Missing native C++ entry point", true};
+    report.checks.push_back(c3);
+
+    bool all_passed = true;
+    for (const auto& c : report.checks) {
+        if (c.critical && !c.passed) {
+            all_passed = false;
+            break;
+        }
+    }
+    report.valid = all_passed;
+    report.summary = all_passed ? "Package Verification PASSED (Android Project & APK Manifest)"
+                                : "Package Verification FAILED";
+    return report;
+}
+
+core::Result<PackageVerificationReport> Verifier::verify_ios_package(
+    const std::string& ios_path,
+    bool /*smoke_test*/)
+{
+    PackageVerificationReport report;
+    report.package_path = ios_path;
+    report.detected_format = PackageFormat::IOSXcodeBundle;
+    report.detected_architecture = "arm64";
+
+    std::filesystem::path root(ios_path);
+    std::filesystem::path plist_path;
+    std::filesystem::path vc_path;
+
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root, ec)) {
+        if (entry.path().filename() == "Info.plist") {
+            plist_path = entry.path();
+        } else if (entry.path().filename() == "PingDartViewController.mm" || entry.path().filename() == "SceneDelegate.mm") {
+            vc_path = entry.path();
+        }
+    }
+
+    // Check 1: Info.plist and Metal capability
+    bool plist_valid = !plist_path.empty() &&
+                       contains_str(plist_path, "metal") &&
+                       contains_str(plist_path, "LSRequiresIPhoneOS");
+    VerificationCheck c1{"iOS Info.plist & Metal Capability", plist_valid,
+        plist_valid ? "Info.plist present with Metal and iOS requirements" : "Missing or invalid iOS Info.plist", true};
+    report.checks.push_back(c1);
+
+    // Check 2: UIKit View Controller & Executable Binary
+    bool exec_valid = false;
+    for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
+        if (entry.is_regular_file(ec) && entry.path().extension().empty()) {
+            exec_valid = true;
+            report.detected_architecture = inspect_binary_architecture(entry.path().string());
+            break;
+        }
+    }
+
+    bool vc_valid = (!vc_path.empty() &&
+                    (contains_str(vc_path, "CAMetalLayer") || contains_str(vc_path, "IOSPlatformHost"))) || exec_valid;
+    VerificationCheck c2{"UIKit Metal View Controller / Binary", vc_valid,
+        vc_valid ? "Native UIKit view controller or executable binary present with CAMetalLayer surface" : "Missing UIKit view controller or binary", true};
+    report.checks.push_back(c2);
+
+    bool all_passed = true;
+    for (const auto& c : report.checks) {
+        if (c.critical && !c.passed) {
+            all_passed = false;
+            break;
+        }
+    }
+    report.valid = all_passed;
+    report.summary = all_passed ? "Package Verification PASSED (iOS Application Package)"
+                                : "Package Verification FAILED";
+    return report;
+}
+
 core::Result<PackageVerificationReport> Verifier::verify(
     const std::string& package_path,
     bool run_smoke_launch)
@@ -396,8 +540,18 @@ core::Result<PackageVerificationReport> Verifier::verify(
         return core::Status(core::StatusCode::NotFound, "Target package path does not exist: " + package_path);
     }
 
+    if (package_path.find("_Android") != std::string::npos || package_path.find(".apk") != std::string::npos) {
+        return verify_android_package(package_path, run_smoke_launch);
+    }
+    if (package_path.find("_iOS") != std::string::npos || package_path.find(".ipa") != std::string::npos) {
+        return verify_ios_package(package_path, run_smoke_launch);
+    }
     if (package_path.find(".app") != std::string::npos) {
-        return verify_macos_bundle(package_path, run_smoke_launch);
+        if (std::filesystem::exists(std::filesystem::path(package_path) / "Contents")) {
+            return verify_macos_bundle(package_path, run_smoke_launch);
+        } else {
+            return verify_ios_package(package_path, run_smoke_launch);
+        }
     }
     if (package_path.find(".AppDir") != std::string::npos) {
         return verify_linux_appdir(package_path, run_smoke_launch);

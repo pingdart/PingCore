@@ -637,7 +637,14 @@ HttpResponse RegistryServer::handle_api_publish(const HttpRequest& req) {
 
     auto status = publish_package(manifest, req.body, token);
     if (!status.ok()) {
-        int code = (status.code() == core::StatusCode::AlreadyExists) ? 409 : 400;
+        int code = 400;
+        if (status.code() == core::StatusCode::AlreadyExists) {
+            code = 409;
+        } else if (status.code() == core::StatusCode::PermissionDenied) {
+            code = 403;
+        } else if (status.code() == core::StatusCode::Unauthenticated) {
+            code = 401;
+        }
         return HttpResponse::error(code, status.message());
     }
 

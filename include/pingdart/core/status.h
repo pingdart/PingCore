@@ -20,7 +20,9 @@ enum class StatusCode : int32_t {
     Unimplemented = 9,
     Internal = 10,
     Unavailable = 11,
-    Timeout = 12
+    Timeout = 12,
+    DataLoss = 13,
+    Unauthenticated = 14
 };
 
 [[nodiscard]] constexpr std::string_view StatusCodeToString(StatusCode code) noexcept {
@@ -38,6 +40,8 @@ enum class StatusCode : int32_t {
         case StatusCode::Internal: return "Internal";
         case StatusCode::Unavailable: return "Unavailable";
         case StatusCode::Timeout: return "Timeout";
+        case StatusCode::DataLoss: return "DataLoss";
+        case StatusCode::Unauthenticated: return "Unauthenticated";
     }
     return "Unknown";
 }

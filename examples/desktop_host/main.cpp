@@ -10,6 +10,8 @@
 
 #if defined(_WIN32)
 #include "win32_platform_host.h"
+#elif defined(__APPLE__)
+#include <pingdart/pal/macos/macos_platform_host.h>
 #endif
 
 namespace {
@@ -122,8 +124,48 @@ int main() {
     window->acknowledge_surface_retirement();
     window.reset();
     host->shutdown();
+#elif defined(__APPLE__)
+    using namespace pingdart::pal;
+    using namespace pingdart::pal::macos;
+
+    std::cout << "[DesktopHost] Initializing MacosPlatformHost..." << std::endl;
+    auto host = std::make_unique<MacosPlatformHost>();
+    auto host_status = host->initialize();
+    if (!host_status.ok()) {
+        std::cerr << "macOS host init failed: " << host_status.message() << std::endl;
+        pingdart::core::Runtime::shutdown();
+        return 1;
+    }
+
+    auto window_res = host->create_window("PingDart Native Desktop Host (macOS)", WindowSize{1280, 720});
+    if (!window_res.has_value()) {
+        std::cerr << "Failed to create macOS window: " << window_res.status().message() << std::endl;
+        host->shutdown();
+        pingdart::core::Runtime::shutdown();
+        return 1;
+    }
+
+    auto window = std::move(window_res).value();
+    ConsoleInputDispatcher dispatcher;
+    window->set_input_dispatcher(&dispatcher);
+
+    window->show();
+    std::cout << "[DesktopHost] Native Cocoa window visible (1280x720) with CAMetalLayer surface." << std::endl;
+
+    auto loop = pingdart::core::EventLoop::create();
+    EventPumpWakeupAdapter adapter(host->event_pump());
+    loop->set_wakeup_handle(&adapter);
+
+    // Cooperative event pump loop
+    host->event_pump().poll_events();
+
+    std::cout << "[DesktopHost] Initiating window closure..." << std::endl;
+    window->close();
+    window->acknowledge_surface_retirement();
+    window.reset();
+    host->shutdown();
 #else
-    std::cout << "[DesktopHost] Non-Windows host: Core and PAL interfaces initialized." << std::endl;
+    std::cout << "[DesktopHost] Non-Windows/Non-macOS host: Core and PAL interfaces initialized." << std::endl;
 #endif
 
     pingdart::core::Runtime::shutdown();

@@ -134,7 +134,10 @@ public:
     }
 
     // PKG-111C/D: Relational Database & Object Storage Integration
-    void set_persistent_database(std::shared_ptr<IPersistentPackageDatabase> db) { db_ = std::move(db); }
+    void set_persistent_database(std::shared_ptr<IPersistentPackageDatabase> db) {
+        db_ = db;
+        publisher_security_.set_database(std::move(db));
+    }
     [[nodiscard]] std::shared_ptr<IPersistentPackageDatabase> persistent_database() const noexcept { return db_; }
 
     void set_object_storage(std::shared_ptr<IObjectStorage> storage) { storage_ = std::move(storage); }

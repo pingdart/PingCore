@@ -11,3 +11,7 @@ target_link_libraries(desktop_login PRIVATE
     PingDart::Text
     PingDart::UI
 )
+
+if(APPLE AND NOT IOS)
+    target_link_libraries(desktop_login PRIVATE pingdart_pal_macos)
+endif()

@@ -1,6 +1,8 @@
 // include/pingdart/core/ref_ptr.h
 #pragma once
 #include <atomic>
+#include <cassert>
+#include <cstdlib>
 #include <cstdint>
 #include <cstddef>
 #include <utility>
@@ -170,8 +172,15 @@ template <typename T, typename... Args>
     return RefPtr<T>(new T(std::forward<Args>(args)...));
 }
 
+/// Adopts an existing pointer that already has an acquired reference count (ref_count >= 1).
+/// NEVER call adopt_ref on a freshly allocated object with ref_count == 0; use make_ref<T>() or RefPtr<T>(ptr) instead.
+/// Enforces a release-safe contract check (std::abort on violation) to prevent use-after-free even when NDEBUG is defined.
 template <typename T>
 [[nodiscard]] RefPtr<T> adopt_ref(T* ptr) noexcept {
+    if (ptr != nullptr && ptr->ref_count() == 0) {
+        std::abort();
+    }
+    assert((ptr == nullptr || ptr->ref_count() >= 1) && "adopt_ref() must only be called on an object that already has ref_count >= 1 (e.g. from detach())");
     return RefPtr<T>(AdoptRefTag::Adopt, ptr);
 }
 

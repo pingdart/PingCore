@@ -83,8 +83,8 @@ TEST(MobilePlatformGoogleTest, AndroidWindowSurfaceLifecycleAndGenerations) {
 }
 
 TEST(MobilePlatformGoogleTest, AndroidMultiTouchMotionTranslation) {
-    AndroidWindow window("PingDartAndroid", WindowSize{1080, 2400});
     MockInputDispatcher dispatcher;
+    AndroidWindow window("PingDartAndroid", WindowSize{1080, 2400});
     window.set_input_dispatcher(&dispatcher);
 
     // 1. Single Touch Down
@@ -119,6 +119,8 @@ TEST(MobilePlatformGoogleTest, AndroidMultiTouchMotionTranslation) {
     ASSERT_EQ(dispatcher.pointer_events.size(), 1u);
     EXPECT_EQ(dispatcher.pointer_events[0].type, EventType::PointerUp);
     EXPECT_EQ(dispatcher.pointer_events[0].pointer_id, 11u);
+
+    window.set_input_dispatcher(nullptr);
 }
 
 TEST(MobilePlatformGoogleTest, AndroidHostLifecycleTransitions) {
@@ -193,8 +195,8 @@ TEST(MobilePlatformGoogleTest, IOSWindowMetalSurfaceLifecycleAndPhysicalScaling)
 }
 
 TEST(MobilePlatformGoogleTest, IOSMultiTouchPhaseTranslation) {
-    IOSWindow window("PingDartIOS", WindowSize{393, 852});
     MockInputDispatcher dispatcher;
+    IOSWindow window("PingDartIOS", WindowSize{393, 852});
     window.set_input_dispatcher(&dispatcher);
 
     // 1. Began -> PointerDown
@@ -230,6 +232,8 @@ TEST(MobilePlatformGoogleTest, IOSMultiTouchPhaseTranslation) {
     window.handle_ios_touches(TouchPhase::Cancelled, {t0});
     ASSERT_EQ(dispatcher.pointer_events.size(), 1u);
     EXPECT_EQ(dispatcher.pointer_events[0].type, EventType::PointerLeave);
+
+    window.set_input_dispatcher(nullptr);
 }
 
 TEST(MobilePlatformGoogleTest, IOSSafeAreaInsetsHandling) {

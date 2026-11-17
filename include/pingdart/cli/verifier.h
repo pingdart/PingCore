@@ -43,6 +43,8 @@ private:
     [[nodiscard]] core::Result<PackageVerificationReport> verify_macos_bundle(const std::string& bundle_path, bool smoke_test);
     [[nodiscard]] core::Result<PackageVerificationReport> verify_windows_package(const std::string& package_path, bool smoke_test);
     [[nodiscard]] core::Result<PackageVerificationReport> verify_linux_appdir(const std::string& appdir_path, bool smoke_test);
+    [[nodiscard]] core::Result<PackageVerificationReport> verify_android_package(const std::string& android_path, bool smoke_test);
+    [[nodiscard]] core::Result<PackageVerificationReport> verify_ios_package(const std::string& ios_path, bool smoke_test);
 };
 
 } // namespace pingdart::cli

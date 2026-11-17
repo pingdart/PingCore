@@ -6,11 +6,13 @@
 #include <pingdart/pkg/archive.h>
 #include <pingdart/pkg/resolver.h>
 #include <pingdart/pkg/registry_client.h>
+#include <pingdart/pkg/registry_server.h>
 #include <pingdart/pkg/package_manager.h>
 #include <filesystem>
 #include <fstream>
 
 using namespace pingdart::pkg;
+namespace core = pingdart::core;
 
 // ============================================================================
 // PKG-103: SemVer & Version Constraint Tests

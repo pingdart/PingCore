@@ -16,6 +16,8 @@
 
 namespace pingdart::pkg {
 
+class IPersistentPackageDatabase;
+
 enum class ScanSeverity {
     Info,
     Low,
@@ -167,6 +169,8 @@ class PublisherSecurity {
 public:
     PublisherSecurity();
 
+    void set_database(std::shared_ptr<IPersistentPackageDatabase> db) { db_ = std::move(db); }
+
     // Accounts
     core::Status register_publisher(std::string_view username, std::string_view email, bool verified = false);
     [[nodiscard]] bool publisher_exists(std::string_view username) const;
@@ -213,6 +217,7 @@ private:
     std::map<std::string, PublishingToken> tokens_by_hash_; // SHA-256 hash -> token
     std::map<std::string, std::set<std::string>> package_owners_; // package_name -> owners
     std::vector<SecurityAuditEntry> audit_log_;
+    std::shared_ptr<IPersistentPackageDatabase> db_;
     std::vector<AuditCheckpoint> checkpoints_;
     void seed_default_publishers();
 };

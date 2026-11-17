@@ -15,6 +15,11 @@
 #include <pingdart/ui/input_dispatcher.h>
 #include <iostream>
 
+#if defined(__APPLE__)
+#include <pingdart/pal/macos/macos_platform_host.h>
+#include <pingdart/pal/macos/macos_window.h>
+#endif
+
 using namespace pingdart;
 using namespace pingdart::rhi;
 using namespace pingdart::text;
@@ -30,12 +35,20 @@ int main() {
         return 1;
     }
 
-    // 2. Initialize RHI Render Device & Mock Vulkan Pipeline
+    // 2. Initialize RHI Render Device (Metal on Apple Silicon, Vulkan on other platforms)
+#if defined(__APPLE__)
+    RenderDeviceDescriptor dev_desc{
+        .preferred_api = GraphicsApi::Metal,
+        .enable_validation_layers = true,
+        .prefer_discrete_gpu = true
+    };
+#else
     RenderDeviceDescriptor dev_desc{
         .preferred_api = GraphicsApi::Vulkan,
         .enable_validation_layers = true,
         .prefer_discrete_gpu = true
     };
+#endif
     auto dev_res = IRenderDevice::create(dev_desc);
     if (!dev_res.has_value()) {
         std::cerr << "Failed to initialize RHI RenderDevice: " << dev_res.status().message() << std::endl;
@@ -44,14 +57,33 @@ int main() {
     }
     auto device = std::move(dev_res).value();
     auto dev_info = device->physical_device_info();
-    std::cout << "[Vulkan Backend] Initialized device: " << dev_info.device_name
+    std::cout << "[" << graphics_api_name(device->api_type()) << " Backend] Initialized device: " << dev_info.device_name
               << " (vendorID=0x" << std::hex << dev_info.vendor_id
               << ", deviceID=0x" << dev_info.device_id
               << ", deviceType=" << std::dec << dev_info.device_type
               << ", apiVersion=" << (dev_info.api_version >> 22) << "." << ((dev_info.api_version >> 12) & 0x3FF)
               << ")" << std::endl;
 
+    uint32_t win_w = 1280;
+    uint32_t win_h = 720;
+
     // 3. Create Presentation Surface & Swapchain
+#if defined(__APPLE__)
+    using namespace pingdart::pal::macos;
+    auto host = std::make_unique<MacosPlatformHost>();
+    if (!host->initialize().ok()) {
+        std::cerr << "Failed to initialize macOS platform host" << std::endl;
+        return 1;
+    }
+    auto win_res = host->create_window("PingDart Native Interactive Login (macOS Metal)", pal::WindowSize{win_w, win_h});
+    if (!win_res.has_value()) {
+        std::cerr << "Failed to create native Cocoa window: " << win_res.status().message() << std::endl;
+        return 1;
+    }
+    auto window = std::move(win_res).value();
+    window->show();
+    pal::NativeSurfaceHandle surface = window->native_surface_handle();
+#else
     pal::NativeSurfaceHandle surface{
         .kind = pal::SurfaceKind::Win32,
         .token = pal::Win32SurfaceDescriptor{
@@ -64,17 +96,16 @@ int main() {
         .lifecycle_state = pal::SurfaceLifecycleState::Active,
         .is_valid = true
     };
+#endif
 
-    uint32_t win_w = 1280;
-    uint32_t win_h = 720;
     auto sc_res = device->create_swapchain(surface, win_w, win_h, PresentMode::Mailbox);
     if (!sc_res.has_value()) {
-        std::cerr << "Failed to create Vulkan swapchain: " << sc_res.status().message() << std::endl;
+        std::cerr << "Failed to create swapchain: " << sc_res.status().message() << std::endl;
         core::Runtime::shutdown();
         return 1;
     }
     auto swapchain = std::move(sc_res).value();
-    std::cout << "[Vulkan Swapchain] Created triple-buffered swapchain (" 
+    std::cout << "[" << graphics_api_name(device->api_type()) << " Swapchain] Created triple-buffered swapchain (" 
               << swapchain->width() << "x" << swapchain->height() << ", buffers=" 
               << swapchain->buffer_count() << ")" << std::endl;
 

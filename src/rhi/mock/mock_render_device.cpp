@@ -82,6 +82,42 @@ core::Status MockSwapchain::present(PresentMode mode) {
     return core::Status::Ok();
 }
 
+core::Result<std::vector<uint8_t>> MockSwapchain::capture_screenshot() const {
+    if (!is_valid_ || width_ == 0 || height_ == 0) {
+        return core::Status(core::StatusCode::Unavailable, "Swapchain is invalid or uninitialized");
+    }
+
+    size_t byte_size = static_cast<size_t>(width_) * height_ * 4;
+    std::vector<uint8_t> result(byte_size, 0);
+
+    for (size_t y = 0; y < height_; ++y) {
+        for (size_t x = 0; x < width_; ++x) {
+            size_t idx = (y * width_ + x) * 4;
+            // Predictable, high-contrast test pattern:
+            // Slate background with center button box and grid lines
+            bool is_border = (x == 0 || x == width_ - 1 || y == 0 || y == height_ - 1);
+            bool is_center_button = (x >= width_ / 4 && x <= width_ * 3 / 4 &&
+                                     y >= height_ / 3 && y <= height_ * 2 / 3);
+
+            if (is_border) {
+                result[idx + 0] = 100; // R
+                result[idx + 1] = 116; // G
+                result[idx + 2] = 139; // B
+            } else if (is_center_button) {
+                result[idx + 0] = 59;  // R (Tailwind Blue 500)
+                result[idx + 1] = 130; // G
+                result[idx + 2] = 246; // B
+            } else {
+                result[idx + 0] = 15;  // R (Slate 900)
+                result[idx + 1] = 23;  // G
+                result[idx + 2] = 42;  // B
+            }
+            result[idx + 3] = 255;     // A
+        }
+    }
+    return result;
+}
+
 // --- MockCommandBuffer ---
 
 MockCommandBuffer::MockCommandBuffer() = default;

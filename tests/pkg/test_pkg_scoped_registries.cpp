@@ -7,6 +7,7 @@
 #include <fstream>
 
 using namespace pingdart::pkg;
+namespace core = pingdart::core;
 
 // ============================================================================
 // PKG-110: Scoped Package Identification & Validation Tests

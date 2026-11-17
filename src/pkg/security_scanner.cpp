@@ -2,6 +2,7 @@
 // PKG-109: Package Scanning, Advisories and Publisher Security Implementation
 #include <pingdart/pkg/security_scanner.h>
 #include <pingdart/pkg/archive.h>
+#include <pingdart/pkg/database.h>
 #include <sstream>
 #include <fstream>
 #include <algorithm>
@@ -517,7 +518,9 @@ core::Status PublisherSecurity::register_publisher(
 }
 
 bool PublisherSecurity::publisher_exists(std::string_view username) const {
-    return publishers_.count(std::string(username)) > 0;
+    if (publishers_.count(std::string(username)) > 0) return true;
+    if (db_ && db_->has_publisher(username)) return true;
+    return false;
 }
 
 bool PublisherSecurity::is_verified_publisher(std::string_view username) const {

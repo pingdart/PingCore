@@ -31,7 +31,7 @@ core::RefPtr<FontFace> FontFace::load_from_file(const std::string& path, uint32_
     if (err) {
         return nullptr;
     }
-    return core::adopt_ref(new FontFace(face));
+    return core::RefPtr<FontFace>(new FontFace(face));
 }
 
 core::RefPtr<FontFace> FontFace::load_from_memory(const uint8_t* data, size_t size, uint32_t face_index) {
@@ -45,7 +45,7 @@ core::RefPtr<FontFace> FontFace::load_from_memory(const uint8_t* data, size_t si
     if (err) {
         return nullptr;
     }
-    return core::adopt_ref(new FontFace(face, std::move(buffer)));
+    return core::RefPtr<FontFace>(new FontFace(face, std::move(buffer)));
 }
 
 static std::atomic<uint64_t> s_next_font_id{1};

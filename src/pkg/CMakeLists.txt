@@ -28,10 +28,13 @@ target_include_directories(pingdart_pkg
 target_link_libraries(pingdart_pkg
     PUBLIC
         PingDart::Core
+        PingDart::Security
 )
 
 if(WIN32)
     target_link_libraries(pingdart_pkg PUBLIC bcrypt)
+elseif(APPLE)
+    target_link_libraries(pingdart_pkg PUBLIC "-framework Security")
 endif()
 
 add_library(PingDart::PKG ALIAS pingdart_pkg)

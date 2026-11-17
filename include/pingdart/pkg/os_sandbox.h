@@ -14,6 +14,7 @@ enum class OsSandboxEngine {
     Auto,
     WindowsAppContainerAndRestrictedToken,
     LinuxNamespacesAndSeccomp,
+    MacosSeatbeltAndResourceLimits,
     IsolatedWorkerContainer
 };
 
@@ -25,6 +26,7 @@ struct OsSandboxLimits {
     bool read_only_host_fs{true};                            // Host root mounted read-only
     bool strip_host_credentials{true};                       // Drop ambient tokens & keys
     bool enable_app_container{true};                         // Windows AppContainer profile isolation
+    bool require_strict_os_sandbox{true};                    // Fail closed if OS-level kernel sandbox cannot be applied
 };
 
 struct OsSandboxExecutionReport {
@@ -70,6 +72,14 @@ private:
         const std::filesystem::path& workspace_dir,
         std::string_view command_line
     );
+#elif defined(__APPLE__)
+    [[nodiscard]] core::Result<OsSandboxExecutionReport> run_macos_seatbelt_worker(
+        const std::filesystem::path& workspace_dir,
+        std::string_view command_line
+    );
+    [[nodiscard]] std::string generate_seatbelt_profile(
+        const std::filesystem::path& workspace_dir
+    ) const;
 #endif
 };
 

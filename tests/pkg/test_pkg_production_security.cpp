@@ -25,6 +25,7 @@ using namespace pingdart::pkg;
 
 TEST(PkgProductionSecurityTest, CSPRNGTokenEntropyAndNonPredictability) {
     PublisherSecurity security;
+    security.register_publisher("test-publisher", "test@pingdart.dev", true);
     std::set<std::string> generated_tokens;
     const size_t iterations = 100;
 

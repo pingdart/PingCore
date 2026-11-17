@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 #include <pingdart/pkg/registry_server.h>
 #include <pingdart/pkg/archive.h>
+#include <fstream>
 
 using namespace pingdart::pkg;
 

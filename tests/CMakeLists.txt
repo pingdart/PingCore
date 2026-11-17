@@ -103,6 +103,25 @@ if(TARGET gtest_main)
     )
     add_test(NAME UnifiedInputGoogleTest COMMAND test_unified_input)
 
+    # macOS Platform Tests (PKG-113: Cocoa NSWindow & CAMetalLayer)
+    if(APPLE AND NOT IOS)
+        add_executable(test_macos_platform
+            pal/test_macos_platform.mm
+        )
+        target_link_libraries(test_macos_platform PRIVATE
+            PingDart::PALMacos
+            PingDart::PAL
+            PingDart::Core
+            GTest::gtest_main
+            "-framework Cocoa"
+            "-framework Metal"
+            "-framework QuartzCore"
+            "-framework Carbon"
+        )
+        target_compile_options(test_macos_platform PRIVATE -fobjc-arc)
+        add_test(NAME MacosPlatformGoogleTest COMMAND test_macos_platform)
+    endif()
+
     # Mobile Platform Tests (MOBILE-101: Android NDK & iOS UIKit/Metal)
     add_executable(test_mobile_platform
         pal/test_mobile_platform.cpp
@@ -158,6 +177,25 @@ if(TARGET gtest_main)
         GTest::gtest_main
     )
     add_test(NAME VulkanPipelineGoogleTest COMMAND test_vulkan_pipeline)
+
+    # Native Metal Backend Tests (PKG-114: Apple Silicon / Metal RHI)
+    if(APPLE)
+        add_executable(test_metal_backend
+            rhi/test_metal_backend.mm
+        )
+        target_link_libraries(test_metal_backend PRIVATE
+            PingDart::RHI
+            PingDart::PALMacos
+            PingDart::PAL
+            PingDart::Core
+            GTest::gtest_main
+            "-framework Metal"
+            "-framework QuartzCore"
+            "-framework Cocoa"
+        )
+        target_compile_options(test_metal_backend PRIVATE -fobjc-arc)
+        add_test(NAME MetalBackendGoogleTest COMMAND test_metal_backend)
+    endif()
 
     add_executable(test_display_list
         rhi/test_display_list.cpp
@@ -483,4 +521,403 @@ if(TARGET gtest_main)
         GTest::gtest_main
     )
     add_test(NAME PkgStagingE2EGoogleTest COMMAND test_pkg_staging_e2e)
+
+    # PKG-115: Memory Safety Primitives Suite
+    add_executable(test_safe_primitives
+        safety/test_safe_primitives.cpp
+    )
+    target_link_libraries(test_safe_primitives PRIVATE
+        PingDart::Safety
+        PingDart::Core
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    add_test(NAME SafePrimitivesGoogleTest COMMAND test_safe_primitives)
+
+    # PKG-115: Security Subsystems & OS Sandbox Isolation Suite
+    add_executable(test_security_hardening
+        security/test_security_hardening.cpp
+    )
+    target_link_libraries(test_security_hardening PRIVATE
+        PingDart::Security
+        PingDart::Safety
+        PingDart::PKG
+        PingDart::Core
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    add_test(NAME SecurityHardeningGoogleTest COMMAND test_security_hardening)
+
+    # PKG-116: Fuzz Testing Suite for Parsers, Manifests, Archives, and Boundaries
+    add_executable(test_security_fuzzing
+        fuzz/test_security_fuzzing.cpp
+    )
+    target_link_libraries(test_security_fuzzing PRIVATE
+        PingDart::PKG
+        PingDart::Security
+        PingDart::Safety
+        PingDart::Core
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    add_test(NAME SecurityFuzzingGoogleTest COMMAND test_security_fuzzing)
+
+    # PKG-117: Mobile Platform Lifecycle, Multi-Touch & Packaging Suites
+    add_executable(test_mobile_lifecycle
+        mobile/test_mobile_lifecycle.cpp
+    )
+    target_link_libraries(test_mobile_lifecycle PRIVATE
+        PingDart::PALMobile
+        PingDart::Core
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    add_test(NAME MobileLifecycleGoogleTest COMMAND test_mobile_lifecycle)
+
+    add_executable(test_mobile_touch
+        mobile/test_mobile_touch.cpp
+    )
+    target_link_libraries(test_mobile_touch PRIVATE
+        shared_login_lib
+        PingDart::PALMobile
+        PingDart::Core
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    add_test(NAME MobileTouchGoogleTest COMMAND test_mobile_touch)
+
+    add_executable(test_mobile_packaging
+        mobile/test_mobile_packaging.cpp
+    )
+    target_link_libraries(test_mobile_packaging PRIVATE
+        shared_login_lib
+        PingDart::PALMobile
+        PingDart::Core
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    add_test(NAME MobilePackagingGoogleTest COMMAND test_mobile_packaging)
+
+    # PKG-118: PingCore Developer SDK Tests
+    add_executable(test_pingcore_sdk
+        sdk/test_pingcore_sdk.cpp
+    )
+    target_include_directories(test_pingcore_sdk PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_pingcore_sdk PRIVATE
+        PingDart::Core
+        PingDart::PAL
+        PingDart::RHI
+        PingDart::UI
+        PingDart::Text
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    if(APPLE AND NOT IOS)
+        target_link_libraries(test_pingcore_sdk PRIVATE pingdart_pal_macos)
+    endif()
+    add_test(NAME PingCoreSdkGoogleTest COMMAND test_pingcore_sdk)
+
+    # PKG-119: PingCore Backend API SDK Tests
+    add_executable(test_pingcore_server
+        server/test_pingcore_server.cpp
+    )
+    target_include_directories(test_pingcore_server PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_pingcore_server PRIVATE
+        pingcore_server
+        PingDart::Core
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    add_test(NAME PingCoreServerGoogleTest COMMAND test_pingcore_server)
+
+    # PKG-119: Visual Correctness & Golden Image Verification Tests
+    add_executable(test_golden_image
+        visual/test_golden_image.cpp
+    )
+    target_include_directories(test_golden_image PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_golden_image PRIVATE
+        PingDart::Core
+        PingDart::PAL
+        PingDart::RHI
+        PingDart::UI
+        PingDart::Text
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    if(APPLE AND NOT IOS)
+        target_link_libraries(test_golden_image PRIVATE pingdart_pal_macos)
+    endif()
+    add_test(NAME GoldenImageGoogleTest COMMAND test_golden_image)
+
+    # PKG-119: Next.js-Style File-Based Router & UI Components Tests
+    add_executable(test_nextjs_router
+        router/test_nextjs_router.cpp
+    )
+    target_include_directories(test_nextjs_router PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_nextjs_router PRIVATE
+        pingcore_server
+        PingDart::Core
+        PingDart::PAL
+        PingDart::RHI
+        PingDart::UI
+        PingDart::Text
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    if(APPLE AND NOT IOS)
+        target_link_libraries(test_nextjs_router PRIVATE pingdart_pal_macos)
+    endif()
+    add_test(NAME NextJsRouterGoogleTest COMMAND test_nextjs_router)
+
+    # PKG-120: Web Runtime, SSR, SEO, Route Compiler & Security Tests
+    add_executable(test_pkg120_web_ssr
+        web/test_pkg120_web_ssr.cpp
+    )
+    target_include_directories(test_pkg120_web_ssr PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_pkg120_web_ssr PRIVATE
+        pingcore_server
+        PingDart::Web
+        PingDart::Core
+        PingDart::PAL
+        PingDart::RHI
+        PingDart::UI
+        PingDart::Text
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    if(APPLE AND NOT IOS)
+        target_link_libraries(test_pkg120_web_ssr PRIVATE pingdart_pal_macos)
+    endif()
+    add_test(NAME Pkg120WebSsrGoogleTest COMMAND test_pkg120_web_ssr)
+
+    # PKG-121: Real Native Platforms Scaffolding, Permissions & Native Bridge Tests
+    add_executable(test_pkg121_native_platforms
+        native/test_pkg121_native_platforms.cpp
+    )
+    target_include_directories(test_pkg121_native_platforms PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_pkg121_native_platforms PRIVATE
+        PingDart::Core
+        PingDart::PAL
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    if(APPLE AND NOT IOS)
+        target_link_libraries(test_pkg121_native_platforms PRIVATE pingdart_pal_macos)
+    endif()
+    add_test(NAME Pkg121NativePlatformsGoogleTest COMMAND test_pkg121_native_platforms)
+
+    # PKG-122: Native Module System, Async C ABI & Version-Aware Permissions Tests
+    add_executable(test_pkg122_native_modules
+        native/test_pkg122_native_modules.cpp
+    )
+    target_include_directories(test_pkg122_native_modules PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_pkg122_native_modules PRIVATE
+        PingDart::Core
+        PingDart::PAL
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    if(APPLE AND NOT IOS)
+        target_link_libraries(test_pkg122_native_modules PRIVATE pingdart_pal_macos)
+    endif()
+    add_test(NAME Pkg122NativeModulesGoogleTest COMMAND test_pkg122_native_modules)
+
+    # PKG-123: Native Module Runtime Integration, Async State Machine, Mutex Discipline & Atomic Removal Tests
+    add_executable(test_pkg123_runtime_integration
+        native/test_pkg123_runtime_integration.cpp
+    )
+    target_include_directories(test_pkg123_runtime_integration PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_pkg123_runtime_integration PRIVATE
+        PingDart::Core
+        PingDart::PAL
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    if(APPLE AND NOT IOS)
+        target_link_libraries(test_pkg123_runtime_integration PRIVATE pingdart_pal_macos)
+    endif()
+    add_test(NAME Pkg123RuntimeIntegrationGoogleTest COMMAND test_pkg123_runtime_integration)
+
+    # PKG-124: Full-Stack Reactivity Core, Signals, Queries, Hydration, Async Server & Hot Reload Tests
+    add_executable(test_pkg124_fullstack_runtime
+        native/test_pkg124_fullstack_runtime.cpp
+    )
+    target_include_directories(test_pkg124_fullstack_runtime PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_pkg124_fullstack_runtime PRIVATE
+        PingDart::Core
+        PingDart::PAL
+        PingDart::UI
+        PingDart::RHI
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    if(APPLE AND NOT IOS)
+        target_link_libraries(test_pkg124_fullstack_runtime PRIVATE pingdart_pal_macos)
+    endif()
+    add_test(NAME Pkg124FullStackRuntimeGoogleTest COMMAND test_pkg124_fullstack_runtime)
+
+    # PKG-125: Production Runtime Validation, Performance & Reliability Tests
+    add_executable(test_pkg125_production_validation
+        native/test_pkg125_production_validation.cpp
+    )
+    target_include_directories(test_pkg125_production_validation PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_pkg125_production_validation PRIVATE
+        pingcore_server
+        PingDart::Core
+        PingDart::PAL
+        PingDart::UI
+        PingDart::RHI
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    if(APPLE AND NOT IOS)
+        target_link_libraries(test_pkg125_production_validation PRIVATE pingdart_pal_macos)
+    endif()
+    add_test(NAME Pkg125ProductionValidationGoogleTest COMMAND test_pkg125_production_validation)
+
+    # PKG-126: Production Hardening & Real-World End-to-End Certification Tests
+    add_executable(test_pkg126_production_hardening
+        native/test_pkg126_production_hardening.cpp
+    )
+    target_include_directories(test_pkg126_production_hardening PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_pkg126_production_hardening PRIVATE
+        pingcore_server
+        PingDart::Core
+        PingDart::PAL
+        PingDart::UI
+        PingDart::RHI
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    if(APPLE AND NOT IOS)
+        target_link_libraries(test_pkg126_production_hardening PRIVATE pingdart_pal_macos)
+    endif()
+    add_test(NAME Pkg126ProductionHardeningGoogleTest COMMAND test_pkg126_production_hardening)
+
+    # PKG-127: Real Browser, TCP/TLS & Native Device Certification Tests
+    add_executable(test_pkg127_browser_tcp_certification
+        native/test_pkg127_browser_tcp_certification.cpp
+    )
+    target_include_directories(test_pkg127_browser_tcp_certification PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_pkg127_browser_tcp_certification PRIVATE
+        pingcore_server
+        PingDart::Core
+        PingDart::PAL
+        PingDart::UI
+        PingDart::RHI
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    if(APPLE AND NOT IOS)
+        target_link_libraries(test_pkg127_browser_tcp_certification PRIVATE pingdart_pal_macos)
+    endif()
+    add_test(NAME Pkg127BrowserTcpCertificationGoogleTest COMMAND test_pkg127_browser_tcp_certification)
+
+    # PKG-128: End-to-End Full-Stack Application Certification Tests
+    add_executable(test_pkg128_fullstack_certification
+        native/test_pkg128_fullstack_certification.cpp
+    )
+    target_include_directories(test_pkg128_fullstack_certification PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_pkg128_fullstack_certification PRIVATE
+        pingcore_server
+        PingDart::Core
+        PingDart::PAL
+        PingDart::UI
+        PingDart::RHI
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    if(APPLE AND NOT IOS)
+        target_link_libraries(test_pkg128_fullstack_certification PRIVATE pingdart_pal_macos)
+    endif()
+    add_test(NAME Pkg128FullStackCertificationGoogleTest COMMAND test_pkg128_fullstack_certification)
+
+    # PKG-129: Real Application Runtime & Deployment Certification Tests
+    add_executable(test_pkg129_runtime_deployment
+        native/test_pkg129_runtime_deployment.cpp
+    )
+    target_include_directories(test_pkg129_runtime_deployment PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_pkg129_runtime_deployment PRIVATE
+        pingcore_server
+        PingDart::Core
+        PingDart::PAL
+        PingDart::UI
+        PingDart::RHI
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    if(APPLE AND NOT IOS)
+        target_link_libraries(test_pkg129_runtime_deployment PRIVATE pingdart_pal_macos)
+    endif()
+    add_test(NAME Pkg129RuntimeDeploymentGoogleTest COMMAND test_pkg129_runtime_deployment)
+
+    # PKG-130: Genuine Native Runtime & Network Integration Certification Tests
+    add_executable(test_pkg130_native_runtime_integration
+        native/test_pkg130_native_runtime_integration.cpp
+    )
+    target_include_directories(test_pkg130_native_runtime_integration PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_pkg130_native_runtime_integration PRIVATE
+        pingcore_server
+        PingDart::Core
+        PingDart::PAL
+        PingDart::UI
+        PingDart::RHI
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    if(APPLE AND NOT IOS)
+        target_link_libraries(test_pkg130_native_runtime_integration PRIVATE pingdart_pal_macos)
+    endif()
+    add_test(NAME Pkg130NativeRuntimeIntegrationGoogleTest COMMAND test_pkg130_native_runtime_integration)
 endif()

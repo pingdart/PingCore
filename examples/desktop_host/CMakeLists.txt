@@ -11,4 +11,6 @@ target_link_libraries(desktop_host PRIVATE
 
 if(WIN32)
     target_link_libraries(desktop_host PRIVATE pingdart_pal_windows)
+elseif(APPLE AND NOT IOS)
+    target_link_libraries(desktop_host PRIVATE pingdart_pal_macos)
 endif()

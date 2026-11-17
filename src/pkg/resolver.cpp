@@ -60,10 +60,6 @@ core::Status DependencyResolver::resolve_recursive(
     }
 
     if (visit_path.count(pkg_name)) {
-        // Allow re-visiting if already resolved, otherwise cycle
-        if (resolved.count(pkg_name)) {
-            return core::Status{};
-        }
         return core::Status(core::StatusCode::Internal, "Circular dependency cycle detected at: " + pkg_name);
     }
 

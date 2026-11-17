@@ -43,6 +43,7 @@ public:
     [[nodiscard]] core::Status resize(uint32_t width, uint32_t height) override;
     [[nodiscard]] core::Result<ITexture*> acquire_next_backbuffer() override;
     [[nodiscard]] core::Status present(PresentMode mode = PresentMode::Fifo) override;
+    [[nodiscard]] core::Result<std::vector<uint8_t>> capture_screenshot() const override;
 
     [[nodiscard]] uint32_t width() const noexcept override { return width_; }
     [[nodiscard]] uint32_t height() const noexcept override { return height_; }

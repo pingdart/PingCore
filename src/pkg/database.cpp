@@ -126,6 +126,11 @@ void PostgresPackageDatabase::register_publisher(std::string_view username, std:
     };
 }
 
+bool PostgresPackageDatabase::has_publisher(std::string_view username) const {
+    std::lock_guard<std::mutex> lock(db_mutex_);
+    return publishers_.count(std::string(username)) > 0;
+}
+
 core::Status PostgresPackageDatabase::initialize_schema() {
     // Verifies PostgreSQL table DDL execution
     return core::Status{};
