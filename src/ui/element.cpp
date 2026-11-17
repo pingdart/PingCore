@@ -1,6 +1,7 @@
 #include <pingdart/ui/element.h>
 #include <pingdart/ui/render_object_widget.h>
 #include <pingdart/ui/widget_tree.h>
+#include <stdexcept>
 
 namespace pingdart::ui {
 

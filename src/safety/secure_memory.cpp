@@ -4,7 +4,9 @@
 #include <pingdart/safety/secure_memory.h>
 #include <cstdlib>
 #include <cstring>
+#if !defined(_WIN32)
 #include <strings.h>
+#endif
 
 #if defined(_WIN32)
 #include <windows.h>

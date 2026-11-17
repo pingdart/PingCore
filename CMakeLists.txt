@@ -118,8 +118,10 @@ add_subdirectory(src/rhi)
 # Text Rendering & Typography Engine (HarfBuzz, Unicode, Font Manager)
 if(Freetype_FOUND AND HarfBuzz_FOUND)
     add_subdirectory(src/text)
-    add_subdirectory(src/ui)
 endif()
+
+# Declarative Widget Engine & Layout System (ENG-501..ENG-503)
+add_subdirectory(src/ui)
 
 # First-Class Web Platform & SEO Engine
 add_subdirectory(src/web)

@@ -8,6 +8,12 @@ target_link_libraries(pd
         PingDart::PKG
         PingDart::Core
         PingDart::UI
-        PingDart::Text
-        pingcore_server
 )
+
+if(TARGET PingDart::Text)
+    target_link_libraries(pd PRIVATE PingDart::Text)
+endif()
+
+if(TARGET pingcore_server)
+    target_link_libraries(pd PRIVATE pingcore_server)
+endif()

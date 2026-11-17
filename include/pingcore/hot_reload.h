@@ -23,6 +23,10 @@
 #include <dlfcn.h>
 #elif defined(__linux__)
 #include <dlfcn.h>
+#elif defined(_WIN32)
+#include <windows.h>
+#define popen _popen
+#define pclose _pclose
 #endif
 
 namespace pingcore {

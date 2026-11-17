@@ -88,6 +88,88 @@ int handle_doctor() {
     return report.toolchain_ready ? 0 : 1;
 }
 
+static bool compile_android_shared_library(const std::filesystem::path& so_path) {
+    std::string ndk_clang;
+    const char* env_ndk = std::getenv("ANDROID_NDK_HOME");
+    if (!env_ndk) env_ndk = std::getenv("ANDROID_NDK_ROOT");
+    if (!env_ndk) env_ndk = std::getenv("NDK_ROOT");
+
+    std::vector<std::filesystem::path> search_roots;
+    if (env_ndk && *env_ndk) search_roots.push_back(env_ndk);
+#if defined(_WIN32)
+    const char* userprofile = std::getenv("USERPROFILE");
+    const char* localappdata = std::getenv("LOCALAPPDATA");
+    if (localappdata) search_roots.push_back(std::filesystem::path(localappdata) / "Android" / "Sdk" / "ndk");
+    if (userprofile) search_roots.push_back(std::filesystem::path(userprofile) / "AppData" / "Local" / "Android" / "Sdk" / "ndk");
+#elif defined(__APPLE__)
+    const char* home = std::getenv("HOME");
+    if (home) search_roots.push_back(std::filesystem::path(home) / "Library" / "Android" / "sdk" / "ndk");
+#else
+    const char* home = std::getenv("HOME");
+    if (home) search_roots.push_back(std::filesystem::path(home) / "Android" / "Sdk" / "ndk");
+    search_roots.push_back("/opt/android-sdk/ndk");
+    search_roots.push_back("/usr/local/share/android-ndk");
+#endif
+
+    for (const auto& root : search_roots) {
+        if (!std::filesystem::exists(root)) continue;
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(root, ec)) {
+            if (ec) break;
+            std::string filename = entry.path().filename().string();
+            if (filename.find("aarch64-linux-android") != std::string::npos &&
+                filename.find("-clang") != std::string::npos &&
+                filename.find("++") == std::string::npos) {
+#if defined(_WIN32)
+                if (filename.ends_with(".cmd") || filename.ends_with(".exe")) {
+                    ndk_clang = entry.path().string();
+                    break;
+                }
+#else
+                if (!filename.ends_with(".cmd")) {
+                    ndk_clang = entry.path().string();
+                    break;
+                }
+#endif
+            }
+        }
+        if (!ndk_clang.empty()) break;
+    }
+
+    auto temp_dir = std::filesystem::temp_directory_path();
+    auto c_src = temp_dir / "pingcore_jni_entry.c";
+    {
+        std::ofstream out(c_src);
+        out << "/* PingCore Android JNI Native Entry Point */\n"
+            << "#include <stdint.h>\n"
+            << "__attribute__((visibility(\"default\")))\n"
+            << "int32_t JNI_OnLoad(void* vm, void* reserved) {\n"
+            << "    (void)vm; (void)reserved;\n"
+            << "    return 0x00010006; /* JNI_VERSION_1_6 */\n"
+            << "}\n"
+            << "__attribute__((visibility(\"default\")))\n"
+            << "int32_t pingcore_android_main(void) {\n"
+            << "    return 0;\n"
+            << "}\n";
+    }
+
+    std::string cmd;
+    if (!ndk_clang.empty()) {
+#if defined(_WIN32)
+        cmd = "call \"" + ndk_clang + "\" -shared -fPIC -O2 -Wl,-soname,libpingcore_app.so -o \"" + so_path.string() + "\" \"" + c_src.string() + "\"";
+#else
+        cmd = "\"" + ndk_clang + "\" -shared -fPIC -O2 -Wl,-soname,libpingcore_app.so -o \"" + so_path.string() + "\" \"" + c_src.string() + "\"";
+#endif
+    } else {
+        cmd = "clang -target aarch64-linux-android -shared -fPIC -O2 -nostdlib -fuse-ld=lld -Wl,-soname,libpingcore_app.so -o \"" + so_path.string() + "\" \"" + c_src.string() + "\" 2>/dev/null";
+    }
+
+    int rc = std::system(cmd.c_str());
+    std::error_code ec;
+    std::filesystem::remove(c_src, ec);
+    return (rc == 0 && std::filesystem::exists(so_path));
+}
+
 int handle_build(int argc, char* argv[]) {
     std::string target = "host";
     BuildOptions opts;
@@ -146,19 +228,8 @@ int handle_build(int argc, char* argv[]) {
         std::filesystem::create_directories(staging / "META-INF", ec);
 
         std::filesystem::path so_path = staging / "lib" / "arm64-v8a" / "libpingcore_app.so";
-        std::string elf_cmd = "/usr/bin/clang -target aarch64-linux-android -c -O2 -fPIC -o \"" +
-            so_path.string() + "\" -x c - <<< 'int JNI_OnLoad(void* vm, void* reserved) { (void)vm; (void)reserved; return 0x00010006; } int pingcore_android_main() { return 0; }' 2>&1";
-        (void)::system(elf_cmd.c_str());
-
-        // Patch ELF header byte 16 from ET_REL (1) to ET_DYN (3) to produce valid loadable shared object
-        if (std::filesystem::exists(so_path)) {
-            std::fstream so_file(so_path, std::ios::in | std::ios::out | std::ios::binary);
-            if (so_file.is_open()) {
-                so_file.seekp(16);
-                char dyn_type = 3; // ET_DYN = 3 (Shared object file)
-                so_file.put(dyn_type);
-                so_file.close();
-            }
+        if (!compile_android_shared_library(so_path)) {
+            std::cerr << "[pd build] Warning: Could not compile native Android shared library via NDK toolchain." << std::endl;
         }
 
         std::ofstream dex(staging / "classes.dex", std::ios::binary);

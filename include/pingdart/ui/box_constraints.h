@@ -89,12 +89,12 @@ public:
     }
 
     [[nodiscard]] constexpr float constrain_width(float width = infinity) const noexcept {
-        if (std::isnan(width)) return min_width;
+        if (width != width) return min_width;
         return std::clamp(width, min_width, max_width);
     }
 
     [[nodiscard]] constexpr float constrain_height(float height = infinity) const noexcept {
-        if (std::isnan(height)) return min_height;
+        if (height != height) return min_height;
         return std::clamp(height, min_height, max_height);
     }
 

@@ -21,7 +21,10 @@ target_link_libraries(pingdart_ui
         PingDart::Core
         PingDart::PAL
         PingDart::RHI
-        PingDart::Text
 )
+
+if(TARGET PingDart::Text)
+    target_link_libraries(pingdart_ui PUBLIC PingDart::Text)
+endif()
 
 add_library(PingDart::UI ALIAS pingdart_ui)
