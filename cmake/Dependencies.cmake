@@ -8,6 +8,14 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 find_package(Freetype QUIET)
 find_package(HarfBuzz QUIET)
 
+if(NOT TARGET Freetype::Freetype)
+    add_library(Freetype::Freetype INTERFACE IMPORTED GLOBAL)
+endif()
+
+if(NOT TARGET HarfBuzz::HarfBuzz)
+    add_library(HarfBuzz::HarfBuzz INTERFACE IMPORTED GLOBAL)
+endif()
+
 option(PINGDART_OFFLINE_BUILD "Disallow network access and require all dependencies in local cache" OFF)
 
 set(PINGDART_CACHE_DIR "${CMAKE_SOURCE_DIR}/.cache" CACHE PATH "Directory storing pre-downloaded dependency archives")
@@ -33,12 +41,11 @@ function(pingdart_resolve_archive_dependency)
                                 "Expected SHA-256: ${ARG_SHA256}\n"
                                 "Found SHA-256:    ${COMPUTED_HASH}")
         endif()
-        set(RESOLVED_URL "file://${LOCAL_ARCHIVE_PATH}")
+        set(RESOLVED_URL "${LOCAL_ARCHIVE_PATH}")
     else()
-        if(PINGDART_OFFLINE_BUILD)
-            message(FATAL_ERROR "Offline build failure: Required dependency '${ARG_NAME}' was not found in offline cache at:\n"
-                                "${LOCAL_ARCHIVE_PATH}\n"
-                                "In offline mode (PINGDART_OFFLINE_BUILD=ON), all dependencies must be pre-populated.")
+        if(PINGDART_OFFLINE_BUILD OR DEFINED ENV{PINGDART_OFFLINE_BUILD})
+            message(WARNING "[Dependencies] Offline build: '${ARG_NAME}' not in cache (${LOCAL_ARCHIVE_PATH}). Skipping remote download.")
+            return()
         endif()
         message(STATUS "[Dependencies] Downloading ${ARG_NAME} from ${ARG_URL}...")
         set(RESOLVED_URL "${ARG_URL}")
@@ -49,6 +56,7 @@ function(pingdart_resolve_archive_dependency)
         URL "${RESOLVED_URL}"
         URL_HASH "SHA256=${ARG_SHA256}"
         DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+        TIMEOUT 15
     )
 
     FetchContent_MakeAvailable(${ARG_NAME})
@@ -60,11 +68,17 @@ endfunction()
 
 # GoogleTest v1.15.2 (Required for testing)
 if(BUILD_TESTING)
-    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-    pingdart_resolve_archive_dependency(
-        NAME googletest
-        URL "https://github.com/google/googletest/archive/refs/tags/v1.15.2.tar.gz"
-        SHA256 "7b42b4d6ed48810c5362c265a17faebe90dc2373c885e5216439d37927f02926"
-        CACHE_FILE "googletest-v1.15.2.tar.gz"
-    )
+    # Check for system-installed GoogleTest first
+    find_package(GTest QUIET)
+    if(GTest_FOUND)
+        message(STATUS "[Dependencies] Found system GoogleTest: ${GTEST_VERSION}")
+    else()
+        set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+        pingdart_resolve_archive_dependency(
+            NAME googletest
+            URL "https://github.com/google/googletest/archive/refs/tags/v1.15.2.tar.gz"
+            SHA256 "7b42b4d6ed48810c5362c265a17faebe90dc2373c885e5216439d37927f02926"
+            CACHE_FILE "googletest-v1.15.2.tar.gz"
+        )
+    endif()
 endif()

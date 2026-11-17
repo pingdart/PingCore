@@ -17,13 +17,13 @@ target_link_libraries(pingdart_cli
         PingDart::Core
 )
 
-if(TARGET Freetype::Freetype)
+if(Freetype_FOUND)
     target_compile_definitions(pingdart_cli PRIVATE PINGDART_HAS_FREETYPE=1)
     target_include_directories(pingdart_cli PRIVATE ${FREETYPE_INCLUDE_DIRS})
     target_link_libraries(pingdart_cli PRIVATE Freetype::Freetype)
 endif()
 
-if(TARGET HarfBuzz::HarfBuzz)
+if(HarfBuzz_FOUND)
     target_compile_definitions(pingdart_cli PRIVATE PINGDART_HAS_HARFBUZZ=1)
     target_include_directories(pingdart_cli PRIVATE ${HarfBuzz_INCLUDE_DIR})
     target_link_libraries(pingdart_cli PRIVATE HarfBuzz::HarfBuzz)

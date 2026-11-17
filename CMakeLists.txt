@@ -118,6 +118,14 @@ add_subdirectory(src/rhi)
 # Text Rendering & Typography Engine (HarfBuzz, Unicode, Font Manager)
 if(Freetype_FOUND AND HarfBuzz_FOUND)
     add_subdirectory(src/text)
+else()
+    if(NOT TARGET PingDart::Text)
+        add_library(PingDart::Text INTERFACE IMPORTED GLOBAL)
+        target_include_directories(PingDart::Text INTERFACE
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:include>
+        )
+    endif()
 endif()
 
 # Declarative Widget Engine & Layout System (ENG-501..ENG-503)

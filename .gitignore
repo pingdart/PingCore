@@ -3,7 +3,8 @@ build/
 build-*/
 dist/
 dist-*/
-.cache/
+.cache/*
+!.cache/googletest-v1.15.2.tar.gz
 compile_commands.json
 .DS_Store
 *.swp

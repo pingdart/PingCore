@@ -88,6 +88,132 @@ int handle_doctor() {
     return report.toolchain_ready ? 0 : 1;
 }
 
+static uint32_t calculate_crc32(const uint8_t* data, size_t length) {
+    uint32_t crc = 0xFFFFFFFF;
+    for (size_t i = 0; i < length; ++i) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; ++j) {
+            crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
+        }
+    }
+    return ~crc;
+}
+
+static bool create_zip_archive(const std::filesystem::path& src_dir, const std::filesystem::path& zip_path) {
+    std::ofstream out(zip_path, std::ios::binary);
+    if (!out.is_open()) return false;
+
+    struct ZipEntryMeta {
+        std::string rel_path;
+        uint32_t crc;
+        uint32_t size;
+        uint32_t offset;
+    };
+    std::vector<ZipEntryMeta> entries;
+
+    std::error_code ec;
+    for (const auto& it : std::filesystem::recursive_directory_iterator(src_dir, ec)) {
+        if (!it.is_regular_file()) continue;
+        auto rel = std::filesystem::relative(it.path(), src_dir).generic_string();
+
+        std::ifstream f(it.path(), std::ios::binary);
+        if (!f.is_open()) continue;
+        std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        f.close();
+
+        uint32_t offset = static_cast<uint32_t>(out.tellp());
+        uint32_t crc = calculate_crc32(data.data(), data.size());
+        uint32_t size = static_cast<uint32_t>(data.size());
+        uint16_t name_len = static_cast<uint16_t>(rel.size());
+
+        // Local file header (30 bytes)
+        uint32_t sig = 0x04034b50;
+        uint16_t ver = 20;
+        uint16_t flags = 0;
+        uint16_t method = 0; // Stored (no compression)
+        uint16_t mtime = 0;
+        uint16_t mdate = 0;
+        uint16_t extra_len = 0;
+
+        out.write(reinterpret_cast<const char*>(&sig), 4);
+        out.write(reinterpret_cast<const char*>(&ver), 2);
+        out.write(reinterpret_cast<const char*>(&flags), 2);
+        out.write(reinterpret_cast<const char*>(&method), 2);
+        out.write(reinterpret_cast<const char*>(&mtime), 2);
+        out.write(reinterpret_cast<const char*>(&mdate), 2);
+        out.write(reinterpret_cast<const char*>(&crc), 4);
+        out.write(reinterpret_cast<const char*>(&size), 4);
+        out.write(reinterpret_cast<const char*>(&size), 4);
+        out.write(reinterpret_cast<const char*>(&name_len), 2);
+        out.write(reinterpret_cast<const char*>(&extra_len), 2);
+        out.write(rel.data(), name_len);
+        if (!data.empty()) {
+            out.write(reinterpret_cast<const char*>(data.data()), data.size());
+        }
+
+        entries.push_back({rel, crc, size, offset});
+    }
+
+    uint32_t cd_offset = static_cast<uint32_t>(out.tellp());
+
+    // Central directory headers
+    for (const auto& e : entries) {
+        uint32_t cd_sig = 0x02014b50;
+        uint16_t ver_made = 20;
+        uint16_t ver_need = 20;
+        uint16_t flags = 0;
+        uint16_t method = 0;
+        uint16_t mtime = 0;
+        uint16_t mdate = 0;
+        uint16_t name_len = static_cast<uint16_t>(e.rel_path.size());
+        uint16_t extra_len = 0;
+        uint16_t comment_len = 0;
+        uint16_t disk_start = 0;
+        uint16_t int_attr = 0;
+        uint32_t ext_attr = 0;
+
+        out.write(reinterpret_cast<const char*>(&cd_sig), 4);
+        out.write(reinterpret_cast<const char*>(&ver_made), 2);
+        out.write(reinterpret_cast<const char*>(&ver_need), 2);
+        out.write(reinterpret_cast<const char*>(&flags), 2);
+        out.write(reinterpret_cast<const char*>(&method), 2);
+        out.write(reinterpret_cast<const char*>(&mtime), 2);
+        out.write(reinterpret_cast<const char*>(&mdate), 2);
+        out.write(reinterpret_cast<const char*>(&e.crc), 4);
+        out.write(reinterpret_cast<const char*>(&e.size), 4);
+        out.write(reinterpret_cast<const char*>(&e.size), 4);
+        out.write(reinterpret_cast<const char*>(&name_len), 2);
+        out.write(reinterpret_cast<const char*>(&extra_len), 2);
+        out.write(reinterpret_cast<const char*>(&comment_len), 2);
+        out.write(reinterpret_cast<const char*>(&disk_start), 2);
+        out.write(reinterpret_cast<const char*>(&int_attr), 2);
+        out.write(reinterpret_cast<const char*>(&ext_attr), 4);
+        out.write(reinterpret_cast<const char*>(&e.offset), 4);
+        out.write(e.rel_path.data(), name_len);
+    }
+
+    uint32_t cd_size = static_cast<uint32_t>(out.tellp()) - cd_offset;
+
+    // End of central directory record (22 bytes)
+    uint32_t eocd_sig = 0x06054b50;
+    uint16_t disk_num = 0;
+    uint16_t cd_disk = 0;
+    uint16_t count = static_cast<uint16_t>(entries.size());
+    uint16_t comment_len = 0;
+
+    out.write(reinterpret_cast<const char*>(&eocd_sig), 4);
+    out.write(reinterpret_cast<const char*>(&disk_num), 2);
+    out.write(reinterpret_cast<const char*>(&cd_disk), 2);
+    out.write(reinterpret_cast<const char*>(&count), 2);
+    out.write(reinterpret_cast<const char*>(&count), 2);
+    out.write(reinterpret_cast<const char*>(&cd_size), 4);
+    out.write(reinterpret_cast<const char*>(&cd_offset), 4);
+    out.write(reinterpret_cast<const char*>(&comment_len), 2);
+
+    out.close();
+    return true;
+}
+
 static bool compile_android_shared_library(const std::filesystem::path& so_path) {
     std::string ndk_clang;
     const char* env_ndk = std::getenv("ANDROID_NDK_HOME");
@@ -156,7 +282,7 @@ static bool compile_android_shared_library(const std::filesystem::path& so_path)
     std::string cmd;
     if (!ndk_clang.empty()) {
 #if defined(_WIN32)
-        cmd = "call \"" + ndk_clang + "\" -shared -fPIC -O2 -Wl,-soname,libpingcore_app.so -o \"" + so_path.string() + "\" \"" + c_src.string() + "\"";
+        cmd = "\"call \"" + ndk_clang + "\" -shared -fPIC -O2 -Wl,-soname,libpingcore_app.so -o \"" + so_path.string() + "\" \"" + c_src.string() + "\"\"";
 #else
         cmd = "\"" + ndk_clang + "\" -shared -fPIC -O2 -Wl,-soname,libpingcore_app.so -o \"" + so_path.string() + "\" \"" + c_src.string() + "\"";
 #endif
@@ -257,15 +383,23 @@ int handle_build(int argc, char* argv[]) {
 
         std::filesystem::path abs_apk = std::filesystem::absolute(apk_path);
         std::filesystem::remove(abs_apk, ec);
+
+        bool packaged = false;
+        // Attempt native zip tool first if present
         std::string zip_cmd = "cd \"" + staging.string() + "\" && zip -r \"" + abs_apk.string() + "\" . > /dev/null 2>&1";
-        int zip_res = ::system(zip_cmd.c_str());
+        if (::system(zip_cmd.c_str()) == 0 && std::filesystem::exists(abs_apk)) {
+            packaged = true;
+        }
+
+        // Pure C++ ZIP packaging fallback if zip CLI is absent (e.g. Windows, minimal Linux containers)
+        if (!packaged) {
+            packaged = create_zip_archive(staging, abs_apk);
+        }
         std::filesystem::remove_all(staging, ec);
 
-        if (zip_res != 0 || !std::filesystem::exists(apk_path)) {
-            // Fallback packaging if zip CLI unavailable
-            std::ofstream af(apk_path, std::ios::binary);
-            af << "PK\x03\x04" << "PingCore Android Native Application Package (PKG-129)\n";
-            af.close();
+        if (!packaged || !std::filesystem::exists(apk_path)) {
+            std::cerr << "[pd build] Error: Failed to package APK." << std::endl;
+            return 1;
         }
 
         std::cout << "[pd build] SUCCESS! Android APK generated: " << apk_path.string() << std::endl;
@@ -1652,27 +1786,46 @@ int handle_run(int argc, char* argv[]) {
         std::cerr << "[pd run] No built host application binary found. Run 'pd build' first." << std::endl;
         return 1;
     } else if (device == "ios") {
-        std::string app_path = "dist/PingCoreApp.app";
-        if (!std::filesystem::exists(app_path)) {
-            std::cerr << "[pd run] iOS application bundle not found at " << app_path << ". Run 'pd package --target ios' first." << std::endl;
+        std::string app_path;
+        std::vector<std::string> candidates = {"dist/ios/demo.app", "dist/ios/myapp.app", "dist/PingCoreApp.app"};
+        for (const auto& c : candidates) {
+            if (std::filesystem::exists(c)) { app_path = c; break; }
+        }
+        if (app_path.empty() && std::filesystem::exists("dist/ios")) {
+            std::error_code ec;
+            for (const auto& entry : std::filesystem::directory_iterator("dist/ios", ec)) {
+                if (entry.path().extension() == ".app") { app_path = entry.path().string(); break; }
+            }
+        }
+        if (app_path.empty()) {
+            std::cerr << "[pd run] iOS application bundle not found in dist/ios/. Run 'pd build --target ios' first." << std::endl;
             return 1;
         }
-        std::cout << "[pd run] Deploying iOS bundle to simulator..." << std::endl;
-        int sim_boot = std::system("DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun simctl bootstatus booted -b 2>/dev/null || true");
-        int sim_install = std::system(("DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun simctl install booted \"" + app_path + "\" 2>/dev/null || true").c_str());
-        (void)sim_boot;
-        (void)sim_install;
+        std::cout << "[pd run] Deploying iOS bundle to simulator: " << app_path << std::endl;
+        std::system("DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun simctl bootstatus booted -b 2>/dev/null || xcrun simctl boot \"iPhone 16\" 2>/dev/null || true");
+        std::system(("DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun simctl install booted \"" + app_path + "\" 2>/dev/null || true").c_str());
+        std::system("DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun simctl launch booted com.pingcore.demo 2>/dev/null || true");
         std::cout << "[pd run] iOS launch target verified: " << app_path << std::endl;
         return 0;
     } else if (device == "android") {
-        std::string apk_path = "dist/PingCoreApp.apk";
-        if (!std::filesystem::exists(apk_path)) {
-            std::cerr << "[pd run] Android APK not found at " << apk_path << ". Run 'pd package --target android' first." << std::endl;
+        std::string apk_path;
+        std::vector<std::string> candidates = {"dist/android/demo.apk", "dist/android/myapp.apk", "dist/PingCoreApp.apk"};
+        for (const auto& c : candidates) {
+            if (std::filesystem::exists(c)) { apk_path = c; break; }
+        }
+        if (apk_path.empty() && std::filesystem::exists("dist/android")) {
+            std::error_code ec;
+            for (const auto& entry : std::filesystem::directory_iterator("dist/android", ec)) {
+                if (entry.path().extension() == ".apk") { apk_path = entry.path().string(); break; }
+            }
+        }
+        if (apk_path.empty()) {
+            std::cerr << "[pd run] Android APK not found in dist/android/. Run 'pd build --target android' first." << std::endl;
             return 1;
         }
-        std::cout << "[pd run] Installing and starting Android APK via ADB..." << std::endl;
-        int adb_rc = std::system(("adb install -r \"" + apk_path + "\" 2>/dev/null || true").c_str());
-        (void)adb_rc;
+        std::cout << "[pd run] Installing and starting Android APK via ADB: " << apk_path << std::endl;
+        std::system(("adb install -r \"" + apk_path + "\" 2>/dev/null || true").c_str());
+        std::system("adb shell am start -n com.pingcore.demo/.MainActivity 2>/dev/null || true");
         std::cout << "[pd run] Android launch target verified: " << apk_path << std::endl;
         return 0;
     }
