@@ -181,7 +181,7 @@ public:
     [[nodiscard]] core::Result<std::string> authenticate_token(
         std::string_view raw_token_secret,
         std::string_view required_scope = "pkg:publish"
-    );
+    ) const;
     core::Status revoke_token(std::string_view token_secret_or_id);
 
     // Ownership & Collaboration (Finding C: Transactional mutex)

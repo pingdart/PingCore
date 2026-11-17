@@ -30,4 +30,8 @@ target_link_libraries(pingdart_pkg
         PingDart::Core
 )
 
+if(WIN32)
+    target_link_libraries(pingdart_pkg PUBLIC bcrypt)
+endif()
+
 add_library(PingDart::PKG ALIAS pingdart_pkg)

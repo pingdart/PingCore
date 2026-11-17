@@ -5,8 +5,8 @@ include(FetchContent)
 find_package(Threads REQUIRED)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
-find_package(Freetype REQUIRED)
-find_package(HarfBuzz REQUIRED)
+find_package(Freetype QUIET)
+find_package(HarfBuzz QUIET)
 
 option(PINGDART_OFFLINE_BUILD "Disallow network access and require all dependencies in local cache" OFF)
 

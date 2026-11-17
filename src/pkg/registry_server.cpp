@@ -793,7 +793,7 @@ core::Status RegistryServer::publish_package(
             .package_name = meta.name,
             .version = meta.version.to_string(),
             .status = "denied",
-            .details = own_status.message()
+            .details = std::string(own_status.message())
         });
         return own_status;
     }

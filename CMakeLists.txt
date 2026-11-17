@@ -97,10 +97,10 @@ endif()
 add_subdirectory(src/rhi)
 
 # Text Rendering & Typography Engine (HarfBuzz, Unicode, Font Manager)
-add_subdirectory(src/text)
-
-# Declarative Widget Engine & Layout System (ENG-501..ENG-503)
-add_subdirectory(src/ui)
+if(Freetype_FOUND AND HarfBuzz_FOUND)
+    add_subdirectory(src/text)
+    add_subdirectory(src/ui)
+endif()
 
 # First-Class Web Platform & SEO Engine
 add_subdirectory(src/web)
@@ -113,8 +113,10 @@ add_subdirectory(src/pkg)
 add_subdirectory(tools/pd)
 
 # Examples
-add_subdirectory(examples/desktop_host)
-add_subdirectory(examples/desktop_login)
+if(Freetype_FOUND AND HarfBuzz_FOUND)
+    add_subdirectory(examples/desktop_host)
+    add_subdirectory(examples/desktop_login)
+endif()
 add_subdirectory(examples/web_hello)
 
 # Testing

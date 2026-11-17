@@ -5,9 +5,18 @@
 #include <sstream>
 #include <filesystem>
 #include <cstdlib>
+
+#if defined(_WIN32)
+#define popen _popen
+#define pclose _pclose
+#endif
+#if defined(PINGDART_HAS_FREETYPE)
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#endif
+#if defined(PINGDART_HAS_HARFBUZZ)
 #include <hb.h>
+#endif
 
 namespace pingdart::cli {
 
@@ -125,6 +134,7 @@ ToolDiagnostic Doctor::check_freetype() const {
     diag.name = "FreeType 2 Typography";
     diag.required = true;
 
+#if defined(PINGDART_HAS_FREETYPE)
     FT_Library ft = nullptr;
     if (FT_Init_FreeType(&ft) == 0) {
         FT_Int major = 0, minor = 0, patch = 0;
@@ -135,6 +145,7 @@ ToolDiagnostic Doctor::check_freetype() const {
         diag.details = "Glyph rasterization and outline decomposition ready.";
         return diag;
     }
+#endif
 
     std::string ver = run_cmd("pkg-config --modversion freetype2 2>/dev/null");
     if (!ver.empty()) {
@@ -154,6 +165,7 @@ ToolDiagnostic Doctor::check_harfbuzz() const {
     diag.name = "HarfBuzz Text Shaper";
     diag.required = true;
 
+#if defined(PINGDART_HAS_HARFBUZZ)
     const char* hb_ver = hb_version_string();
     if (hb_ver && *hb_ver) {
         diag.version = "HarfBuzz " + std::string(hb_ver);
@@ -161,6 +173,7 @@ ToolDiagnostic Doctor::check_harfbuzz() const {
         diag.details = "OpenType multilingual shaping (Indic, Arabic, Latin) available.";
         return diag;
     }
+#endif
 
     std::string ver = run_cmd("pkg-config --modversion harfbuzz 2>/dev/null");
     if (!ver.empty()) {

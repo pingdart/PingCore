@@ -5,6 +5,11 @@
 #include <cstdio>
 #include <array>
 
+#if defined(_WIN32)
+#define popen _popen
+#define pclose _pclose
+#endif
+
 namespace pingdart::cli {
 
 namespace {

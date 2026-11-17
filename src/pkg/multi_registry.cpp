@@ -184,7 +184,7 @@ core::Result<const RegistryEndpoint*> MultiRegistryClient::get_authorized_endpoi
 
     // For private packages/registries, authorization applies to searches, version resolution, and downloads
     if (ep->is_private && ep->auth_token.empty()) {
-        return core::Status(core::StatusCode::Unauthenticated,
+        return core::Status(core::StatusCode::PermissionDenied,
                             "Authentication required for private registry '" + ep->alias + "' (" + ep->url + ")");
     }
 
@@ -204,7 +204,7 @@ core::Result<std::vector<PackageInfo>> MultiRegistryClient::search(
     }
 
     if (ep && ep->is_private && ep->auth_token.empty()) {
-        return core::Status(core::StatusCode::Unauthenticated,
+        return core::Status(core::StatusCode::PermissionDenied,
                             "Authentication required to search private registry: " + ep->alias);
     }
 
@@ -273,7 +273,7 @@ core::Status MultiRegistryClient::publish_package(
     }
 
     if (ep->auth_token.empty()) {
-        return core::Status(core::StatusCode::Unauthenticated,
+        return core::Status(core::StatusCode::PermissionDenied,
                             "Authentication token required to publish to registry: " + ep->alias);
     }
 

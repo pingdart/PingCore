@@ -359,7 +359,7 @@ ScanReport SecurityScanner::scan_directory(
             .rule_id = "RULE-DIR-ERROR",
             .severity = ScanSeverity::Critical,
             .file_path = dir_path.string(),
-            .description = pack_res.status().message()
+            .description = std::string(pack_res.status().message())
         });
         return report;
     }
@@ -579,20 +579,20 @@ core::Result<TokenCreationResult> PublisherSecurity::create_token(
 
 core::Result<std::string> PublisherSecurity::authenticate_token(
     std::string_view raw_token_secret,
-    std::string_view required_scope)
+    std::string_view required_scope) const
 {
     std::lock_guard<std::mutex> lock(token_mutex_);
     std::string hash = ArchiveUtil::compute_string_sha256(raw_token_secret);
     auto it = tokens_by_hash_.find(hash);
     if (it == tokens_by_hash_.end()) {
-        return core::Status(core::StatusCode::Unauthenticated, "Invalid or unrecognized registry authentication token");
+        return core::Status(core::StatusCode::PermissionDenied, "Invalid or unrecognized registry authentication token");
     }
 
     auto now = std::chrono::system_clock::now();
     uint64_t now_sec = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count());
 
     if (!it->second.is_valid(now_sec)) {
-        return core::Status(core::StatusCode::Unauthenticated, "Authentication token has expired or been revoked");
+        return core::Status(core::StatusCode::PermissionDenied, "Authentication token has expired or been revoked");
     }
 
     if (!required_scope.empty() && !it->second.has_scope(required_scope)) {

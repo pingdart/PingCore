@@ -4,6 +4,11 @@
 #include <sstream>
 #include <filesystem>
 
+#if defined(_WIN32)
+#define popen _popen
+#define pclose _pclose
+#endif
+
 namespace pingdart::cli {
 
 std::string Builder::target_platform_to_string(TargetPlatform target) {
