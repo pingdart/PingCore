@@ -41,23 +41,37 @@ function(pingdart_resolve_archive_dependency)
                                 "Expected SHA-256: ${ARG_SHA256}\n"
                                 "Found SHA-256:    ${COMPUTED_HASH}")
         endif()
-        set(RESOLVED_URL "${LOCAL_ARCHIVE_PATH}")
+
+        set(DEP_SRC_DIR "${CMAKE_BINARY_DIR}/_deps/${ARG_NAME}-src")
+        if(NOT EXISTS "${DEP_SRC_DIR}/CMakeLists.txt")
+            message(STATUS "[Dependencies] Pre-extracting ${ARG_NAME} for offline/disconnected build...")
+            file(ARCHIVE_EXTRACT INPUT "${LOCAL_ARCHIVE_PATH}" DESTINATION "${CMAKE_BINARY_DIR}/_deps")
+            if(EXISTS "${CMAKE_BINARY_DIR}/_deps/googletest-1.15.2")
+                file(RENAME "${CMAKE_BINARY_DIR}/_deps/googletest-1.15.2" "${DEP_SRC_DIR}")
+            elseif(EXISTS "${CMAKE_BINARY_DIR}/_deps/${ARG_NAME}-1.15.2")
+                file(RENAME "${CMAKE_BINARY_DIR}/_deps/${ARG_NAME}-1.15.2" "${DEP_SRC_DIR}")
+            endif()
+        endif()
+
+        FetchContent_Declare(
+            ${ARG_NAME}
+            SOURCE_DIR "${DEP_SRC_DIR}"
+        )
     else()
-        if(PINGDART_OFFLINE_BUILD OR DEFINED ENV{PINGDART_OFFLINE_BUILD})
-            message(WARNING "[Dependencies] Offline build: '${ARG_NAME}' not in cache (${LOCAL_ARCHIVE_PATH}). Skipping remote download.")
-            return()
+        if(PINGDART_OFFLINE_BUILD OR DEFINED ENV{PINGDART_OFFLINE_BUILD} OR FETCHCONTENT_FULLY_DISCONNECTED)
+            message(FATAL_ERROR "Offline build failure: Required dependency '${ARG_NAME}' was not found in offline cache at:\n"
+                                "${LOCAL_ARCHIVE_PATH}\n"
+                                "In offline mode, all dependencies must be pre-populated in .cache/.")
         endif()
         message(STATUS "[Dependencies] Downloading ${ARG_NAME} from ${ARG_URL}...")
-        set(RESOLVED_URL "${ARG_URL}")
+        FetchContent_Declare(
+            ${ARG_NAME}
+            URL "${ARG_URL}"
+            URL_HASH "SHA256=${ARG_SHA256}"
+            DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+            TIMEOUT 15
+        )
     endif()
-
-    FetchContent_Declare(
-        ${ARG_NAME}
-        URL "${RESOLVED_URL}"
-        URL_HASH "SHA256=${ARG_SHA256}"
-        DOWNLOAD_EXTRACT_TIMESTAMP FALSE
-        TIMEOUT 15
-    )
 
     FetchContent_MakeAvailable(${ARG_NAME})
 endfunction()

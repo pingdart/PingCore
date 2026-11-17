@@ -1242,6 +1242,8 @@ public:
         int status_code{0};
         size_t bytes_sent{0};
         std::chrono::system_clock::time_point timestamp{std::chrono::system_clock::now()};
+        std::string trace_id;
+        std::string request_id;
     };
 
     void clear_request_logs() const {
@@ -1259,7 +1261,18 @@ public:
         std::string method = req.method();
         std::string path = req.path();
         Response res;
+
+        std::string trace_id = req.header("X-PingCore-Trace-ID");
+        if (trace_id.empty()) trace_id = req.header("X-PingCore-Request-ID");
+        if (trace_id.empty()) trace_id = "trace-pkg130-default";
+
+        std::string request_id = req.header("X-PingCore-Request-ID");
+        if (request_id.empty()) request_id = trace_id;
+
         execute_pipeline(req, res, 0);
+
+        res.header("X-PingCore-Trace-ID", trace_id);
+        res.header("X-PingCore-Request-ID", request_id);
 
         std::lock_guard<std::mutex> lock(log_mutex_);
         request_logs_.push_back(RequestLogEntry{
@@ -1267,7 +1280,9 @@ public:
             path,
             res.status_code(),
             res.body().size(),
-            std::chrono::system_clock::now()
+            std::chrono::system_clock::now(),
+            trace_id,
+            request_id
         });
         return res;
     }
