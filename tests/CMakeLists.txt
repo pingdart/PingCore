@@ -955,4 +955,26 @@ if(TARGET gtest_main)
         target_link_libraries(test_pkg132_native_runtime_execution PRIVATE pingdart_pal_macos)
     endif()
     add_test(NAME Pkg132NativeRuntimeExecutionGoogleTest COMMAND test_pkg132_native_runtime_execution)
+
+    # PKG-133: Real Device End-to-End Acceptance Tests
+    add_executable(test_pkg133_real_device_acceptance
+        native/test_pkg133_real_device_acceptance.cpp
+    )
+    target_include_directories(test_pkg133_real_device_acceptance PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_pkg133_real_device_acceptance PRIVATE
+        pingcore_server
+        PingDart::Core
+        PingDart::PAL
+        PingDart::UI
+        PingDart::RHI
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    if(APPLE AND NOT IOS)
+        target_link_libraries(test_pkg133_real_device_acceptance PRIVATE pingdart_pal_macos)
+    endif()
+    add_test(NAME Pkg133RealDeviceAcceptanceGoogleTest COMMAND test_pkg133_real_device_acceptance)
 endif()

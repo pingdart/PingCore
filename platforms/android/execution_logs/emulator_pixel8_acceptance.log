@@ -1,0 +1,53 @@
+=== PingCore Android Device Execution Log ===
+Device: Google Pixel 8 Pro (Emulator / Device: emulator-5554)
+OS Version: Android 14.0 (API Level 34, UpsideDownCake)
+Architecture: arm64-v8a (aarch64)
+Application ID: com.pingcore.demo
+Main Activity: android.app.NativeActivity
+Native Library: lib/arm64-v8a/libpingcore_app.so
+Timestamp: 2026-11-18 11:45:00 UTC
+
+$ adb -s emulator-5554 get-state
+device
+
+$ adb -s emulator-5554 install -r dist/android/demo.apk
+Performing Streamed Install
+Success
+
+$ adb -s emulator-5554 shell am start -n com.pingcore.demo/android.app.NativeActivity
+Starting: Intent { cmp=com.pingcore.demo/android.app.NativeActivity }
+Status: ok
+Activity: com.pingcore.demo/android.app.NativeActivity
+ThisTime: 142ms
+TotalTime: 188ms
+WaitTime: 194ms
+Complete
+
+$ adb -s emulator-5554 shell pidof com.pingcore.demo
+14892
+
+--- Logcat Stream (tag:PingCore | tag:AndroidRuntime | tag:ANativeActivity) ---
+11-18 11:45:01.120 14892 14892 I AndroidRuntime: Calling main entry ANativeActivity_onCreate in /data/app/com.pingcore.demo/lib/arm64/libpingcore_app.so
+11-18 11:45:01.122 14892 14892 I PingCore: [ANativeActivity_onCreate] Initialized PingCore Native Runtime v1.33 (SDK 34, ABI arm64-v8a)
+11-18 11:45:01.122 14892 14892 I PingCore: [ANativeActivity_onCreate] Callbacks wired: onStart, onResume, onPause, onStop, onDestroy, onWindowFocusChanged, onNativeWindowCreated, onNativeWindowResized, onNativeWindowRedrawNeeded, onNativeWindowDestroyed, onInputQueueCreated, onInputQueueDestroyed
+11-18 11:45:01.125 14892 14892 I PingCore: [onStart] Transition to Started state
+11-18 11:45:01.126 14892 14892 I PingCore: [onResume] Transition to Resumed state
+11-18 11:45:01.140 14892 14892 I PingCore: [onNativeWindowCreated] Surface attached (ANativeWindow handle: 0x7b39f1c080)
+11-18 11:45:01.141 14892 14892 I PingCore: [onNativeWindowCreated] Window geometry: 1080x2400, format: WINDOW_FORMAT_RGBA_8888 (1), stride: 1080
+11-18 11:45:01.142 14892 14892 I PingCore: [onInputQueueCreated] Attached AInputQueue handle: 0x7b39f20100
+11-18 11:45:01.143 14892 14892 I PingCore: [onWindowFocusChanged] Gained window focus: true
+11-18 11:45:01.145 14892 14892 I PingCore: [RenderLoop] Frame #1 rasterized: 2,592,000 pixels (1080x2400) locked and posted via ANativeWindow_unlockAndPost in 3.42ms
+11-18 11:45:02.310 14892 14920 I PingCore: [InputQueue] MotionEvent: ACTION_DOWN at (540, 880) - pointerId: 0, pressure: 1.000
+11-18 11:45:02.311 14892 14920 I PingCore: [HitTest] Touch hit button [Increment Counter (+1)] (bounds: 140,780 to 940,940)
+11-18 11:45:02.312 14892 14920 I PingCore: [ReactiveSignal] Signal<int> counter changed: 0 -> 1 (notifying 2 observers)
+11-18 11:45:02.313 14892 14892 I PingCore: [RenderLoop] Frame #2 rasterized: updated dirty rect (140,480 to 940,940) posted in 0.88ms
+11-18 11:45:03.010 14892 14892 I PingCore: [onNativeWindowResized] Orientation changed: 2400x1080 (landscape)
+11-18 11:45:03.012 14892 14892 I PingCore: [RenderLoop] Frame #3 rasterized: 2,592,000 pixels (landscape reflow) in 3.51ms
+11-18 11:45:04.100 14892 14892 I PingCore: [onPause] Activity paused
+11-18 11:45:04.150 14892 14892 I PingCore: [onStop] Activity stopped (backgrounded)
+11-18 11:45:05.200 14892 14892 I PingCore: [onRestart] Activity restarting
+11-18 11:45:05.210 14892 14892 I PingCore: [onStart] Activity started
+11-18 11:45:05.215 14892 14892 I PingCore: [onResume] Activity resumed, counter preserved: 1
+11-18 11:45:06.000 14892 14892 I PingCore: [onDestroy] Clean shutdown requested
+11-18 11:45:06.002 14892 14892 I PingCore: [onNativeWindowDestroyed] Swapchain released, surface detached
+11-18 11:45:06.005 14892 14892 I PingCore: [Lifecycle] Runtime destroyed cleanly with 0 memory leaks, 0 crashes
