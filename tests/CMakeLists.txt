@@ -992,4 +992,19 @@ if(TARGET gtest_main)
         GTest::gtest_main
     )
     add_test(NAME Pkg135PingDartUiFoundationGoogleTest COMMAND test_pingdart_ui_foundation)
+
+    # PKG-136: PingDartUI Unified CSS & Utility Styling Engine Tests
+    add_executable(test_pkg136_css_styling_engine
+        ui/test_pkg136_css_styling_engine.cpp
+    )
+    target_include_directories(test_pkg136_css_styling_engine PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_pkg136_css_styling_engine PRIVATE
+        PingDart::Core
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    add_test(NAME Pkg136CssStylingEngineGoogleTest COMMAND test_pkg136_css_styling_engine)
 endif()

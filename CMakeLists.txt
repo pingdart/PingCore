@@ -258,6 +258,7 @@ add_subdirectory(examples/shared_login)
 add_subdirectory(examples/my_first_app)
 add_subdirectory(examples/web_hello)
 add_subdirectory(examples/doctor_card)
+add_subdirectory(examples/component_gallery)
 
 # Testing
 if(BUILD_TESTING)

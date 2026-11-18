@@ -1,0 +1,57 @@
+/* examples/component_gallery/gallery.css */
+/* PingDartUI Unified CSS Engine Demonstration (PKG-136) */
+
+:root {
+    --primary: #2563EB;
+    --secondary: #64748B;
+    --success: #16A34A;
+    --card: #FFFFFF;
+    --border: #E2E8F0;
+    --radius: 12px;
+}
+
+.gallery-container {
+    background-color: #F8FAFC;
+    padding: 24px;
+    gap: 24px;
+}
+
+.gallery-card {
+    background-color: var(--card, #FFFFFF);
+    border: 1px solid var(--border, #E2E8F0);
+    border-radius: var(--radius, 12px);
+    padding: 20px;
+    gap: 16px;
+}
+
+.gallery-header {
+    font-size: 24px;
+    color: #0F172A;
+    font-weight: 700;
+}
+
+.gallery-btn {
+    background-color: var(--primary, #2563EB);
+    color: #FFFFFF;
+    padding: 10px 18px;
+    border-radius: 8px;
+    font-size: 15px;
+    font-weight: 500;
+}
+
+.gallery-btn:hover {
+    background-color: #1D4ED8;
+}
+
+.gallery-btn:disabled {
+    background-color: #94A3B8;
+    opacity: 0.6;
+}
+
+.gallery-badge {
+    background-color: #EFF6FF;
+    color: var(--primary, #2563EB);
+    padding: 4px 10px;
+    border-radius: 9999px;
+    font-size: 12px;
+}

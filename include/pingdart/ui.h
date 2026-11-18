@@ -1,8 +1,10 @@
 // include/pingdart/ui.h
-// PingDartUI — Unified Declarative UI & Styling Framework (PKG-135)
+// PingDartUI — Unified Declarative UI & Styling Framework (PKG-136)
 // Simple modern C++20 API: zero raw pointers, multi-styling, pluggable Qt/Native/Web renderers
 #pragma once
 
+#include <pingdart/ui/theme.h>
+#include <pingdart/ui/css_parser.h>
 #include <pingdart/ui/style.h>
 #include <pingdart/ui/state.h>
 #include <pingdart/ui/router.h>
