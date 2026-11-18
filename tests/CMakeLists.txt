@@ -933,4 +933,26 @@ if(TARGET gtest_main)
         target_link_libraries(test_pkg130_native_runtime_integration PRIVATE pingdart_pal_macos)
     endif()
     add_test(NAME Pkg130NativeRuntimeIntegrationGoogleTest COMMAND test_pkg130_native_runtime_integration)
+
+    # PKG-132: Native Runtime Execution & Device Certification Tests
+    add_executable(test_pkg132_native_runtime_execution
+        native/test_pkg132_native_runtime_execution.cpp
+    )
+    target_include_directories(test_pkg132_native_runtime_execution PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_pkg132_native_runtime_execution PRIVATE
+        pingcore_server
+        PingDart::Core
+        PingDart::PAL
+        PingDart::UI
+        PingDart::RHI
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    if(APPLE AND NOT IOS)
+        target_link_libraries(test_pkg132_native_runtime_execution PRIVATE pingdart_pal_macos)
+    endif()
+    add_test(NAME Pkg132NativeRuntimeExecutionGoogleTest COMMAND test_pkg132_native_runtime_execution)
 endif()

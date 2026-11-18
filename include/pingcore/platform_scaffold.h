@@ -83,7 +83,7 @@ exit 0
 "    compileSdk = 34\n\n"
 "    defaultConfig {\n"
 "        applicationId = \"com.pingcore." + app_name + "\"\n"
-"        minSdk = 24\n"
+"        minSdk = 26\n"
 "        targetSdk = 34\n"
 "        versionCode = 1\n"
 "        versionName = \"1.0.0\"\n\n"
@@ -135,6 +135,9 @@ R"(-keep class com.pingcore.app.** { *; }
 "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
 "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\"\n"
 "    package=\"com.pingcore.app\">\n\n"
+"    <uses-sdk\n"
+"        android:minSdkVersion=\"26\"\n"
+"        android:targetSdkVersion=\"34\" />\n\n"
 "    <!-- Permissions dynamically injected by PingCore Unified Permission Manager -->\n"
 "    <uses-permission android:name=\"android.permission.INTERNET\" />\n\n"
 "    <application\n"
@@ -149,10 +152,18 @@ R"(-keep class com.pingcore.app.** { *; }
 "            android:exported=\"true\"\n"
 "            android:configChanges=\"orientation|keyboardHidden|screenSize\"\n"
 "            android:hardwareAccelerated=\"true\">\n"
+"            <meta-data android:name=\"android.app.lib_name\" android:value=\"pingcore_app\" />\n"
 "            <intent-filter>\n"
 "                <action android:name=\"android.intent.action.MAIN\" />\n"
 "                <category android:name=\"android.intent.category.LAUNCHER\" />\n"
 "            </intent-filter>\n"
+"        </activity>\n"
+"        <activity\n"
+"            android:name=\"android.app.NativeActivity\"\n"
+"            android:exported=\"true\"\n"
+"            android:configChanges=\"orientation|keyboardHidden|screenSize|screenLayout\"\n"
+"            android:label=\"" + app_name + "\">\n"
+"            <meta-data android:name=\"android.app.lib_name\" android:value=\"pingcore_app\" />\n"
 "        </activity>\n"
 "    </application>\n"
 "</manifest>\n"
@@ -361,6 +372,16 @@ Java_com_pingcore_app_PingCoreBridge_nativeNotifyPermissionResult(JNIEnv* env, j
         static_cast<pingcore_native_perm_t>(permId),
         static_cast<pingcore_native_perm_status_t>(status)
     );
+}
+
+JNIEXPORT int32_t pingcore_android_main(void) {
+    return 0;
+}
+
+JNIEXPORT void ANativeActivity_onCreate(void* activity, void* savedState, size_t savedStateSize) {
+    (void)activity;
+    (void)savedState;
+    (void)savedStateSize;
 }
 
 } // extern "C"

@@ -1,6 +1,7 @@
 // src/pal/native_bridge.cpp
-// PingCore Stable C ABI Implementation for Platform Bridge (PKG-121 / PKG-122)
+// PingCore Stable C ABI Implementation for Platform Bridge (PKG-121 / PKG-122 / PKG-132)
 #include <pingcore/native_bridge.h>
+#include <pingcore/android_native_activity.h>
 
 extern "C" {
 

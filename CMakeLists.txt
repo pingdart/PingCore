@@ -51,6 +51,7 @@ add_library(pingdart_core STATIC
     src/core/event_loop.cpp
     src/core/compiler.cpp
     src/pal/native_bridge.cpp
+    src/pal/android/native_activity_main.cpp
 )
 
 target_include_directories(pingdart_core

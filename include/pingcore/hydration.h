@@ -5,6 +5,7 @@
 
 #include <pingcore/reactive.h>
 #include <pingcore/server.h>
+#include <pingcore/hot_reload.h>
 #include <string>
 #include <string_view>
 #include <unordered_map>

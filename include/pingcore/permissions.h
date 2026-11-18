@@ -285,6 +285,11 @@ public:
         bool modified = false;
         std::ostringstream to_inject;
 
+        if (content.find("<uses-sdk") == std::string::npos) {
+            to_inject << "    <uses-sdk android:minSdkVersion=\"26\" android:targetSdkVersion=\"34\" />\n";
+            modified = true;
+        }
+
         auto inject_entry = [&](const AndroidPermissionEntry& entry) {
             std::string tag = "android:name=\"" + entry.name + "\"";
             if (content.find(tag) == std::string::npos) {
@@ -452,6 +457,9 @@ public:
 
     static bool sync_project_permissions(const std::filesystem::path& project_root) {
         auto yaml_path = project_root / "pingcore.yaml";
+        if (!std::filesystem::exists(yaml_path)) {
+            yaml_path = project_root / "permissions.yaml";
+        }
         if (!std::filesystem::exists(yaml_path)) {
             return false;
         }

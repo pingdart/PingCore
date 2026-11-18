@@ -3,7 +3,7 @@
     package="dev.pingdart.sharedlogin">
 
     <uses-sdk
-        android:minSdkVersion="24"
+        android:minSdkVersion="26"
         android:targetSdkVersion="34" />
 
     <supports-screens
@@ -15,6 +15,7 @@
 
     <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="false" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="true" />
+    <uses-feature android:name="android.hardware.touchscreen.multitouch" android:required="true" />
 
     <application
         android:label="PingDart Login"
