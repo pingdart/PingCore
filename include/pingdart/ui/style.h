@@ -97,8 +97,21 @@ struct BoxShadow {
     std::string color{""};
 };
 
+struct Rect {
+    float x{0.0f};
+    float y{0.0f};
+    float width{0.0f};
+    float height{0.0f};
+
+    bool operator==(const Rect& other) const = default;
+};
+
 // Unified ComputedStyle representation across CSS, Tailwind, & Fluent C++
 struct ComputedStyle {
+    // Computed Geometry (Layout Engine Output)
+    Rect layout_bounds{};
+    Breakpoint active_breakpoint{Breakpoint::Base};
+
     // Visuals
     std::string background_color{""};
     std::string text_color{""};

@@ -1,5 +1,5 @@
 // include/pingdart/ui/renderer.h
-// PingDartUI Pluggable Multi-Renderer Adapters: Web SSR, Qt Quick, & Native RHI (PKG-136)
+// PingDartUI Pluggable Multi-Renderer Adapters: Web SSR, Qt Quick, & Native RHI (PKG-137)
 #pragma once
 
 #include <pingdart/ui/component.h>
@@ -19,7 +19,7 @@ public:
     virtual std::string render_to_string(const Component& root) = 0;
 };
 
-// 1. Web SSR & HTML5 Renderer with Strict XSS Sanitization
+// 1. Web SSR & HTML5 Renderer with Context-Aware Sanitization
 class WebSsrAdapter : public IRenderAdapter {
 public:
     std::string name() const override {
@@ -36,10 +36,10 @@ private:
     void render_node(const Component& comp, std::ostringstream& ss, bool is_root = false) {
         ss << "<" << comp.type();
 
-        // Style attribute
+        // Style attribute with CSS value sanitizer
         std::string css = comp.computed_style().to_css();
         if (!css.empty()) {
-            ss << " style=\"" << escape_html(css) << "\"";
+            ss << " style=\"" << escape_html(sanitize_css_value(css)) << "\"";
         }
 
         // Class names
@@ -52,9 +52,13 @@ private:
             ss << "\"";
         }
 
-        // HTML attributes (escaped)
+        // HTML attributes with URL and entity escaping
         for (const auto& [k, v] : comp.attributes()) {
-            ss << " " << escape_html(k) << "=\"" << escape_html(v) << "\"";
+            if (k == "href" || k == "src") {
+                ss << " " << escape_html(k) << "=\"" << escape_html(sanitize_url(v)) << "\"";
+            } else {
+                ss << " " << escape_html(k) << "=\"" << escape_html(v) << "\"";
+            }
         }
 
         // Automatic dark mode indicator attribute on root element if active
@@ -87,7 +91,7 @@ private:
     }
 };
 
-// 2. Qt 6.8 LTS Quick SceneGraph Adapter (Pluggable Native UI)
+// 2. Qt 6.8 LTS Quick SceneGraph Adapter with Functional Properties and Bindings
 class QtQuickAdapter : public IRenderAdapter {
 public:
     std::string name() const override {
@@ -136,24 +140,59 @@ private:
 
         ss << ind << qml_type << " {\n";
 
-        // Properties
+        // Properties and functional bindings
         if (!comp.id().empty()) {
-            ss << ind << "    id: " << comp.id() << "\n";
+            ss << ind << "    id: " << escape_qml_string(comp.id()) << "\n";
         }
         if (!comp.text().empty()) {
-            ss << ind << "    text: \"" << comp.text() << "\"\n";
+            ss << ind << "    text: \"" << escape_qml_string(comp.text()) << "\"\n";
         }
         if (comp.computed_style().border_radius > 0) {
-            ss << ind << "    // radius: " << comp.computed_style().border_radius << "\n";
+            ss << ind << "    radius: " << comp.computed_style().border_radius << "\n";
         }
         if (comp.computed_style().gap > 0) {
             ss << ind << "    spacing: " << comp.computed_style().gap << "\n";
         }
-        if (!comp.computed_style().width.empty()) {
-            ss << ind << "    // width: " << comp.computed_style().width << "\n";
+        if (!comp.computed_style().background_color.empty() && (qml_type == "Rectangle" || qml_type == "Item")) {
+            ss << ind << "    color: \"" << escape_qml_string(comp.computed_style().background_color) << "\"\n";
         }
-        if (!comp.computed_style().height.empty()) {
-            ss << ind << "    // height: " << comp.computed_style().height << "\n";
+
+        // Functional layout dimensions
+        if (comp.computed_style().width == "100%") {
+            ss << ind << "    width: parent.width\n";
+        } else if (!comp.computed_style().width.empty()) {
+            std::string w = comp.computed_style().width;
+            if (w.ends_with("px")) w = w.substr(0, w.size() - 2);
+            ss << ind << "    width: " << w << "\n";
+        }
+
+        if (comp.computed_style().height == "100%") {
+            ss << ind << "    height: parent.height\n";
+        } else if (!comp.computed_style().height.empty()) {
+            std::string h = comp.computed_style().height;
+            if (h.ends_with("px")) h = h.substr(0, h.size() - 2);
+            ss << ind << "    height: " << h << "\n";
+        }
+
+        // Typography styling for Text nodes
+        if (qml_type == "Text") {
+            if (comp.computed_style().font_size > 0) {
+                ss << ind << "    font.pixelSize: " << comp.computed_style().font_size << "\n";
+            }
+            if (comp.computed_style().font_weight >= FontWeight::SemiBold) {
+                ss << ind << "    font.bold: true\n";
+            }
+            if (!comp.computed_style().text_color.empty()) {
+                ss << ind << "    color: \"" << escape_qml_string(comp.computed_style().text_color) << "\"\n";
+            }
+        }
+
+        // Image source binding
+        if (qml_type == "Image") {
+            auto it = comp.attributes().find("src");
+            if (it != comp.attributes().end()) {
+                ss << ind << "    source: \"" << escape_qml_string(sanitize_url(it->second)) << "\"\n";
+            }
         }
 
         // Children
@@ -174,7 +213,11 @@ public:
 
     std::string render_to_string(const Component& root) override {
         std::ostringstream ss;
-        ss << "[NativeRHI DisplayList: " << root.type() << " tree]";
+        ss << "[NativeRHI DisplayList: " << root.type() << " bounds=(" 
+           << root.computed_style().layout_bounds.x << ","
+           << root.computed_style().layout_bounds.y << ","
+           << root.computed_style().layout_bounds.width << ","
+           << root.computed_style().layout_bounds.height << ")]";
         return ss.str();
     }
 };

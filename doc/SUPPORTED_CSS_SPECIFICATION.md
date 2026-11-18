@@ -1,7 +1,7 @@
 # PingDartUI Supported CSS Specification & Styling Architecture
 
-**Version**: 1.0 (Qt 6.8 LTS & PingCore Unified Native Runtime)  
-**Package**: PKG-136  
+**Version**: 1.1 (Qt 6.8 LTS & PingCore Unified Native Runtime)  
+**Package**: PKG-137  
 **Status**: Formal Specification  
 
 ---
@@ -14,7 +14,7 @@ PingDartUI features a deterministic 5-tier styling cascade engine that resolves 
 
 ---
 
-## 2. Five-Layer Styling Cascade & Precedence Engine
+## 2. Five-Layer Styling Cascade & Lexicographical Specificity Engine
 
 When resolving visual styling for any component, PingDartUI applies a strict 5-layer cascade hierarchy. Higher tiers override lower tiers unless overridden by an `!important` declaration:
 
@@ -24,7 +24,7 @@ When resolving visual styling for any component, PingDartUI applies a strict 5-l
 ├─────────────────────────────────────────────────────────────┤
 │  Tier 4: Utility Classes (.className("bg-blue-600 p-4"))    │
 ├─────────────────────────────────────────────────────────────┤
-│  Tier 3: External CSS Rules (.card, #main, button:hover)    │  (Specificity scored)
+│  Tier 3: External CSS Rules (.card, #main, button:hover)    │  (Lexicographically compared)
 ├─────────────────────────────────────────────────────────────┤
 │  Tier 2: Theme Configuration (pingdart.config.json / Tokens)│
 ├─────────────────────────────────────────────────────────────┤
@@ -32,18 +32,25 @@ When resolving visual styling for any component, PingDartUI applies a strict 5-l
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Specificity Scoring (Tier 3)
-External CSS selectors are evaluated using the standard 4-tuple specificity vector:
-$$\text{Specificity} = (a, b, c, d)$$
-- $a$: Inline styles ($a = 1$ when applied via style attribute, else $0$).
-- $b$: ID selectors (`#id`).
-- $c$: Class selectors (`.class`) and pseudo-classes (`:hover`, `:focus`, `:active`, `:disabled`).
-- $d$: Element/Tag selectors (`div`, `button`, `span`, `h1`).
+### Lexicographical Specificity Comparison (P0 Precision)
+External CSS selectors are evaluated using strict C++20 three-way comparison (`operator<=>`) over the 4-tuple specificity vector:
 
-Total specificity score is calculated as:
-$$\text{Score} = (a \times 1{,}000{,}000) + (b \times 10{,}000) + (c \times 100) + d$$
+```cpp
+struct CssSpecificity {
+    uint32_t a{0}; // Inline style count
+    uint32_t b{0}; // ID count
+    uint32_t c{0}; // Class / pseudo-class count
+    uint32_t d{0}; // Tag / element count
 
-When specificity scores are identical, later declarations in source order override earlier declarations. Any declaration tagged with `!important` immediately bypasses standard Tier 4/5 overrides.
+    // C++20 member-wise lexicographical comparison: a -> b -> c -> d
+    auto operator<=>(const CssSpecificity&) const = default;
+    bool operator==(const CssSpecificity&) const = default;
+};
+```
+
+This guarantees zero arithmetic overflow: an ID selector `(0, 1, 0, 0)` strictly outranks any combination of class and element selectors `(0, 0, 250, 500)`, and inline styles `(1, 0, 0, 0)` strictly outrank any selector combination.
+
+When specificity tuples are identical, later declarations in source order override earlier declarations. Any declaration tagged with `!important` immediately bypasses standard Tier 4/5 overrides.
 
 ---
 
@@ -106,7 +113,7 @@ When specificity scores are identical, later declarations in source order overri
 
 ---
 
-## 5. Bundled Design Tokens & Palettes
+## 5. Bundled Design Tokens & Scoped ThemeContext
 
 PingDartUI bundles 8 standard color palettes from 50 to 950 shades:
 - **Slate**: Neutral cool grays (`#F8FAFC` to `#020617`)
@@ -118,88 +125,35 @@ PingDartUI bundles 8 standard color palettes from 50 to 950 shades:
 - **Indigo**: Elevated accents (`#EEF2FF` to `#1E1B4B`)
 - **Violet**: Secondary creative accents (`#F5F3FF` to `#2E1065`)
 
-### CSS Variable Resolution
-Dynamic CSS variables are declared and resolved via `ThemeEngine`:
-```css
-.card {
-    background-color: var(--card, #FFFFFF);
-    color: var(--foreground, #0F172A);
-    border: 1px solid var(--border, #E2E8F0);
-    border-radius: var(--radius, 12px);
-}
+### Scoped ThemeContext
+In addition to the global `ThemeEngine::instance()`, applications can instantiate independent `ThemeContext` objects for windows, modal panels, or subtrees:
+
+```cpp
+auto window_theme = std::make_shared<ThemeContext>();
+window_theme->set_dark_mode(true);
+window_theme->tokens().primary = "#7C3AED"; // Scoped violet theme
+
+Component modal = Card({ ... }).theme(window_theme);
 ```
 
-Standard token names:
-- `--primary`: Primary brand action color (`#2563EB` light, `#3B82F6` dark)
-- `--secondary`: Supporting neutral color (`#64748B`)
-- `--success`: Positive feedback color (`#16A34A`)
-- `--danger`: Destructive/error action color (`#DC2626`)
-- `--warning`: Warning alert color (`#D97706`)
-- `--background`: Page background (`#FFFFFF` light, `#0F172A` dark)
-- `--foreground`: High-contrast body text (`#0F172A` light, `#F8FAFC` dark)
-- `--card`: Surface container background (`#FFFFFF` light, `#1E293B` dark)
-- `--border`: Standard structural border color (`#E2E8F0` light, `#334155` dark)
-- `--muted`: Low-emphasis background (`#F1F5F9` light, `#1E293B` dark)
+---
+
+## 6. Security: Context-Aware Sanitization
+
+To guarantee zero code execution across all supported renderers:
+1. **HTML Entity Escaping**: Strict conversion of `&`, `<`, `>`, `"`, `'` prevents DOM injection during SSR hydration.
+2. **URL Sanitization**: Blocks dangerous execution schemes (`javascript:`, `vbscript:`, `data:text/html`). Only safe schemes (`http://`, `https://`, `mailto:`, `tel:`, `/`, `#`) are allowed; malicious schemes resolve to `#blocked-unsafe-url`.
+3. **QML String Escaping**: Escapes quotes, newlines, and backslashes in generated SceneGraph strings.
+4. **CSS Value Sanitization**: Strips `expression(...)`, `behavior:`, and embedded scripts.
 
 ---
 
-## 6. Tailwind-Compatible Utility Classes
+## 7. Functional QML Layout Bindings (Qt 6.8 LTS)
 
-PingDartUI provides a high-throughput, thread-safe `UtilityClassCompiler` with LRU caching (`std::unordered_map<std::string, ComputedStyle>`):
-
-| Utility Prefix | Examples | Resulting ComputedStyle |
-| :--- | :--- | :--- |
-| `bg-{color}-{shade}` | `bg-blue-600`, `bg-slate-100`, `bg-white` | `background_color = "#2563EB"` |
-| `text-{color}-{shade}` | `text-slate-900`, `text-white`, `text-red-600` | `text_color = "#0F172A"` |
-| `text-{size}` | `text-sm`, `text-base`, `text-lg`, `text-xl`, `text-2xl` | `font_size = 14`, `16`, `18`, `20`, `24` |
-| `p-{n}`, `px-{n}`, `py-{n}` | `p-4` (16px), `px-6` (24px), `py-2` (8px) | `padding` calculated with `n * 4px` |
-| `m-{n}`, `mx-{n}`, `my-{n}` | `m-4` (16px), `mx-auto` | `margin` calculated with `n * 4px` |
-| `gap-{n}` | `gap-2` (8px), `gap-4` (16px), `gap-6` (24px) | `gap = n * 4px` |
-| `rounded-{size}` | `rounded-sm` (4px), `rounded-md` (6px), `rounded-lg` (8px), `rounded-xl` (12px), `rounded-full` (9999px) | `border_radius` |
-| `flex-row`, `flex-col` | `flex-row`, `flex-col` | `flex_direction = FlexDirection::Row / Column` |
-| `items-{align}` | `items-center`, `items-start`, `items-end` | `align_items = AlignItems::Center / Start / End` |
-| `justify-{align}` | `justify-between`, `justify-center`, `justify-end` | `justify_content = SpaceBetween / Center / End` |
-| `w-full`, `h-full` | `w-full`, `h-full` | `width = "100%"`, `height = "100%"` |
-| `font-{weight}` | `font-medium` (500), `font-semibold` (600), `font-bold` (700) | `font_weight` |
-| `shadow-{size}` | `shadow-sm`, `shadow-md`, `shadow-lg` | Multi-layer drop shadow |
-| `cursor-pointer` | `cursor-pointer` | `cursor = "pointer"` |
-| `overflow-auto` | `overflow-auto`, `overflow-hidden` | `overflow = "auto" / "hidden"` |
-
----
-
-## 7. Responsive Breakpoints
-
-PingDartUI evaluates media queries and responsive utility prefixes against 5 standard breakpoints:
-- `sm`: $\ge 640\text{ px}$ (Mobile landscape / small tablets)
-- `md`: $\ge 768\text{ px}$ (Standard tablets)
-- `lg`: $\ge 1024\text{ px}$ (Laptops / desktops)
-- `xl`: $\ge 1280\text{ px}$ (Large desktops)
-- `2xl`: $\ge 1536\text{ px}$ (High-resolution displays)
-
----
-
-## 8. Unsupported Properties & Rationale
-
-The following web-only or legacy CSS constructs are intentionally excluded from the unified native engine:
-
-1. **`float` / `clear` Layout**:
-   - *Rationale*: Legacy layout model superseded by Flexbox and CSS Grid. Direct mapping to Qt SceneGraph and Native Vulkan/Metal layouts is non-deterministic.
-2. **Complex 3D CSS Transforms (`transform: rotate3d(...)`, `perspective`)**:
-   - *Rationale*: PingDartUI delegates 3D transforms to dedicated hardware-accelerated RHI SceneGraph matrices in PKG-139 rather than parsing CSS matrix strings.
-3. **CSS Counters (`counter-reset`, `counter-increment`)**:
-   - *Rationale*: Dynamic counting is natively managed through reactive state (`useState<int>()`).
-4. **CSS Preprocessor Directives (`@extend`, `@mixin`, `@include`)**:
-   - *Rationale*: Compile-time composability is natively provided by C++20 templates and helper functions.
-
----
-
-## 9. Security & XSS Mitigation
-
-The SSR renderer (`WebSsrAdapter`) performs automatic, strict sanitization of all HTML entities:
-- `&` $\rightarrow$ `&amp;`
-- `<` $\rightarrow$ `&lt;`
-- `>` $\rightarrow$ `&gt;`
-- `"` $\rightarrow$ `&quot;`
-- `'` $\rightarrow$ `&#39;`
-
-Untrusted inputs embedded in component text or attributes cannot inject malicious script tags or execute arbitrary JavaScript during server-side hydration.
+PingDartUI does not emit dimensions as dead comments. All layout properties translate directly into functional Qt Quick QML properties and bindings:
+- `width: "100%"` $\rightarrow$ `width: parent.width`
+- `height: "100%"` $\rightarrow$ `height: parent.height`
+- `border_radius` $\rightarrow$ `radius: <val>`
+- `gap` $\rightarrow$ `spacing: <val>`
+- `font_size` $\rightarrow$ `font.pixelSize: <val>`
+- `font_weight` $\rightarrow$ `font.bold: true`

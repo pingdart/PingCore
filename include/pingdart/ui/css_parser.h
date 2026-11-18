@@ -14,7 +14,7 @@
 
 namespace pingdart::ui {
 
-// 1. Security: HTML & Attribute Sanitizer (XSS Prevention)
+// 1. Security: HTML, URL, QML, & CSS Sanitizers (XSS Prevention & Code Injection Defense)
 inline std::string escape_html(std::string_view input) {
     std::string out;
     out.reserve(input.size() * 11 / 10);
@@ -31,27 +31,75 @@ inline std::string escape_html(std::string_view input) {
     return out;
 }
 
-// 2. Specificity Calculation: (a=inline, b=ID, c=class/pseudo, d=tag)
+inline std::string sanitize_url(std::string_view url) {
+    std::string s(url);
+    // Trim leading whitespace
+    size_t start = s.find_first_not_of(" \t\r\n");
+    if (start != std::string::npos) s = s.substr(start);
+
+    // Convert to lowercase copy for scheme validation
+    std::string lower_s = s;
+    std::transform(lower_s.begin(), lower_s.end(), lower_s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+
+    // Block dangerous execution schemes
+    if (lower_s.starts_with("javascript:") ||
+        lower_s.starts_with("vbscript:") ||
+        lower_s.starts_with("data:text/html")) {
+        return "#blocked-unsafe-url";
+    }
+    return s;
+}
+
+inline std::string escape_qml_string(std::string_view input) {
+    std::string out;
+    out.reserve(input.size() + 16);
+    for (char c : input) {
+        switch (c) {
+            case '\\': out.append("\\\\"); break;
+            case '\"': out.append("\\\""); break;
+            case '\n': out.append("\\n"); break;
+            case '\r': out.append("\\r"); break;
+            case '\t': out.append("\\t"); break;
+            default:   out.push_back(c); break;
+        }
+    }
+    return out;
+}
+
+inline std::string sanitize_css_value(std::string_view val) {
+    std::string s(val);
+    std::string lower_s = s;
+    std::transform(lower_s.begin(), lower_s.end(), lower_s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+
+    if (lower_s.find("javascript:") != std::string::npos ||
+        lower_s.find("expression(") != std::string::npos ||
+        lower_s.find("behavior:") != std::string::npos) {
+        return "inherit";
+    }
+    return s;
+}
+
+// 2. Specificity Calculation: Lexicographical 4-tuple (a=inline, b=ID, c=class/pseudo, d=tag)
 struct CssSpecificity {
     uint32_t a{0}; // Inline style
     uint32_t b{0}; // ID count
     uint32_t c{0}; // Class / pseudo-class count
     uint32_t d{0}; // Tag / element count
 
-    uint32_t score() const {
-        return (a * 1000000) + (b * 10000) + (c * 100) + d;
-    }
+    // C++20 default <=> performs strict lexicographical member-wise comparison in order (a, b, c, d)
+    auto operator<=>(const CssSpecificity&) const = default;
+    bool operator==(const CssSpecificity&) const = default;
 
-    bool operator<(const CssSpecificity& other) const {
-        return score() < other.score();
-    }
-
-    bool operator>(const CssSpecificity& other) const {
-        return score() > other.score();
-    }
-
-    bool operator==(const CssSpecificity& other) const {
-        return a == other.a && b == other.b && c == other.c && d == other.d;
+    // Optional legacy scalar score for debug logging only
+    uint64_t score() const {
+        return (static_cast<uint64_t>(a) * 1000000000ULL) +
+               (static_cast<uint64_t>(b) * 1000000ULL) +
+               (static_cast<uint64_t>(c) * 1000ULL) +
+               static_cast<uint64_t>(d);
     }
 };
 

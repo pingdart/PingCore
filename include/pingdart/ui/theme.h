@@ -1,16 +1,17 @@
 // include/pingdart/ui/theme.h
-// PingDartUI Configurable Design Tokens & Bundled Palettes (PKG-136)
+// PingDartUI Color Palettes, Theme Engine, & Scoped ThemeContext (PKG-137)
 #pragma once
 
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <optional>
 #include <sstream>
 #include <memory>
-#include <cstdint>
 
 namespace pingdart::ui {
 
+// Standard 11-shade color palette (50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 950)
 struct ColorPalette {
     std::string s50;
     std::string s100;
@@ -62,17 +63,15 @@ struct ThemeTokens {
     std::string dark_mode{"system"};      // "system", "light", "dark"
 };
 
-class ThemeEngine {
+// Application-scoped or Container-scoped ThemeContext
+class ThemeContext {
 public:
-    static ThemeEngine& instance() {
-        static ThemeEngine s_instance;
-        return s_instance;
-    }
-
-    ThemeEngine() {
+    ThemeContext() {
         init_bundled_palettes();
         set_light_defaults();
     }
+
+    virtual ~ThemeContext() = default;
 
     void set_dark_mode(bool is_dark) {
         is_dark_active_ = is_dark;
@@ -141,7 +140,6 @@ public:
     }
 
     bool load_config_json(const std::string& json_str) {
-        // Minimal deterministic JSON token extractor without external deps
         auto extract_field = [&](const std::string& key) -> std::string {
             std::string pattern = "\"" + key + "\":";
             size_t pos = json_str.find(pattern);
@@ -161,9 +159,10 @@ public:
             } else {
                 size_t val_end = json_str.find_first_of(",}\n\r", val_start);
                 if (val_end != std::string::npos) {
-                    std::string num = json_str.substr(val_start, val_end - val_start);
-                    num.erase(std::remove_if(num.begin(), num.end(), ::isspace), num.end());
-                    return num;
+                    std::string raw = json_str.substr(val_start, val_end - val_start);
+                    auto s_end = raw.find_last_not_of(" \t\n\r");
+                    if (s_end != std::string::npos) return raw.substr(0, s_end + 1);
+                    return raw;
                 }
             }
             return "";
@@ -200,7 +199,7 @@ public:
         return true;
     }
 
-private:
+protected:
     void set_light_defaults() {
         tokens_.background = "#FFFFFF";
         tokens_.foreground = "#0F172A";
@@ -250,6 +249,15 @@ private:
     bool is_dark_active_{false};
     std::unordered_map<std::string, ColorPalette> palettes_{};
     std::unordered_map<std::string, std::string> variables_{};
+};
+
+// Global default theme engine singleton
+class ThemeEngine : public ThemeContext {
+public:
+    static ThemeEngine& instance() {
+        static ThemeEngine s_instance;
+        return s_instance;
+    }
 };
 
 } // namespace pingdart::ui

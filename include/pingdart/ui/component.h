@@ -13,6 +13,33 @@
 
 namespace pingdart::ui {
 
+// Form Submission Key-Value Container
+class FormData {
+private:
+    std::unordered_map<std::string, std::string> data_{};
+
+public:
+    FormData() = default;
+
+    void set(const std::string& key, const std::string& val) {
+        data_[key] = val;
+    }
+
+    std::string get(const std::string& key, const std::string& fallback = "") const {
+        auto it = data_.find(key);
+        if (it != data_.end()) return it->second;
+        return fallback;
+    }
+
+    bool has(const std::string& key) const {
+        return data_.find(key) != data_.end();
+    }
+
+    const std::unordered_map<std::string, std::string>& all() const {
+        return data_;
+    }
+};
+
 struct ComponentNode;
 
 class Component : public StyleBuilder<Component> {
@@ -58,8 +85,17 @@ public:
     // Event Listeners
     Component& onClick(std::function<void()> cb);
     Component& onChange(std::function<void(const std::string&)> cb);
+    Component& onSubmit(std::function<void(const FormData&)> cb);
+    Component& onHover(std::function<void(bool)> cb);
+    Component& onFocus(std::function<void()> cb);
+    Component& onBlur(std::function<void()> cb);
+
     void emit_click() const;
     void emit_change(const std::string& val) const;
+    void emit_submit(const FormData& data) const;
+    void emit_hover(bool hovered);
+    void emit_focus();
+    void emit_blur();
 
     // HTML / DOM Attributes
     Component& id(const std::string& elem_id);
@@ -71,10 +107,18 @@ public:
     Component& alt(const std::string& text);
     Component& placeholder(const std::string& text);
     Component& value(const std::string& val);
+    Component& type(const std::string& t);
+
+    // Scoped Theme Context
+    Component& theme(std::shared_ptr<ThemeContext> ctx);
+    std::shared_ptr<ThemeContext> theme() const;
 
     // Style sync & cascade
     const ComputedStyle& style() const;
     void apply_css_rules(const std::vector<CssRule>& rules);
+
+    // Layout Geometry Engine
+    void compute_layout(float parent_x = 0.0f, float parent_y = 0.0f, float parent_w = 800.0f, float parent_h = 600.0f);
 };
 
 struct ComponentNode {
@@ -92,6 +136,12 @@ struct ComponentNode {
     bool is_disabled{false};
     bool is_hovered{false};
     bool is_focused{false};
+
+    std::function<void(const FormData&)> on_submit{nullptr};
+    std::function<void(bool)> on_hover{nullptr};
+    std::function<void()> on_focus{nullptr};
+    std::function<void()> on_blur{nullptr};
+    std::shared_ptr<ThemeContext> local_theme{nullptr};
 
     ComponentNode() = default;
     explicit ComponentNode(std::string t) : type(std::move(t)) {}
@@ -247,6 +297,26 @@ inline Component& Component::onChange(std::function<void(const std::string&)> cb
     return *this;
 }
 
+inline Component& Component::onSubmit(std::function<void(const FormData&)> cb) {
+    node_->on_submit = std::move(cb);
+    return *this;
+}
+
+inline Component& Component::onHover(std::function<void(bool)> cb) {
+    node_->on_hover = std::move(cb);
+    return *this;
+}
+
+inline Component& Component::onFocus(std::function<void()> cb) {
+    node_->on_focus = std::move(cb);
+    return *this;
+}
+
+inline Component& Component::onBlur(std::function<void()> cb) {
+    node_->on_blur = std::move(cb);
+    return *this;
+}
+
 inline void Component::emit_click() const {
     if (!node_->is_disabled && node_->on_click) {
         node_->on_click();
@@ -257,6 +327,47 @@ inline void Component::emit_change(const std::string& val) const {
     if (!node_->is_disabled && node_->on_change) {
         node_->on_change(val);
     }
+}
+
+inline void Component::emit_submit(const FormData& data) const {
+    if (!node_->is_disabled && node_->on_submit) {
+        node_->on_submit(data);
+    }
+}
+
+inline void Component::emit_hover(bool hovered) {
+    node_->is_hovered = hovered;
+    if (node_->on_hover) {
+        node_->on_hover(hovered);
+    }
+}
+
+inline void Component::emit_focus() {
+    node_->is_focused = true;
+    if (node_->on_focus) {
+        node_->on_focus();
+    }
+}
+
+inline void Component::emit_blur() {
+    node_->is_focused = false;
+    if (node_->on_blur) {
+        node_->on_blur();
+    }
+}
+
+inline Component& Component::type(const std::string& t) {
+    node_->type = t;
+    return *this;
+}
+
+inline Component& Component::theme(std::shared_ptr<ThemeContext> ctx) {
+    node_->local_theme = std::move(ctx);
+    return *this;
+}
+
+inline std::shared_ptr<ThemeContext> Component::theme() const {
+    return node_->local_theme;
 }
 
 inline Component& Component::attr(const std::string& k, const std::string& v) {
@@ -374,6 +485,68 @@ inline void Component::apply_css_rules(const std::vector<CssRule>& rules) {
     // Recursively apply to children
     for (auto& child : node_->children) {
         child.apply_css_rules(rules);
+    }
+}
+
+inline void Component::compute_layout(float parent_x, float parent_y, float parent_w, float parent_h) {
+    float x = parent_x + style_.margin.left;
+    float y = parent_y + style_.margin.top;
+
+    float w = parent_w;
+    if (style_.width == "100%") {
+        w = std::max(0.0f, parent_w - style_.margin.left - style_.margin.right);
+    } else if (!style_.width.empty()) {
+        w = CssParser::parse_px_dimension(style_.width);
+    }
+    if (style_.max_width > 0 && w > style_.max_width) {
+        w = style_.max_width;
+    }
+    if (style_.min_width > 0 && w < style_.min_width) {
+        w = style_.min_width;
+    }
+
+    float h = parent_h;
+    if (style_.height == "100%") {
+        h = std::max(0.0f, parent_h - style_.margin.top - style_.margin.bottom);
+    } else if (!style_.height.empty()) {
+        h = CssParser::parse_px_dimension(style_.height);
+    }
+    if (style_.max_height > 0 && h > style_.max_height) {
+        h = style_.max_height;
+    }
+    if (style_.min_height > 0 && h < style_.min_height) {
+        h = style_.min_height;
+    }
+
+    style_.layout_bounds = Rect{x, y, w, h};
+
+    if (node_->children.empty()) return;
+
+    if (style_.flex_direction == FlexDirection::Row) {
+        float cur_x = x + style_.padding.left;
+        float cur_y = y + style_.padding.top;
+        float inner_w = std::max(0.0f, w - style_.padding.left - style_.padding.right);
+        float total_gaps = static_cast<float>(node_->children.size() - 1) * style_.gap;
+        float child_avail_w = std::max(0.0f, (inner_w - total_gaps) / static_cast<float>(node_->children.size()));
+        float child_avail_h = std::max(0.0f, h - style_.padding.top - style_.padding.bottom);
+
+        for (auto& child : node_->children) {
+            float cw = child.style().width.empty() ? child_avail_w : CssParser::parse_px_dimension(child.style().width);
+            float ch = child.style().height.empty() ? child_avail_h : CssParser::parse_px_dimension(child.style().height);
+            child.compute_layout(cur_x, cur_y, cw, ch);
+            cur_x += child.style().layout_bounds.width + style_.gap;
+        }
+    } else {
+        float cur_x = x + style_.padding.left;
+        float cur_y = y + style_.padding.top;
+        float child_avail_w = std::max(0.0f, w - style_.padding.left - style_.padding.right);
+
+        for (auto& child : node_->children) {
+            float cw = child.style().width.empty() ? child_avail_w : (child.style().width == "100%" ? child_avail_w : CssParser::parse_px_dimension(child.style().width));
+            float ch = child.style().height.empty() ? 32.0f : CssParser::parse_px_dimension(child.style().height);
+            child.compute_layout(cur_x, cur_y, cw, ch);
+            cur_y += child.style().layout_bounds.height + style_.gap;
+        }
     }
 }
 

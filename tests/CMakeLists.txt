@@ -1007,4 +1007,19 @@ if(TARGET gtest_main)
         GTest::gtest_main
     )
     add_test(NAME Pkg136CssStylingEngineGoogleTest COMMAND test_pkg136_css_styling_engine)
+
+    # PKG-137: PingDartUI Complete Component Library & Interactive Runtime Tests
+    add_executable(test_pkg137_component_library
+        ui/test_pkg137_component_library.cpp
+    )
+    target_include_directories(test_pkg137_component_library PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_pkg137_component_library PRIVATE
+        PingDart::Core
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    add_test(NAME Pkg137ComponentLibraryGoogleTest COMMAND test_pkg137_component_library)
 endif()

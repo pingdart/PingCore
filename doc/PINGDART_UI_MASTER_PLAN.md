@@ -112,7 +112,7 @@ The initial PingDartUI library provides 70 production-grade components across 12
 ```text
 @pingdart/
 ├── ui                 (Public Component API, State, Virtual DOM)
-├── ui-qt              (Qt 6.7+ QQuickRenderControl & SceneGraph adapter)
+├── ui-qt              (Qt 6.8 LTS QQuickRenderControl & SceneGraph adapter)
 ├── ui-native          (PingCore RHI Direct Metal / Vulkan / D3D12 adapter)
 ├── ui-web             (HTML5 / CSS3 / SSR / Hydration / WASM adapter)
 ├── css                (Pure C++ CSS3 Lexer, Parser & Cascade Engine)
