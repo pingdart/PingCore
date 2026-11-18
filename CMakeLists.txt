@@ -139,6 +139,7 @@ add_subdirectory(tools/pd)
 
 # Backend API & Server Engine (PKG-119)
 add_subdirectory(src/server)
+target_link_libraries(pd PRIVATE pingcore_server)
 
 # Modular Target Architecture & Aliases (PKG-119)
 add_library(PingCore::Core ALIAS pingdart_core)
@@ -259,6 +260,12 @@ add_subdirectory(examples/my_first_app)
 add_subdirectory(examples/web_hello)
 add_subdirectory(examples/doctor_card)
 add_subdirectory(examples/component_gallery)
+add_subdirectory(examples/reactive_counter)
+add_subdirectory(examples/login_form)
+add_subdirectory(examples/doctor_profile)
+add_subdirectory(examples/responsive_dashboard)
+add_subdirectory(examples/interactive_datagrid)
+add_subdirectory(examples/gesture_playground)
 
 # Testing
 if(BUILD_TESTING)

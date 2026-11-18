@@ -1,0 +1,4 @@
+# examples/interactive_datagrid/CMakeLists.txt
+add_executable(example_interactive_datagrid main.cpp)
+target_include_directories(example_interactive_datagrid PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_features(example_interactive_datagrid PRIVATE cxx_std_20)

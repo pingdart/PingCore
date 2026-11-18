@@ -4,6 +4,7 @@
 
 #include <pingdart/ui/style.h>
 #include <pingdart/ui/css_parser.h>
+#include <pingdart/ui/gestures/swipe.h>
 #include <string>
 #include <vector>
 #include <memory>
@@ -84,18 +85,37 @@ public:
 
     // Event Listeners
     Component& onClick(std::function<void()> cb);
+    Component& onDoubleClick(std::function<void()> cb);
     Component& onChange(std::function<void(const std::string&)> cb);
     Component& onSubmit(std::function<void(const FormData&)> cb);
     Component& onHover(std::function<void(bool)> cb);
     Component& onFocus(std::function<void()> cb);
     Component& onBlur(std::function<void()> cb);
 
+    // Gestures
+    Component& onTap(std::function<void()> cb);
+    Component& onLongPress(std::function<void()> cb);
+    Component& onSwipe(std::function<void(Direction)> cb);
+    Component& onPan(std::function<void(float dx, float dy)> cb);
+    Component& onPinch(std::function<void(float scale)> cb);
+
+    // Lifecycle
+    Component& onMount(std::function<void()> cb);
+    Component& onUpdate(std::function<void()> cb);
+    Component& onUnmount(std::function<void()> cb);
+
     void emit_click() const;
+    void emit_double_click() const;
     void emit_change(const std::string& val) const;
     void emit_submit(const FormData& data) const;
     void emit_hover(bool hovered);
     void emit_focus();
     void emit_blur();
+    void emit_tap() const;
+    void emit_long_press() const;
+    void emit_swipe(Direction dir) const;
+    void emit_pan(float dx, float dy) const;
+    void emit_pinch(float scale) const;
 
     // HTML / DOM Attributes
     Component& id(const std::string& elem_id);
@@ -131,6 +151,7 @@ struct ComponentNode {
     ComputedStyle style{};
     std::unordered_map<std::string, std::string> attributes{};
     std::function<void()> on_click{nullptr};
+    std::function<void()> on_double_click{nullptr};
     std::function<void(const std::string&)> on_change{nullptr};
 
     bool is_disabled{false};
@@ -142,6 +163,16 @@ struct ComponentNode {
     std::function<void()> on_focus{nullptr};
     std::function<void()> on_blur{nullptr};
     std::shared_ptr<ThemeContext> local_theme{nullptr};
+
+    // Gestures & Lifecycle
+    std::function<void()> on_tap{nullptr};
+    std::function<void()> on_long_press{nullptr};
+    std::function<void(Direction)> on_swipe{nullptr};
+    std::function<void(float, float)> on_pan{nullptr};
+    std::function<void(float)> on_pinch{nullptr};
+    std::function<void()> on_mount{nullptr};
+    std::function<void()> on_update{nullptr};
+    std::function<void()> on_unmount{nullptr};
 
     ComponentNode() = default;
     explicit ComponentNode(std::string t) : type(std::move(t)) {}
@@ -292,6 +323,11 @@ inline Component& Component::onClick(std::function<void()> cb) {
     return *this;
 }
 
+inline Component& Component::onDoubleClick(std::function<void()> cb) {
+    node_->on_double_click = std::move(cb);
+    return *this;
+}
+
 inline Component& Component::onChange(std::function<void(const std::string&)> cb) {
     node_->on_change = std::move(cb);
     return *this;
@@ -317,9 +353,86 @@ inline Component& Component::onBlur(std::function<void()> cb) {
     return *this;
 }
 
+inline Component& Component::onTap(std::function<void()> cb) {
+    node_->on_tap = std::move(cb);
+    return *this;
+}
+
+inline Component& Component::onLongPress(std::function<void()> cb) {
+    node_->on_long_press = std::move(cb);
+    return *this;
+}
+
+inline Component& Component::onSwipe(std::function<void(Direction)> cb) {
+    node_->on_swipe = std::move(cb);
+    return *this;
+}
+
+inline Component& Component::onPan(std::function<void(float, float)> cb) {
+    node_->on_pan = std::move(cb);
+    return *this;
+}
+
+inline Component& Component::onPinch(std::function<void(float)> cb) {
+    node_->on_pinch = std::move(cb);
+    return *this;
+}
+
+inline Component& Component::onMount(std::function<void()> cb) {
+    node_->on_mount = std::move(cb);
+    return *this;
+}
+
+inline Component& Component::onUpdate(std::function<void()> cb) {
+    node_->on_update = std::move(cb);
+    return *this;
+}
+
+inline Component& Component::onUnmount(std::function<void()> cb) {
+    node_->on_unmount = std::move(cb);
+    return *this;
+}
+
 inline void Component::emit_click() const {
     if (!node_->is_disabled && node_->on_click) {
         node_->on_click();
+    }
+}
+
+inline void Component::emit_double_click() const {
+    if (!node_->is_disabled && node_->on_double_click) {
+        node_->on_double_click();
+    }
+}
+
+inline void Component::emit_tap() const {
+    if (!node_->is_disabled) {
+        if (node_->on_tap) node_->on_tap();
+        else if (node_->on_click) node_->on_click();
+    }
+}
+
+inline void Component::emit_long_press() const {
+    if (!node_->is_disabled && node_->on_long_press) {
+        node_->on_long_press();
+    }
+}
+
+inline void Component::emit_swipe(Direction dir) const {
+    if (!node_->is_disabled && node_->on_swipe) {
+        node_->on_swipe(dir);
+    }
+}
+
+inline void Component::emit_pan(float dx, float dy) const {
+    if (!node_->is_disabled && node_->on_pan) {
+        node_->on_pan(dx, dy);
+    }
+}
+
+inline void Component::emit_pinch(float scale) const {
+    if (!node_->is_disabled && node_->on_pinch) {
+        node_->on_pinch(scale);
     }
 }
 

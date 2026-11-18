@@ -165,8 +165,8 @@ When the browser receives the pre-rendered HTML:
 The official developer CLI exposes streamlined web workflows:
 
 ```bash
-# Start local live-reload development server for web
-pd dev --platform web --port 8080
+# Start the local web example server with rebuild-and-refresh on C++ edits
+pd dev --target web --app login_form --port 8080
 
 # Build static production website (SSG) with automatic sitemap and SEO pre-rendering
 pd build --platform web --mode static --output-dir dist/
@@ -177,3 +177,7 @@ pd build --platform web --mode ssr --output-dir dist/
 # Build client-side interactive WASM app (for dashboards)
 pd build --platform web --mode spa --output-dir dist/
 ```
+
+The current development server rebuilds the selected CMake example and reloads the
+browser page after successful C++ changes. This is full-page refresh, not
+state-preserving component HMR.

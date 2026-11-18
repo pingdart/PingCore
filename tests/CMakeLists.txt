@@ -1022,4 +1022,20 @@ if(TARGET gtest_main)
         GTest::gtest_main
     )
     add_test(NAME Pkg137ComponentLibraryGoogleTest COMMAND test_pkg137_component_library)
+
+    # PKG-138: PingDartUI Reactive Runtime, Reconciliation, Events & Gestures Tests
+    add_executable(test_pkg138_reactive_runtime
+        ui/test_pkg138_reactive_runtime.cpp
+    )
+    target_include_directories(test_pkg138_reactive_runtime PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_pkg138_reactive_runtime PRIVATE
+        PingDart::Core
+        PingDart::UI
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    add_test(NAME Pkg138ReactiveRuntimeGoogleTest COMMAND test_pkg138_reactive_runtime)
 endif()

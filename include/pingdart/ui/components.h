@@ -235,6 +235,13 @@ inline Component Input(const std::string& placeholder = "", const std::string& v
     return comp;
 }
 
+inline Component Input(const std::string& name, const std::string& type, const std::string& placeholder, const std::string& val = "") {
+    auto comp = Input(placeholder, val);
+    comp.attr("name", name);
+    comp.attr("type", type);
+    return comp;
+}
+
 // 4.2 TextArea — Multi-line text entry field
 inline Component TextArea(const std::string& placeholder = "", int rows = 4) {
     return Component("textarea")
@@ -562,6 +569,11 @@ private:
     bool searchable_{false};
     bool sortable_{false};
     int pagination_{0};
+    int current_page_{1};
+    std::string sort_column_{""};
+    bool sort_ascending_{true};
+    std::string filter_query_{""};
+    int selected_index_{-1};
 
 public:
     DataGridBuilder& columns(std::vector<ColumnDef> cols) {
@@ -589,40 +601,120 @@ public:
         return *this;
     }
 
+    DataGridBuilder& page(int p) {
+        current_page_ = std::max(1, p);
+        return *this;
+    }
+
+    DataGridBuilder& sortBy(std::string col, bool asc = true) {
+        sort_column_ = std::move(col);
+        sort_ascending_ = asc;
+        return *this;
+    }
+
+    DataGridBuilder& filter(std::string query) {
+        filter_query_ = std::move(query);
+        return *this;
+    }
+
+    DataGridBuilder& select(size_t index) {
+        selected_index_ = static_cast<int>(index);
+        return *this;
+    }
+
+    size_t row_count() const noexcept {
+        return data_.size();
+    }
+
     Component build() const {
+        auto rows_to_display = data_;
+
+        // 1. In-Memory Filtering
+        if (!filter_query_.empty()) {
+            std::vector<std::unordered_map<std::string, std::string>> filtered;
+            for (const auto& row : rows_to_display) {
+                bool match = false;
+                for (const auto& [k, v] : row) {
+                    if (v.find(filter_query_) != std::string::npos) {
+                        match = true;
+                        break;
+                    }
+                }
+                if (match) filtered.push_back(row);
+            }
+            rows_to_display = std::move(filtered);
+        }
+
+        // 2. In-Memory Sorting
+        if (!sort_column_.empty()) {
+            std::sort(rows_to_display.begin(), rows_to_display.end(),
+                [this](const std::unordered_map<std::string, std::string>& a,
+                       const std::unordered_map<std::string, std::string>& b) {
+                    auto it_a = a.find(sort_column_);
+                    auto it_b = b.find(sort_column_);
+                    std::string val_a = (it_a != a.end()) ? it_a->second : "";
+                    std::string val_b = (it_b != b.end()) ? it_b->second : "";
+                    return sort_ascending_ ? (val_a < val_b) : (val_a > val_b);
+                });
+        }
+
+        size_t total_rows = rows_to_display.size();
+
+        // 3. In-Memory Pagination
+        size_t start_idx = 0;
+        size_t end_idx = total_rows;
+        if (pagination_ > 0) {
+            size_t pag_sz = static_cast<size_t>(std::max(1, pagination_));
+            start_idx = static_cast<size_t>(std::max(0, current_page_ - 1)) * pag_sz;
+            if (start_idx > total_rows) start_idx = total_rows;
+            end_idx = std::min(start_idx + pag_sz, total_rows);
+        }
+
         std::vector<Component> table_rows;
 
         // Header Row
         std::vector<Component> header_cells;
         for (const auto& col : columns_) {
-            header_cells.push_back(TableCell(col.label + (col.sortable ? " ▲" : ""), true));
+            std::string indicator = "";
+            if (sortable_ && col.sortable) {
+                if (sort_column_ == col.key) {
+                    indicator = sort_ascending_ ? " ▲" : " ▼";
+                } else {
+                    indicator = " ⇅";
+                }
+            }
+            header_cells.push_back(TableCell(col.label + indicator, true));
         }
         table_rows.push_back(TableRow(header_cells));
 
         // Data Rows
-        for (const auto& row_map : data_) {
+        for (size_t r = start_idx; r < end_idx; ++r) {
+            const auto& row_map = rows_to_display[r];
             std::vector<Component> row_cells;
             for (const auto& col : columns_) {
                 auto it = row_map.find(col.key);
                 std::string cell_val = (it != row_map.end()) ? it->second : "";
                 row_cells.push_back(TableCell(cell_val, false));
             }
-            table_rows.push_back(TableRow(row_cells));
+            auto row_comp = TableRow(row_cells);
+            if (selected_index_ >= 0 && static_cast<size_t>(selected_index_) == r) {
+                row_comp.background("#EFF6FF");
+            }
+            table_rows.push_back(row_comp);
         }
 
         auto table_comp = Component("table", table_rows).width("100%");
 
         std::vector<Component> container_children;
         if (searchable_) {
-            container_children.push_back(Input("Search table records...").className("mb-3"));
+            container_children.push_back(Input("Search table records...", filter_query_).className("mb-3"));
         }
         container_children.push_back(table_comp);
 
         if (pagination_ > 0) {
-            size_t pag_sz = static_cast<size_t>(std::max(0, pagination_));
             container_children.push_back(
                 Row({
-                    Text("Showing " + std::to_string(std::min<size_t>(data_.size(), pag_sz)) + " of " + std::to_string(data_.size()) + " rows"),
+                    Text("Showing " + std::to_string(end_idx - start_idx) + " of " + std::to_string(total_rows) + " rows (Page " + std::to_string(current_page_) + ")"),
                     Spacer(),
                     Button("Previous").padding(4, 10),
                     Button("Next").padding(4, 10)
@@ -1022,31 +1114,5 @@ inline Component Link(const std::string& label, const std::string& href) {
             Router::push(href);
         });
 }
-
-// Application Shell class
-class App {
-private:
-    std::string stylesheet_path_{""};
-    Component root_{};
-
-public:
-    App& stylesheet(const std::string& css_path) {
-        stylesheet_path_ = css_path;
-        return *this;
-    }
-
-    App& render(Component root) {
-        root_ = std::move(root);
-        return *this;
-    }
-
-    const Component& root() const {
-        return root_;
-    }
-
-    const std::string& stylesheet_path() const {
-        return stylesheet_path_;
-    }
-};
 
 } // namespace pingdart::ui

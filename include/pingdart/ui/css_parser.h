@@ -46,7 +46,8 @@ inline std::string sanitize_url(std::string_view url) {
     // Block dangerous execution schemes
     if (lower_s.starts_with("javascript:") ||
         lower_s.starts_with("vbscript:") ||
-        lower_s.starts_with("data:text/html")) {
+        lower_s.starts_with("data:") ||
+        lower_s.starts_with("file:")) {
         return "#blocked-unsafe-url";
     }
     return s;

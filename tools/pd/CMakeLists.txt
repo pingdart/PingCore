@@ -1,5 +1,6 @@
 add_executable(pd
     main.cpp
+    web_dev_server.cpp
 )
 
 target_link_libraries(pd

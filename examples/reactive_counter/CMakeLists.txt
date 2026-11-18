@@ -1,0 +1,4 @@
+# examples/reactive_counter/CMakeLists.txt
+add_executable(example_reactive_counter main.cpp)
+target_include_directories(example_reactive_counter PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_features(example_reactive_counter PRIVATE cxx_std_20)

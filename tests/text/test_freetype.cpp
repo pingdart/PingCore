@@ -70,8 +70,8 @@ TEST(FreeTypeTest, RasterizesGlyphToBitmap) {
     GlyphBitmap bmp = face->rasterize_glyph(gid);
     EXPECT_GT(bmp.metrics.width, 0u);
     EXPECT_GT(bmp.metrics.height, 0u);
-    EXPECT_FALSE(bmp.buffer.empty());
-    EXPECT_EQ(bmp.buffer.size(), bmp.metrics.width * bmp.metrics.height);
+    EXPECT_FALSE(bmp.pixels.empty());
+    EXPECT_EQ(bmp.pixels.size(), bmp.metrics.width * bmp.metrics.height);
 }
 
 TEST(FreeTypeTest, DpiScalingAdjustsPixelDimensions) {

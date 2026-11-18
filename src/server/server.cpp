@@ -15,6 +15,7 @@ inline int sock_setopt(SOCKET s, int lvl, int optname, const void* optval, int o
     return ::setsockopt(s, lvl, optname, reinterpret_cast<const char*>(optval), optlen);
 }
 #else
+#include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -31,7 +32,7 @@ inline int sock_setopt(int s, int lvl, int optname, const void* optval, socklen_
 
 namespace pingcore {
 
-pingdart::core::Status Server::listen(uint16_t port, bool non_blocking) {
+pingdart::core::Status Server::listen(uint16_t port, bool non_blocking, std::string bind_address) {
     if (is_running_.load()) {
         return pingdart::core::Status(pingdart::core::StatusCode::AlreadyExists, "Server already running");
     }
@@ -60,7 +61,22 @@ pingdart::core::Status Server::listen(uint16_t port, bool non_blocking) {
 
     struct sockaddr_in address{};
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
+    if (bind_address == "0.0.0.0") {
+        address.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else {
+#if defined(_WIN32)
+        const int address_valid = ::InetPtonA(AF_INET, bind_address.c_str(), &address.sin_addr);
+#else
+        const int address_valid = ::inet_pton(AF_INET, bind_address.c_str(), &address.sin_addr);
+#endif
+        if (address_valid != 1) {
+            sock_close(server_fd);
+            is_running_.store(false);
+            return pingdart::core::Status(
+                pingdart::core::StatusCode::InvalidArgument,
+                "Invalid IPv4 bind address: " + bind_address);
+        }
+    }
     address.sin_port = htons(port);
 
     if (::bind(server_fd, reinterpret_cast<struct sockaddr*>(&address), sizeof(address)) < 0) {

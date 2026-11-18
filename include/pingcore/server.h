@@ -1288,7 +1288,10 @@ public:
     }
 
     /// Listens on the specified port
-    pingdart::core::Status listen(uint16_t port, bool non_blocking = false);
+    pingdart::core::Status listen(
+        uint16_t port,
+        bool non_blocking = false,
+        std::string bind_address = "0.0.0.0");
 
     // PKG-127: Production TCP Server Configuration
     struct ServerConfig {

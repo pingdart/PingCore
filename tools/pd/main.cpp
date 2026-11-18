@@ -13,9 +13,12 @@
 #include <pingcore/native_module.h>
 #include <pingcore/hot_reload.h>
 #include <pingcore/reactive.h>
+#include "web_dev_server.h"
 #include <iostream>
 #include <vector>
 #include <string>
+#include <charconv>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -36,7 +39,7 @@ void print_usage() {
               << "Application & Routing Commands:\n"
               << "  create app <name> [--platforms <list>] Scaffold Next.js-style C++ project with real platforms/\n"
               << "  create package <name>                  Scaffold a new reusable PingDart library package project\n"
-              << "  dev [--target <host|web>]              Start development environment with hot reload\n"
+              << "  dev [--target web] [--app <example>] [--port <port>]  Run web example with live reload\n"
               << "  run [--device <host|android|ios>]      Build, install, and launch application\n"
               << "  build [--target <host|web|android|ios|server|windows|macos|linux>] Compile native dist/ artifacts\n"
               << "  package [--target <platform>]          Create standalone installer bundle (.app / .apk / .exe)\n"
@@ -59,26 +62,55 @@ void print_usage() {
 }
 
 int handle_dev(int argc, char* argv[]) {
-    std::string target = "host";
-    std::string inspect_path = "";
+    std::string target = "web";
+    std::string example = "login_form";
+    uint16_t port = 3000;
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--target" && i + 1 < argc) {
+        if ((arg == "--target" || arg == "--platform") && i + 1 < argc) {
             target = argv[++i];
-        } else if (arg == "--inspect-change" && i + 1 < argc) {
-            inspect_path = argv[++i];
+        } else if (arg == "--app" && i + 1 < argc) {
+            example = argv[++i];
+        } else if (arg == "--port" && i + 1 < argc) {
+            const std::string value = argv[++i];
+            unsigned int parsed_port = 0;
+            const auto parse_result = std::from_chars(
+                value.data(), value.data() + value.size(), parsed_port);
+            if (parse_result.ec != std::errc{} ||
+                parse_result.ptr != value.data() + value.size() ||
+                parsed_port == 0 || parsed_port > 65535) {
+                std::cerr << "[pd dev] Invalid port: " << value << std::endl;
+                return 2;
+            }
+            port = static_cast<uint16_t>(parsed_port);
+        } else {
+            std::cerr << "[pd dev] Unknown or incomplete option: " << arg << std::endl;
+            return 2;
         }
     }
-    std::cout << "[pd dev] Starting PingCore Next.js-style development environment (target: " << target << ")..." << std::endl;
-    std::cout << "[pd dev] File-based route watcher active: monitoring ./app, ./components, ./styles, ./native..." << std::endl;
-    std::cout << "[pd dev] Reactivity engine: Signals & Fine-Grained Invalidations active" << std::endl;
-    std::cout << "[pd dev] Development server listening at http://localhost:3000 (hot reload enabled)" << std::endl;
 
-    if (!inspect_path.empty()) {
-        auto change = pingcore::HotReloadManager::instance().process_file_change(inspect_path);
-        std::cout << "[pd dev] Change detected: " << inspect_path << " -> " << change.description << std::endl;
+    if (target != "web") {
+        std::cerr << "[pd dev] The live-reload development server currently supports --target web only."
+                  << std::endl;
+        return 2;
     }
-    return 0;
+
+    if (example.empty() ||
+        !std::all_of(example.begin(), example.end(), [](unsigned char c) {
+            return std::isalnum(c) || c == '_' || c == '-';
+        })) {
+        std::cerr << "[pd dev] Invalid example name: " << example << std::endl;
+        return 2;
+    }
+
+    std::error_code ec;
+    const auto project_root = std::filesystem::current_path(ec);
+    if (ec) {
+        std::cerr << "[pd dev] Could not resolve the current directory: " << ec.message()
+                  << std::endl;
+        return 1;
+    }
+    return run_web_dev_server(project_root, example, port);
 }
 
 int handle_doctor() {
