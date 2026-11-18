@@ -247,11 +247,13 @@ private:
         swapchain_.reset();
         compositor_.reset();
         device_.reset();
+#if defined(__APPLE__) && !defined(IOS)
         window_.reset();
         if (host_) {
             host_->shutdown();
             host_.reset();
         }
+#endif
         pingdart::core::Runtime::shutdown();
         initialized_ = false;
     }

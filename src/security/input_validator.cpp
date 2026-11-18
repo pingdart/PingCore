@@ -311,6 +311,15 @@ core::Result<PinnedConnectionTarget> InputValidator::resolve_and_pin_destination
             "SSRF / DNS Rebinding Prevention: Host is in a restricted network range");
     }
 
+#if defined(_WIN32)
+    static bool s_winsock_init = false;
+    if (!s_winsock_init) {
+        WSADATA wsa;
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+        s_winsock_init = true;
+    }
+#endif
+
     std::string pinned_ip;
     struct addrinfo hints;
     std::memset(&hints, 0, sizeof(hints));

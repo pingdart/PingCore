@@ -38,6 +38,11 @@ add_library(pingdart_compiler STATIC IMPORTED GLOBAL)
 set_target_properties(pingdart_compiler PROPERTIES
     IMPORTED_LOCATION "${RUST_LIB_STATIC}"
 )
+if(WIN32)
+    set_target_properties(pingdart_compiler PROPERTIES
+        INTERFACE_LINK_LIBRARIES "ws2_32;userenv;ntdll;bcrypt"
+    )
+endif()
 add_dependencies(pingdart_compiler pingdart_compiler_cargo)
 
 # Core Framework Static Library
@@ -57,8 +62,8 @@ target_include_directories(pingdart_core
 target_link_libraries(pingdart_core
     PUBLIC
         Threads::Threads
-    PRIVATE
         $<BUILD_INTERFACE:pingdart_compiler>
+    PRIVATE
         $<BUILD_INTERFACE:PingDart::Sanitizers>
         $<BUILD_INTERFACE:PingDart::SecurityHardening>
 )
@@ -116,17 +121,7 @@ endif()
 add_subdirectory(src/rhi)
 
 # Text Rendering & Typography Engine (HarfBuzz, Unicode, Font Manager)
-if(Freetype_FOUND AND HarfBuzz_FOUND)
-    add_subdirectory(src/text)
-else()
-    if(NOT TARGET PingDart::Text)
-        add_library(PingDart::Text INTERFACE IMPORTED GLOBAL)
-        target_include_directories(PingDart::Text INTERFACE
-            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-            $<INSTALL_INTERFACE:include>
-        )
-    endif()
-endif()
+add_subdirectory(src/text)
 
 # Declarative Widget Engine & Layout System (ENG-501..ENG-503)
 add_subdirectory(src/ui)
@@ -256,12 +251,10 @@ install(FILES
 )
 
 # Examples
-if(Freetype_FOUND AND HarfBuzz_FOUND)
-    add_subdirectory(examples/desktop_host)
-    add_subdirectory(examples/desktop_login)
-    add_subdirectory(examples/shared_login)
-    add_subdirectory(examples/my_first_app)
-endif()
+add_subdirectory(examples/desktop_host)
+add_subdirectory(examples/desktop_login)
+add_subdirectory(examples/shared_login)
+add_subdirectory(examples/my_first_app)
 add_subdirectory(examples/web_hello)
 
 # Testing

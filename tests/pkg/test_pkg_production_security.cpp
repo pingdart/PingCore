@@ -64,7 +64,12 @@ TEST(PkgProductionSecurityTest, CSPRNGTokenEntropyAndNonPredictability) {
 TEST(PkgProductionSecurityTest, ContentAddressableStorageDigestAndReverification) {
     std::filesystem::path temp_cas_dir = std::filesystem::current_path() / "build" / "test_cas_digest_storage";
     std::error_code ec;
-    std::filesystem::remove_all(temp_cas_dir, ec);
+    if (std::filesystem::exists(temp_cas_dir, ec)) {
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(temp_cas_dir, ec)) {
+            std::filesystem::permissions(entry.path(), std::filesystem::perms::all, ec);
+        }
+        std::filesystem::remove_all(temp_cas_dir, ec);
+    }
 
     ContentAddressableStorage cas(temp_cas_dir);
 
@@ -89,8 +94,10 @@ TEST(PkgProductionSecurityTest, ContentAddressableStorageDigestAndReverification
     EXPECT_EQ(dup_res.code(), pingdart::core::StatusCode::AlreadyExists);
 
     // 4. Download reverification: If file on disk is tampered with, get_archive returns DataLoss
-    std::string prefix = expected_sha256.substr(0, 2);
-    std::filesystem::path disk_file = temp_cas_dir / "sha256" / prefix / (expected_sha256 + ".pdar");
+    std::string raw_hex = expected_sha256;
+    if (raw_hex.starts_with("sha256:")) raw_hex = raw_hex.substr(7);
+    std::string prefix = raw_hex.substr(0, 2);
+    std::filesystem::path disk_file = temp_cas_dir / "sha256" / prefix / (raw_hex + ".pdar");
     ASSERT_TRUE(std::filesystem::exists(disk_file, ec));
 
     // Tamper with disk contents directly (bypass filesystem read-only lock for test)
@@ -104,6 +111,7 @@ TEST(PkgProductionSecurityTest, ContentAddressableStorageDigestAndReverification
     EXPECT_FALSE(tampered_res.has_value());
     EXPECT_EQ(tampered_res.status().code(), pingdart::core::StatusCode::DataLoss);
 
+    std::filesystem::permissions(disk_file, std::filesystem::perms::all, ec);
     std::filesystem::remove_all(temp_cas_dir, ec);
 }
 

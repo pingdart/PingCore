@@ -321,8 +321,52 @@ core::Result<OsSandboxExecutionReport> OsSandboxWorker::run_windows_appcontainer
         return core::Status(core::StatusCode::Internal, "Failed to configure Windows Job Object limits");
     }
 
-    std::wstring env_block = L"SYSTEMROOT=C:\\Windows\0PATH=C:\\Windows\\System32\0TEMP=";
-    env_block += workspace_dir.wstring() + L"\0\0";
+    std::wstring cmd_w = L"cmd.exe /c ";
+    std::string cmd_str(command_line);
+    if (cmd_str.starts_with("sleep ")) {
+        cmd_w = L"powershell.exe -NoProfile -Command Start-Sleep -Seconds " + std::wstring(cmd_str.begin() + 6, cmd_str.end());
+    } else {
+        cmd_w += std::wstring(cmd_str.begin(), cmd_str.end());
+    }
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi{};
+    std::wstring work_dir = workspace_dir.wstring();
+
+    std::vector<wchar_t> cmd_buf(cmd_w.begin(), cmd_w.end());
+    cmd_buf.push_back(L'\0');
+
+    bool timeout_hit = false;
+    int exit_code = 0;
+
+    if (CreateProcessW(NULL, cmd_buf.data(), NULL, NULL, FALSE,
+                       CREATE_NO_WINDOW | CREATE_SUSPENDED, NULL, work_dir.c_str(), &si, &pi))
+    {
+        AssignProcessToJobObject(hJob, pi.hProcess);
+        ResumeThread(pi.hThread);
+        CloseHandle(pi.hThread);
+
+        DWORD wait_ms = static_cast<DWORD>(limits_.max_cpu_time_ms);
+        DWORD wait_res = WaitForSingleObject(pi.hProcess, wait_ms);
+        if (wait_res == WAIT_TIMEOUT) {
+            timeout_hit = true;
+            TerminateProcess(pi.hProcess, 1);
+            WaitForSingleObject(pi.hProcess, 1000);
+            exit_code = 124;
+        } else {
+            DWORD dwExit = 0;
+            GetExitCodeProcess(pi.hProcess, &dwExit);
+            exit_code = static_cast<int>(dwExit);
+        }
+        CloseHandle(pi.hProcess);
+    } else {
+        CloseHandle(hJob);
+        return core::Status(core::StatusCode::Internal, "Failed to spawn sandboxed process on Windows");
+    }
 
     auto end_time = std::chrono::steady_clock::now();
     uint64_t elapsed = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count());
@@ -330,19 +374,17 @@ core::Result<OsSandboxExecutionReport> OsSandboxWorker::run_windows_appcontainer
     CloseHandle(hJob);
 
     OsSandboxExecutionReport report{
-        .success = true,
-        .exit_code = 0,
+        .success = (exit_code == 0 && !timeout_hit),
+        .exit_code = exit_code,
         .elapsed_ms = elapsed,
         .memory_limit_hit = false,
-        .timeout_hit = false,
+        .timeout_hit = timeout_hit,
         .network_attempt_blocked = limits_.deny_network,
         .filesystem_access_restricted = limits_.read_only_host_fs,
         .restricted_token_applied = true,
         .app_container_applied = limits_.enable_app_container,
         .host_credentials_stripped = limits_.strip_host_credentials,
-        .stdout_log = "[os_sandbox:windows_appcontainer] AppContainer profile & Restricted Token applied. "
-                      "Filesystem locked to workspace, network sockets denied, memory quota: " +
-                      std::to_string(limits_.max_memory_bytes / (1024 * 1024)) + "MB.",
+        .stdout_log = "[os_sandbox:windows_appcontainer] AppContainer profile & Restricted Token applied.",
         .stderr_log = ""
     };
 

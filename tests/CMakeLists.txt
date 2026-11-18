@@ -51,6 +51,7 @@ if(TARGET gtest_main)
     )
     target_link_libraries(test_compiler_ffi PRIVATE
         PingDart::Core
+        pingdart_compiler
         GTest::gtest_main
     )
     add_test(NAME CompilerFfiGoogleTest COMMAND test_compiler_ffi)
@@ -395,6 +396,11 @@ if(TARGET gtest_main)
     add_executable(test_freetype
         text/test_freetype.cpp
     )
+    if(Freetype_FOUND)
+        target_compile_definitions(test_freetype PRIVATE PINGDART_HAS_FREETYPE=1)
+        target_include_directories(test_freetype PRIVATE ${FREETYPE_INCLUDE_DIRS})
+        target_link_libraries(test_freetype PRIVATE Freetype::Freetype)
+    endif()
     target_link_libraries(test_freetype PRIVATE
         PingDart::Text
         PingDart::Core
@@ -405,10 +411,14 @@ if(TARGET gtest_main)
     add_executable(test_harfbuzz
         text/test_harfbuzz.cpp
     )
+    if(HarfBuzz_FOUND)
+        target_compile_definitions(test_harfbuzz PRIVATE PINGDART_HAS_HARFBUZZ=1)
+        target_include_directories(test_harfbuzz PRIVATE ${HarfBuzz_INCLUDE_DIR})
+        target_link_libraries(test_harfbuzz PRIVATE HarfBuzz::HarfBuzz)
+    endif()
     target_link_libraries(test_harfbuzz PRIVATE
         PingDart::Text
         PingDart::Core
-        HarfBuzz::HarfBuzz
         GTest::gtest_main
     )
     add_test(NAME HarfBuzzGoogleTest COMMAND test_harfbuzz)
@@ -436,11 +446,14 @@ if(TARGET gtest_main)
     add_executable(test_text_renderer
         text/test_text_renderer.cpp
     )
+    if(HarfBuzz_FOUND)
+        target_compile_definitions(test_text_renderer PRIVATE PINGDART_HAS_HARFBUZZ=1)
+        target_link_libraries(test_text_renderer PRIVATE HarfBuzz::HarfBuzz)
+    endif()
     target_link_libraries(test_text_renderer PRIVATE
         PingDart::Text
         PingDart::Core
         PingDart::RHI
-        HarfBuzz::HarfBuzz
         GTest::gtest_main
     )
     add_test(NAME TextRendererGoogleTest COMMAND test_text_renderer)

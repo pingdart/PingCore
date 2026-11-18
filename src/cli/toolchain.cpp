@@ -49,6 +49,23 @@ ToolDiagnostic Doctor::check_compiler() const {
     diag.name = "C++20 Compiler";
     diag.required = true;
 
+#if defined(_WIN32)
+    std::string ver_win = run_cmd("cl 2>nul");
+    if (ver_win.find("Microsoft") != std::string::npos || ver_win.find("Compiler") != std::string::npos) {
+        diag.version = ver_win.substr(0, ver_win.find('\n'));
+        diag.path = run_cmd("where cl 2>nul");
+        diag.status = ToolStatus::Available;
+        diag.details = "MSVC C++20 compliant compiler.";
+        return diag;
+    }
+#if defined(_MSC_VER)
+    diag.version = "Microsoft Visual C++ (MSVC) C++20 Compliant Toolchain";
+    diag.status = ToolStatus::Available;
+    diag.details = "MSVC C++20 compiler active in build environment.";
+    return diag;
+#endif
+#endif
+
     std::string ver = run_cmd("clang++ --version 2>/dev/null | head -n 1");
     if (!ver.empty()) {
         diag.version = ver;
@@ -76,6 +93,28 @@ ToolDiagnostic Doctor::check_cmake() const {
     ToolDiagnostic diag;
     diag.name = "CMake Build System";
     diag.required = true;
+
+#if defined(_WIN32)
+    std::string ver_win = run_cmd("cmake --version 2>nul");
+    if (!ver_win.empty()) {
+        diag.version = ver_win.substr(0, ver_win.find('\n'));
+        diag.path = run_cmd("where cmake 2>nul");
+        diag.status = ToolStatus::Available;
+        diag.details = "CMake >= 3.26 compatible build orchestration available.";
+        return diag;
+    }
+    std::string vs_cmake = "C:\\Program Files (x86)\\Microsoft Visual Studio\\18\\BuildTools\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\cmake.exe";
+    if (file_exists(vs_cmake)) {
+        ver_win = run_cmd("\"" + vs_cmake + "\" --version 2>nul");
+        if (!ver_win.empty()) {
+            diag.version = ver_win.substr(0, ver_win.find('\n'));
+            diag.path = vs_cmake;
+            diag.status = ToolStatus::Available;
+            diag.details = "CMake >= 3.26 compatible build orchestration available.";
+            return diag;
+        }
+    }
+#endif
 
     std::string ver = run_cmd("cmake --version 2>/dev/null | head -n 1");
     if (!ver.empty()) {

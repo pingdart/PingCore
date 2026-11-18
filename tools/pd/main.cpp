@@ -324,17 +324,32 @@ static bool compile_android_shared_library(const std::filesystem::path& so_path)
     auto c_src = temp_dir / "pingcore_jni_entry.c";
     {
         std::ofstream out(c_src);
-        out << "/* PingCore Android JNI Native Entry Point */\n"
+        out << "/* PingCore Android JNI & NativeActivity Entry Points */\n"
             << "#include <stdint.h>\n"
+            << "#include <stddef.h>\n"
+            << "#if defined(__cplusplus)\n"
+            << "extern \"C\" {\n"
+            << "#endif\n"
             << "__attribute__((visibility(\"default\")))\n"
             << "int32_t JNI_OnLoad(void* vm, void* reserved) {\n"
             << "    (void)vm; (void)reserved;\n"
             << "    return 0x00010006; /* JNI_VERSION_1_6 */\n"
             << "}\n"
             << "__attribute__((visibility(\"default\")))\n"
+            << "void JNI_OnUnload(void* vm, void* reserved) {\n"
+            << "    (void)vm; (void)reserved;\n"
+            << "}\n"
+            << "__attribute__((visibility(\"default\")))\n"
             << "int32_t pingcore_android_main(void) {\n"
             << "    return 0;\n"
-            << "}\n";
+            << "}\n"
+            << "__attribute__((visibility(\"default\")))\n"
+            << "void ANativeActivity_onCreate(void* activity, void* savedState, size_t savedStateSize) {\n"
+            << "    (void)activity; (void)savedState; (void)savedStateSize;\n"
+            << "}\n"
+            << "#if defined(__cplusplus)\n"
+            << "}\n"
+            << "#endif\n";
     }
 
     std::string cmd;
@@ -425,7 +440,10 @@ int handle_build(int argc, char* argv[]) {
         std::ofstream manifest(raw_manifest);
         manifest << "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
                  << "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\" package=\"com.pingcore." << app_name << "\">\n"
+                 << "    <uses-sdk android:minSdkVersion=\"24\" android:targetSdkVersion=\"34\" />\n"
+                 << "    <supports-screens android:anyDensity=\"true\" android:smallScreens=\"true\" android:normalScreens=\"true\" android:largeScreens=\"true\" android:xlargeScreens=\"true\" />\n"
                  << "    <uses-feature android:name=\"android.hardware.vulkan.version\" android:version=\"0x401000\" android:required=\"false\" />\n"
+                 << "    <uses-feature android:name=\"android.hardware.touchscreen\" android:required=\"true\" />\n"
                  << "    <application android:label=\"" << app_name << "\" android:hasCode=\"false\" android:extractNativeLibs=\"true\" android:allowBackup=\"false\">\n"
                  << "        <activity android:name=\"android.app.NativeActivity\" android:label=\"" << app_name << "\" android:configChanges=\"orientation|keyboardHidden|screenSize|screenLayout\" android:exported=\"true\">\n"
                  << "            <meta-data android:name=\"android.app.lib_name\" android:value=\"pingcore_app\" />\n"

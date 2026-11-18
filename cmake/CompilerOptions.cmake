@@ -10,9 +10,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Strict warnings and diagnostic flags
 if(MSVC)
-    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE)
     add_compile_options(
         /W4
+        /wd4996
         /permissive-
         /Zc:__cplusplus
         /utf-8

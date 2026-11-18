@@ -194,4 +194,20 @@ extern "C" {
             static_cast<pingdart::android_bridge::AndroidNativeAppEngine*>(engine_ptr)->on_touch(action, id, x, y, pressure);
         }
     }
+
+    __attribute__((visibility("default")))
+    int32_t JNI_OnLoad(void* vm, void* reserved) {
+        (void)vm; (void)reserved;
+        return 0x00010006; /* JNI_VERSION_1_6 */
+    }
+
+    __attribute__((visibility("default")))
+    void ANativeActivity_onCreate(void* activity, void* savedState, size_t savedStateSize) {
+        (void)savedState;
+        (void)savedStateSize;
+        auto engine = std::make_unique<pingdart::android_bridge::AndroidNativeAppEngine>();
+        if (engine->initialize()) {
+            (void)engine.release();
+        }
+    }
 }

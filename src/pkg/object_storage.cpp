@@ -27,6 +27,9 @@ std::filesystem::path ContentAddressableStorage::resolve_key_path(std::string_vi
     // Digest-addressed storage sharding: sha256/<prefix>/<digest>.pdar
     if (clean.starts_with("sha256:")) {
         std::string digest = clean.substr(7);
+        while (digest.starts_with("sha256:")) {
+            digest = digest.substr(7);
+        }
         std::string prefix = digest.substr(0, 2);
         return storage_root_ / "sha256" / prefix / (digest + ".pdar");
     }

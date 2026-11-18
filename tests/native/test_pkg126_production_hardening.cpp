@@ -21,11 +21,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
+#include <pingcore/socket_compat.h>
 
 using namespace pingcore;
 

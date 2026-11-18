@@ -37,7 +37,7 @@ std::vector<StaticRoute> RouteEnumerator::enumerate_entities(
         StaticRoute route{
             .path = std::move(route_path),
             .seo = std::move(seo),
-            .widget_builder = [&builder, entity]() {
+            .widget_builder = [builder, entity]() {
                 return builder(entity);
             },
             .lastmod = entity.lastmod,

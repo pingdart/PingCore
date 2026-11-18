@@ -11,11 +11,7 @@
 #include <mutex>
 #include <chrono>
 #include <csignal>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <unistd.h>
-#include <fcntl.h>
+#include <pingcore/socket_compat.h>
 
 #ifdef PINGCORE_ENABLE_OPENSSL
 #include <openssl/ssl.h>
@@ -241,13 +237,13 @@ public:
         }
 
         if (!ctx_ref) {
-            ::close(client_fd);
+            close_socket(client_fd);
             return;
         }
 
         SSL* ssl = SSL_new(ctx_ref);
         if (!ssl) {
-            ::close(client_fd);
+            close_socket(client_fd);
             return;
         }
 
@@ -267,7 +263,7 @@ public:
         }
 
         SSL_free(ssl);
-        ::close(client_fd);
+        close_socket(client_fd);
 #else
         (void)client_fd;
 #endif

@@ -45,11 +45,6 @@ core::Result<BundledFontInfo> FontBundler::evaluate_font_for_bundle(
         return core::Status(core::StatusCode::InvalidArgument, "Font path cannot be empty");
     }
 
-    std::error_code ec;
-    if (!std::filesystem::exists(font_path, ec)) {
-        return core::Status(core::StatusCode::NotFound, "Font file does not exist: " + font_path);
-    }
-
     if (is_system_proprietary(font_path)) {
         std::string filename = std::filesystem::path(font_path).filename().string();
         return core::Status(
@@ -59,6 +54,11 @@ core::Result<BundledFontInfo> FontBundler::evaluate_font_for_bundle(
             "Please use a legally redistributable open font (e.g. Google Noto, SIL Open Font License, or Apache 2.0) "
             "bundled in your project's assets/fonts directory."
         );
+    }
+
+    std::error_code ec;
+    if (!std::filesystem::exists(font_path, ec)) {
+        return core::Status(core::StatusCode::NotFound, "Font file does not exist: " + font_path);
     }
 
     std::string ext = std::filesystem::path(font_path).extension().string();

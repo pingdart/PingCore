@@ -1,4 +1,6 @@
 #include <gtest/gtest.h>
+
+#if defined(PINGDART_HAS_HARFBUZZ) && PINGDART_HAS_HARFBUZZ
 #include <pingdart/text/text_renderer.h>
 #include <filesystem>
 
@@ -18,9 +20,13 @@ std::string find_font(const std::vector<std::string>& candidates) {
 TEST(TextRendererTest, RendersLatinTextQuads) {
     std::string font_path = find_font({
         "/System/Library/Fonts/Supplemental/Arial.ttf",
-        "/System/Library/Fonts/Helvetica.ttc"
+        "/System/Library/Fonts/Helvetica.ttc",
+        "C:\\Windows\\Fonts\\arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
     });
-    ASSERT_FALSE(font_path.empty());
+    if (font_path.empty()) {
+        GTEST_SKIP() << "Standard Latin font not available on this host";
+    }
 
     auto face = FontFace::load_from_file(font_path);
     ASSERT_NE(face, nullptr);
@@ -46,7 +52,8 @@ TEST(TextRendererTest, RendersLatinTextQuads) {
 TEST(TextRendererTest, RendersTeluguComplexScriptQuads) {
     std::string font_path = find_font({
         "/System/Library/Fonts/KohinoorTelugu.ttc",
-        "/System/Library/Fonts/Supplemental/Telugu MN.ttc"
+        "/System/Library/Fonts/Supplemental/Telugu MN.ttc",
+        "C:\\Windows\\Fonts\\gautami.ttf"
     });
     if (font_path.empty()) {
         GTEST_SKIP() << "Telugu font not available on this host";
@@ -70,3 +77,8 @@ TEST(TextRendererTest, RendersTeluguComplexScriptQuads) {
         EXPECT_EQ(quad.color, gold);
     }
 }
+#else
+TEST(TextRendererTest, HarfBuzzNotAvailable) {
+    GTEST_SKIP() << "HarfBuzz not available on this host; TextRenderer tests skipped";
+}
+#endif

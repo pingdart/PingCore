@@ -230,15 +230,15 @@ core::Status Win32Window::set_cursor(CursorKind cursor) {
         return core::Status::FailedPrecondition("Cursor mutations must occur on UI thread");
     }
     cursor_ = cursor;
-    LPCWSTR idc = IDC_ARROW;
+    LPCWSTR idc = (LPCWSTR)IDC_ARROW;
     switch (cursor) {
-        case CursorKind::Arrow: idc = IDC_ARROW; break;
-        case CursorKind::IBeam: idc = IDC_IBEAM; break;
-        case CursorKind::PointingHand: idc = IDC_HAND; break;
-        case CursorKind::Crosshair: idc = IDC_CROSS; break;
-        case CursorKind::ResizeHorizontal: idc = IDC_SIZEWE; break;
-        case CursorKind::ResizeVertical: idc = IDC_SIZENS; break;
-        case CursorKind::Wait: idc = IDC_WAIT; break;
+        case CursorKind::Arrow: idc = (LPCWSTR)IDC_ARROW; break;
+        case CursorKind::IBeam: idc = (LPCWSTR)IDC_IBEAM; break;
+        case CursorKind::PointingHand: idc = (LPCWSTR)IDC_HAND; break;
+        case CursorKind::Crosshair: idc = (LPCWSTR)IDC_CROSS; break;
+        case CursorKind::ResizeHorizontal: idc = (LPCWSTR)IDC_SIZEWE; break;
+        case CursorKind::ResizeVertical: idc = (LPCWSTR)IDC_SIZENS; break;
+        case CursorKind::Wait: idc = (LPCWSTR)IDC_WAIT; break;
         case CursorKind::Hidden: idc = nullptr; break;
     }
     if (idc) {
