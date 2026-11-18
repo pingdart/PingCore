@@ -977,4 +977,19 @@ if(TARGET gtest_main)
         target_link_libraries(test_pkg133_real_device_acceptance PRIVATE pingdart_pal_macos)
     endif()
     add_test(NAME Pkg133RealDeviceAcceptanceGoogleTest COMMAND test_pkg133_real_device_acceptance)
+
+    # PKG-135: PingDartUI Foundation Tests
+    add_executable(test_pingdart_ui_foundation
+        ui/test_pingdart_ui_foundation.cpp
+    )
+    target_include_directories(test_pingdart_ui_foundation PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_pingdart_ui_foundation PRIVATE
+        PingDart::Core
+        PingDart::Sanitizers
+        PingDart::SecurityHardening
+        GTest::gtest_main
+    )
+    add_test(NAME Pkg135PingDartUiFoundationGoogleTest COMMAND test_pingdart_ui_foundation)
 endif()
