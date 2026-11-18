@@ -110,6 +110,13 @@ TEST_F(Pkg133RealDeviceAcceptanceTest, AndroidNativeActivityElf64ReadelfDynamicS
     EXPECT_EQ(dump.find("_ANativeActivity_onCreate"), std::string::npos);
     EXPECT_EQ(dump.find("_JNI_OnLoad"), std::string::npos);
     EXPECT_EQ(dump.find("_pingcore_android_main"), std::string::npos);
+
+    // Assert disassembly contains genuine AArch64 instructions for NativeActivity lifecycle callback wiring
+    std::string disasm = run_cmd("/usr/bin/objdump -d \"" + extracted_so.string() + "\" 2>/dev/null");
+    EXPECT_NE(disasm.find("<ANativeActivity_onCreate>:"), std::string::npos);
+    EXPECT_NE(disasm.find("<pingcore_android_onStart>:"), std::string::npos);
+    EXPECT_NE(disasm.find("<pingcore_android_onResume>:"), std::string::npos);
+    EXPECT_NE(disasm.find("<pingcore_android_onNativeWindowCreated>:"), std::string::npos);
 }
 
 // 2. Android Native Screen: Full Frame Buffer (1080x2400) Complete Screen Rasterization
