@@ -13,6 +13,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <algorithm>
+#include <cmath>
+#include <iomanip>
 
 namespace pingcore {
 
@@ -22,6 +25,7 @@ struct SsrRenderOptions {
     std::string canonical_url{"https://example.com"};
     std::string language{"en"};
     bool include_seo_meta{true};
+    bool include_hydration_script{true};
     bool pretty_print{true};
 };
 
@@ -53,7 +57,7 @@ public:
            << "    .pingcore-column { display: flex; flex-direction: column; align-items: stretch; width: 100%; max-width: 480px; }\n"
            << "    .pingcore-row { display: flex; flex-direction: row; align-items: center; width: 100%; }\n"
            << "    .pingcore-text { margin-bottom: 0.5rem; line-height: 1.5; }\n"
-           << "    .pingcore-btn { display: inline-block; padding: 0.75rem 1.5rem; border-radius: 0.5rem; background-color: #3b82f6; color: #ffffff; border: none; font-weight: 600; cursor: pointer; text-align: center; transition: background-color 0.2s; }\n"
+           << "    .pingcore-btn { display: inline-block; padding: 0.75rem 1.5rem; border-radius: 0.5rem; background-color: #3b82f6; color: #ffffff; border: none; font-weight: 600; cursor: pointer; text-align: center; text-decoration: none; transition: background-color 0.2s; }\n"
            << "    .pingcore-btn:hover { background-color: #2563eb; }\n"
            << "    .pingcore-input { width: 100%; padding: 0.75rem 1rem; border-radius: 0.5rem; background-color: #1e293b; border: 1px solid #334155; color: #f8fafc; font-size: 1rem; margin-bottom: 0.75rem; }\n"
            << "    .pingcore-input:focus { outline: 2px solid #3b82f6; }\n"
@@ -64,7 +68,9 @@ public:
         ss << "  <div id=\"__pingcore_root\" data-hydrated=\"false\">\n";
         ss << render_widget(root_widget, 2);
         ss << "  </div>\n";
-        ss << "  <script src=\"/_pingcore/client.js\" defer></script>\n";
+        if (options.include_hydration_script) {
+            ss << "  <script src=\"/_pingcore/client.js\" defer></script>\n";
+        }
         ss << "</body>\n";
         ss << "</html>\n";
         return ss.str();
@@ -73,24 +79,123 @@ public:
     static std::string render_widget(const Widget& widget, int indent_level = 0) {
         if (!widget) return "";
         std::string indent(static_cast<size_t>(indent_level * 2), ' ');
-        std::string type = std::string(widget->widget_type());
+        const std::string type(widget->widget_type());
+        std::ostringstream ss;
 
-        if (type == "Center") {
-            std::ostringstream ss;
-            ss << indent << "<div class=\"pingcore-center\">\n";
-            // Check if widget has children via element construction or introspection
+        if (const auto text = std::dynamic_pointer_cast<const pingdart::ui::Text>(widget)) {
+            ss << indent << "<p class=\"pingcore-text\" style=\"font-size:" << text->font_size()
+               << "px;color:" << color_to_css(text->color()) << ';';
+            if (text->bold()) ss << "font-weight:700;";
+            if (text->italic()) ss << "font-style:italic;";
+            ss << "\">" << escape_html(text->text()) << "</p>\n";
+        } else if (const auto button = std::dynamic_pointer_cast<const pingdart::ui::Button>(widget)) {
+            const auto padding = button->padding();
+            const bool is_navigation_link = !button->navigation_target().empty();
+            if (is_navigation_link) {
+                ss << indent << "<a class=\"pingcore-btn\" href=\""
+                   << escape_html(button->navigation_target()) << "\" style=\"background-color:";
+            } else {
+                ss << indent << "<button class=\"pingcore-btn\" type=\"button\" style=\"background-color:";
+            }
+            ss << color_to_css(button->background_color()) << ";border-radius:"
+               << button->border_radius() << "px;padding:" << padding.top << "px "
+               << padding.right << "px " << padding.bottom << "px " << padding.left << "px;\">";
+            if (const auto label = std::dynamic_pointer_cast<const pingdart::ui::Text>(button->child())) {
+                ss << escape_html(label->text());
+            } else {
+                ss << render_widget(button->child());
+            }
+            ss << (is_navigation_link ? "</a>\n" : "</button>\n");
+        } else if (const auto field = std::dynamic_pointer_cast<const pingdart::ui::TextField>(widget)) {
+            const auto value = field->controller() ? field->controller()->text() : std::string{};
+            ss << indent << "<input class=\"pingcore-input\" type=\""
+               << (field->obscure_text() ? "password" : "text")
+               << "\" placeholder=\"" << escape_html(field->placeholder())
+               << "\" value=\"" << escape_html(value) << "\" />\n";
+        } else if (const auto container = std::dynamic_pointer_cast<const pingdart::ui::Container>(widget)) {
+            ss << indent << "<div class=\"pingcore-container\" style=\"";
+            if (std::isfinite(container->width()) && container->width() >= 0.0f) {
+                ss << "width:" << container->width() << "px;";
+            }
+            if (std::isfinite(container->height()) && container->height() >= 0.0f) {
+                ss << "height:" << container->height() << "px;";
+            }
+            if (container->color().a > 0.0f) {
+                ss << "background-color:" << color_to_css(container->color()) << ';';
+            }
+            const auto padding = container->padding();
+            if (padding.top != 0.0f || padding.right != 0.0f ||
+                padding.bottom != 0.0f || padding.left != 0.0f) {
+                ss << "padding:" << padding.top << "px " << padding.right << "px "
+                   << padding.bottom << "px " << padding.left << "px;";
+            }
+            if (container->border_radius() > 0.0f) {
+                ss << "border-radius:" << container->border_radius() << "px;";
+            }
+            ss << "\">\n" << render_widget(container->child(), indent_level + 1)
+               << indent << "</div>\n";
+        } else if (type == "Center") {
+            const auto single_child =
+                std::dynamic_pointer_cast<const pingdart::ui::SingleChildRenderObjectWidget>(widget);
+            ss << indent << "<div class=\"pingcore-center\">\n"
+               << render_widget(single_child ? single_child->child() : nullptr, indent_level + 1)
+               << indent << "</div>\n";
+        } else if (const auto flex = std::dynamic_pointer_cast<const pingdart::ui::Flex>(widget)) {
+            const bool vertical = flex->direction() == pingdart::ui::Axis::Vertical;
+            ss << indent << "<div class=\"" << (vertical ? "pingcore-column" : "pingcore-row") << "\">\n";
+            for (const auto& child : flex->children()) {
+                ss << render_widget(child, indent_level + 1);
+            }
             ss << indent << "</div>\n";
-            return ss.str();
-        } else if (type == "Text") {
-            return indent + "<p class=\"pingcore-text\">" + escape_html(type) + "</p>\n";
-        } else if (type == "Button") {
-            return indent + "<button class=\"pingcore-btn\" type=\"button\">Action</button>\n";
-        } else if (type == "TextField") {
-            return indent + "<input class=\"pingcore-input\" type=\"text\" />\n";
+        } else if (const auto padding = std::dynamic_pointer_cast<const pingdart::ui::Padding>(widget)) {
+            const auto insets = padding->padding();
+            ss << indent << "<div style=\"padding:" << insets.top << "px " << insets.right << "px "
+               << insets.bottom << "px " << insets.left << "px;\">\n"
+               << render_widget(padding->child(), indent_level + 1)
+               << indent << "</div>\n";
+        } else if (const auto box = std::dynamic_pointer_cast<const pingdart::ui::SizedBox>(widget)) {
+            ss << indent << "<div";
+            if (std::isfinite(box->width()) && box->width() >= 0.0f) {
+                ss << " style=\"width:" << box->width() << "px;";
+                if (std::isfinite(box->height()) && box->height() >= 0.0f) {
+                    ss << "height:" << box->height() << "px;";
+                }
+                ss << '"';
+            } else if (std::isfinite(box->height()) && box->height() >= 0.0f) {
+                ss << " style=\"height:" << box->height() << "px;\"";
+            }
+            ss << ">" << render_widget(box->child()) << "</div>\n";
+        } else if (const auto flexible = std::dynamic_pointer_cast<const pingdart::ui::Flexible>(widget)) {
+            return render_widget(flexible->child(), indent_level);
+        } else if (const auto single_child =
+                       std::dynamic_pointer_cast<const pingdart::ui::SingleChildRenderObjectWidget>(widget)) {
+            ss << indent << "<div class=\"pingcore-widget\" data-type=\""
+               << escape_html(type) << "\">\n"
+               << render_widget(single_child->child(), indent_level + 1)
+               << indent << "</div>\n";
+        } else if (const auto multi_child =
+                       std::dynamic_pointer_cast<const pingdart::ui::MultiChildRenderObjectWidget>(widget)) {
+            ss << indent << "<div class=\"pingcore-widget\" data-type=\""
+               << escape_html(type) << "\">\n";
+            for (const auto& child : multi_child->children()) {
+                ss << render_widget(child, indent_level + 1);
+            }
+            ss << indent << "</div>\n";
+        } else {
+            ss << indent << "<div class=\"pingcore-widget\" data-type=\""
+               << escape_html(type) << "\"></div>\n";
         }
+        return ss.str();
+    }
 
-        // Generic container
-        return indent + "<div class=\"pingcore-widget\" data-type=\"" + type + "\"></div>\n";
+    static std::string color_to_css(const pingdart::ui::Color& color) {
+        std::ostringstream ss;
+        ss << "rgba("
+           << static_cast<int>(std::clamp(color.r, 0.0f, 1.0f) * 255.0f) << ","
+           << static_cast<int>(std::clamp(color.g, 0.0f, 1.0f) * 255.0f) << ","
+           << static_cast<int>(std::clamp(color.b, 0.0f, 1.0f) * 255.0f) << ","
+           << std::fixed << std::setprecision(3) << std::clamp(color.a, 0.0f, 1.0f) << ")";
+        return ss.str();
     }
 
     // Static Site Generation (SSG) for full project

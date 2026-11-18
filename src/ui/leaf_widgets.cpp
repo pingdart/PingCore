@@ -82,14 +82,16 @@ Button::Button(std::shared_ptr<const Widget> child,
                Color background_color,
                EdgeInsets padding,
                float border_radius,
-               std::shared_ptr<const Key> key)
+               std::shared_ptr<const Key> key,
+               std::string navigation_target)
     : StatefulWidget(std::move(key)),
       child_(std::move(child)),
       on_pressed_(std::move(on_pressed)),
       focus_node_(std::move(focus_node)),
       background_color_(background_color),
       padding_(padding),
-      border_radius_(border_radius) {}
+      border_radius_(border_radius),
+      navigation_target_(std::move(navigation_target)) {}
 
 Button::Button(std::string text,
                std::function<void()> on_pressed,
@@ -97,14 +99,16 @@ Button::Button(std::string text,
                Color background_color,
                EdgeInsets padding,
                float border_radius,
-               std::shared_ptr<const Key> key)
+               std::shared_ptr<const Key> key,
+               std::string navigation_target)
     : Button(std::make_shared<Text>(std::move(text), 14.0f, Color::from_argb(255, 255, 255, 255), "sans-serif", true),
              std::move(on_pressed),
              std::move(focus_node),
              background_color,
              padding,
              border_radius,
-             std::move(key)) {}
+             std::move(key),
+             std::move(navigation_target)) {}
 
 class ButtonState : public State<Button> {
 public:

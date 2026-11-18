@@ -25,6 +25,7 @@ if(NOT OpenSSL_FOUND)
         set(OpenSSL_FOUND TRUE)
     endif()
 endif()
+set_property(GLOBAL PROPERTY PINGCORE_HAS_OPENSSL "${OpenSSL_FOUND}")
 
 if(OpenSSL_FOUND)
     target_include_directories(pingcore_server PUBLIC ${OPENSSL_INCLUDE_DIR})

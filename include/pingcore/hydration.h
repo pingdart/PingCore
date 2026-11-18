@@ -663,7 +663,7 @@ inline RealBrowserReport run_headless_chrome_certification() {
 
     std::string cmd =
         "\"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\" "
-        "--headless=new --user-data-dir=/tmp/chrome_test_profile --no-sandbox --disable-gpu "
+        "--headless=new --user-data-dir=/tmp/chrome_profile_cert --no-sandbox --disable-gpu "
         "--screenshot=\"" + screenshot_file + "\" --dump-dom \"file://" + html_file + "\" 2>&1";
 
     FILE* pipe = ::popen(cmd.c_str(), "r");
@@ -789,7 +789,7 @@ inline FullStackAppReport run_fullstack_app_e2e_certification(const std::string&
     std::string screenshot_file = "/tmp/pingcore_pkg128_demo.png";
     std::string cmd =
         "\"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\" "
-        "--headless=new --user-data-dir=/tmp/chrome_test_profile --no-sandbox --disable-gpu "
+        "--headless=new --user-data-dir=/tmp/chrome_profile_pkg128 --no-sandbox --disable-gpu "
         "--screenshot=\"" + screenshot_file + "\" --dump-dom \"file://" + app_html.string() + "\" 2>&1";
 
     FILE* pipe = ::popen(cmd.c_str(), "r");
@@ -980,7 +980,7 @@ inline RealAppRuntimeReport run_pkg129_runtime_and_deployment_certification(cons
     std::string screenshot_file = "/tmp/pingcore_pkg129_demo.png";
     std::string cmd =
         "\"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\" "
-        "--headless=new --user-data-dir=/tmp/chrome_test_profile --no-sandbox --disable-gpu "
+        "--headless=new --user-data-dir=/tmp/chrome_profile_pkg129 --no-sandbox --disable-gpu "
         "--screenshot=\"" + screenshot_file + "\" --dump-dom \"file://" + app_html.string() + "\" 2>&1";
 
     FILE* pipe = ::popen(cmd.c_str(), "r");
@@ -1166,7 +1166,7 @@ inline RealAppRuntimeReport run_pkg130_native_runtime_and_network_certification(
     std::string screenshot_file = "/tmp/pingcore_pkg130_demo.png";
     std::string cmd =
         "\"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\" "
-        "--headless=new --user-data-dir=/tmp/chrome_test_profile --no-sandbox --disable-gpu "
+        "--headless=new --user-data-dir=/tmp/chrome_profile_pkg130 --no-sandbox --disable-gpu "
         "--screenshot=\"" + screenshot_file + "\" --dump-dom \"file://" + app_html.string() + "\" 2>&1";
 
     FILE* pipe = ::popen(cmd.c_str(), "r");

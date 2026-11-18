@@ -269,6 +269,13 @@ public:
 
     std::shared_ptr<Widget> build(BuildContext& context) const override;
 
+    [[nodiscard]] float width() const noexcept { return width_; }
+    [[nodiscard]] float height() const noexcept { return height_; }
+    [[nodiscard]] const Color& color() const noexcept { return color_; }
+    [[nodiscard]] const EdgeInsets& padding() const noexcept { return padding_; }
+    [[nodiscard]] float border_radius() const noexcept { return border_radius_; }
+    [[nodiscard]] const std::shared_ptr<const Widget>& child() const noexcept { return child_; }
+
 private:
     float width_;
     float height_;

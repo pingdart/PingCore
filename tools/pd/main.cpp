@@ -95,14 +95,6 @@ int handle_dev(int argc, char* argv[]) {
         return 2;
     }
 
-    if (example.empty() ||
-        !std::all_of(example.begin(), example.end(), [](unsigned char c) {
-            return std::isalnum(c) || c == '_' || c == '-';
-        })) {
-        std::cerr << "[pd dev] Invalid example name: " << example << std::endl;
-        return 2;
-    }
-
     std::error_code ec;
     const auto project_root = std::filesystem::current_path(ec);
     if (ec) {
@@ -110,6 +102,19 @@ int handle_dev(int argc, char* argv[]) {
                   << std::endl;
         return 1;
     }
+
+    const bool generated_app = std::filesystem::exists(project_root / "app" / "page.cpp") &&
+                               std::filesystem::exists(project_root / "pingcore.yaml");
+    if (generated_app) {
+        example = project_root.filename().string();
+    } else if (example.empty() ||
+               !std::all_of(example.begin(), example.end(), [](unsigned char c) {
+                   return std::isalnum(c) || c == '_' || c == '-';
+               })) {
+        std::cerr << "[pd dev] Invalid example name: " << example << std::endl;
+        return 2;
+    }
+
     return run_web_dev_server(project_root, example, port);
 }
 
@@ -1684,6 +1689,29 @@ int handle_create(int argc, char* argv[]) {
         std::cout << "[pd create app] Scaffolding new Next.js-style PingCore C++ application '" << name << "'..." << std::endl;
         std::error_code ec;
         std::filesystem::path root(name);
+        std::string app_name = root.filename().string();
+        if (app_name.empty()) app_name = "pingcore_app";
+        std::string safe_app_name = app_name;
+        for (char& c : safe_app_name) {
+            if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_') {
+                c = '_';
+            }
+        }
+        if (safe_app_name.empty() || (!std::isalpha(static_cast<unsigned char>(safe_app_name[0])) && safe_app_name[0] != '_')) {
+            safe_app_name = "app_" + safe_app_name;
+        }
+
+#if defined(_WIN32)
+        const auto pd_executable = std::filesystem::path(PINGCORE_BUILD_DIR) / "tools" / "pd" / "pd.exe";
+#else
+        const auto pd_executable = std::filesystem::path(PINGCORE_BUILD_DIR) / "tools" / "pd" / "pd";
+#endif
+        auto pd_dev_command = pd_executable.string();
+        const auto absolute_app_root = std::filesystem::absolute(root, ec);
+        if (!ec) {
+            const auto relative_pd = std::filesystem::relative(pd_executable, absolute_app_root, ec);
+            if (!ec) pd_dev_command = relative_pd.generic_string();
+        }
 
         std::vector<std::string> requested_platforms = {"android", "ios", "windows", "macos", "linux", "web"};
         for (int i = 4; i < argc; ++i) {
@@ -1740,10 +1768,7 @@ int handle_create(int argc, char* argv[]) {
               << "                .fontSize(30.0f)\n"
               << "                .bold(),\n\n"
               << "            Text(\"Build once. Run everywhere.\"),\n\n"
-              << "            Button(\"Login\")\n"
-              << "                .onClick([] {\n"
-              << "                    navigate(\"/login\");\n"
-              << "                })\n"
+              << "            Button(\"Login\").navigateTo(\"/login\")\n"
               << "        }).spacing(16.0f)\n"
               << "    );\n"
               << "}\n";
@@ -1771,7 +1796,7 @@ int handle_create(int argc, char* argv[]) {
               << "    return Center(\n"
               << "        Column({\n"
               << "            Text(\"404 - Page Not Found\").fontSize(32.0f).bold().color(Color::rgb(239, 68, 68)),\n"
-              << "            Button(\"Return Home\").onClick([] { navigate(\"/\"); })\n"
+              << "            Button(\"Return Home\").navigateTo(\"/\")\n"
               << "        }).spacing(16.0f)\n"
               << "    );\n"
               << "}\n";
@@ -1789,10 +1814,7 @@ int handle_create(int argc, char* argv[]) {
               << "            Text(\"Login\").fontSize(28.0f).bold(),\n"
               << "            TextField(\"Email\"),\n"
               << "            PasswordField(\"Password\"),\n"
-              << "            Button(\"Sign In\")\n"
-              << "                .onClick([] {\n"
-              << "                    navigate(\"/dashboard\");\n"
-              << "                })\n"
+              << "            Button(\"Sign In\").navigateTo(\"/dashboard\")\n"
               << "        }).spacing(12.0f)\n"
               << "    );\n"
               << "}\n";
@@ -1809,10 +1831,8 @@ int handle_create(int argc, char* argv[]) {
               << "        Column({\n"
               << "            Text(\"Dashboard\").fontSize(28.0f).bold(),\n"
               << "            Text(\"Unified C++ cross-platform application\"),\n"
-              << "            Button(\"View User 42 Profile\")\n"
-              << "                .onClick([] { navigate(\"/users/42\"); }),\n"
-              << "            Button(\"Sign Out\")\n"
-              << "                .onClick([] { navigate(\"/login\"); })\n"
+              << "            Button(\"View User 42 Profile\").navigateTo(\"/users/42\"),\n"
+              << "            Button(\"Sign Out\").navigateTo(\"/login\")\n"
               << "        }).spacing(12.0f)\n"
               << "    );\n"
               << "}\n";
@@ -1830,7 +1850,7 @@ int handle_create(int argc, char* argv[]) {
               << "        Column({\n"
               << "            Text(\"User Profile: \" + (user_id.empty() ? \"Guest\" : user_id)).fontSize(24.0f).bold(),\n"
               << "            Text(\"Rendered via Next.js dynamic routing in C++20\"),\n"
-              << "            Button(\"Back to Dashboard\").onClick([] { navigate(\"/dashboard\"); })\n"
+              << "            Button(\"Back to Dashboard\").navigateTo(\"/dashboard\")\n"
               << "        }).spacing(12.0f)\n"
               << "    );\n"
               << "}\n";
@@ -1853,7 +1873,7 @@ int handle_create(int argc, char* argv[]) {
         // 10. pingcore.yaml
         {
             std::ofstream f(root / "pingcore.yaml");
-            f << "name: " << name << "\n"
+            f << "name: " << app_name << "\n"
               << "version: 1.0.0\n\n"
               << "targets:\n";
             for (const auto& p : requested_platforms) {
@@ -1870,42 +1890,34 @@ int handle_create(int argc, char* argv[]) {
               << "  seo: true\n"
               << "  ssr: true\n\n"
               << "android:\n"
-              << "  applicationId: com.example." << name << "\n\n"
+              << "  applicationId: com.example." << app_name << "\n\n"
               << "ios:\n"
-              << "  bundleId: com.example." << name << "\n\n"
+              << "  bundleId: com.example." << app_name << "\n\n"
               << "server:\n"
               << "  port: 8080\n\n"
               << pingcore::PermissionManager::serialize_yaml(pingcore::PermissionManager::default_permissions());
         }
 
         // 10b. Generate Native Platform Project Folders & Sync Permissions
-        pingcore::PlatformScaffold::scaffold_all(root, name, requested_platforms);
+        pingcore::PlatformScaffold::scaffold_all(root, app_name, requested_platforms);
         pingcore::PermissionManager::sync_project_permissions(root);
 
         // 11. CMakeLists.txt
         {
             std::ofstream f(root / "CMakeLists.txt");
             f << "cmake_minimum_required(VERSION 3.26)\n"
-              << "project(" << name << " LANGUAGES CXX)\n\n"
+              << "project(" << app_name << " LANGUAGES CXX)\n\n"
               << "set(CMAKE_CXX_STANDARD 20)\n"
               << "set(CMAKE_CXX_STANDARD_REQUIRED ON)\n\n"
-              << "find_package(PingCore REQUIRED)\n\n"
-              << "# 1. Main Client UI Application (Desktop / Mobile / Web)\n"
-              << "add_executable(" << name << "\n"
-              << "    app/layout.cpp\n"
-              << "    app/page.cpp\n"
-              << "    app/loading.cpp\n"
-              << "    app/not_found.cpp\n"
-              << "    app/login/page.cpp\n"
-              << "    app/dashboard/page.cpp\n"
-              << "    app/users/[id]/page.cpp\n"
-              << ")\n"
-              << "target_link_libraries(" << name << " PRIVATE PingCore::SDK)\n\n"
-              << "# 2. Standalone Backend API Server (Microservices)\n"
-              << "add_executable(" << name << "_server\n"
-              << "    app/api/users/route.cpp\n"
-              << ")\n"
-              << "target_link_libraries(" << name << "_server PRIVATE PingCore::Server PingCore::Core)\n";
+              << "find_package(PingCore REQUIRED CONFIG)\n\n"
+              << "# RouteCompiler generates these files before building the app.\n"
+              << "add_executable(" << app_name << " .pingcore/generated/routes_client.g.cpp)\n"
+              << "target_link_libraries(" << app_name << " PRIVATE PingCore::SDK)\n\n"
+              << "add_executable(" << app_name << "_web_dev .pingcore/generated/routes_web.g.cpp)\n"
+              << "target_link_libraries(" << app_name << "_web_dev PRIVATE PingCore::SDK)\n\n"
+              << "# Standalone backend API server\n"
+              << "add_executable(" << app_name << "_server .pingcore/generated/routes_server.g.cpp)\n"
+              << "target_link_libraries(" << app_name << "_server PRIVATE PingCore::Server PingCore::Core)\n";
         }
 
         // 12. .env.example
@@ -1928,12 +1940,14 @@ int handle_create(int argc, char* argv[]) {
         // 14. README.md
         {
             std::ofstream f(root / "README.md");
-            f << "# " << name << "\n\n"
+            f << "# " << app_name << "\n\n"
               << "A Next.js-style unified cross-platform application built with PingCore C++20.\n\n"
               << "## Commands\n\n"
               << "```bash\n"
               << "# Start development\n"
               << "pd dev\n\n"
+              << "# Or use this checkout's pd binary when it is not on PATH\n"
+              << pd_dev_command << " dev\n\n"
               << "# Run on host desktop\n"
               << "pd run --device host\n\n"
               << "# Run on mobile devices\n"
@@ -1958,7 +1972,7 @@ int handle_create(int argc, char* argv[]) {
                   << "  │   ├── dashboard/page.cpp\n"
                   << "  │   ├── users/[id]/page.cpp\n"
                   << "  │   └── api/users/route.cpp\n"
-                  << "  ├── platforms/            Real native platform projects (PKG-121)\n"
+                  << "  ├── platforms/            Native platform project scaffolds\n"
                   << "  │   ├── android/          Android Gradle Kotlin project\n"
                   << "  │   ├── ios/              iOS Xcode project (.xcodeproj)\n"
                   << "  │   ├── macos/            macOS native host\n"
@@ -1978,7 +1992,7 @@ int handle_create(int argc, char* argv[]) {
                   << "  └── CMakeLists.txt        Decoupled UI and server builds\n\n"
                   << "To start developing:\n"
                   << "  cd " << name << "\n"
-                  << "  pd dev\n" << std::endl;
+                  << "  " << pd_dev_command << " dev\n" << std::endl;
         return 0;
     } else if (type == "package") {
         std::cout << "[pd create package] Scaffolding new library package '" << name << "'..." << std::endl;

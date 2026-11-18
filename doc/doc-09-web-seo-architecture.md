@@ -165,7 +165,8 @@ When the browser receives the pre-rendered HTML:
 The official developer CLI exposes streamlined web workflows:
 
 ```bash
-# Start the local web example server with rebuild-and-refresh on C++ edits
+# Start a generated app from its project directory, or select a repository example
+pd dev --target web
 pd dev --target web --app login_form --port 8080
 
 # Build static production website (SSG) with automatic sitemap and SEO pre-rendering
@@ -178,6 +179,12 @@ pd build --platform web --mode ssr --output-dir dist/
 pd build --platform web --mode spa --output-dir dist/
 ```
 
-The current development server rebuilds the selected CMake example and reloads the
-browser page after successful C++ changes. This is full-page refresh, not
-state-preserving component HMR.
+From a generated app directory (`app/` and `pingcore.yaml`), `pd dev` compiles the
+file-based routes, builds a server-rendered web target, serves static and dynamic
+routes on loopback, and reloads the page after successful C++ changes. From the
+PingCore repository root, `--app` continues to select a repository example.
+Refresh is full-page, not state-preserving HMR; browser-side widget event
+hydration is not provided by this development preview. Use `Button::navigateTo`
+for browser navigation in the preview; it renders a semantic link that works
+without client-side hydration. `.onClick()` callbacks still require an
+interactive runtime and are not executed by server-rendered HTML.

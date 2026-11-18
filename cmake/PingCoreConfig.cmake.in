@@ -4,8 +4,32 @@ include(CMakeFindDependencyMacro)
 
 find_dependency(Threads)
 
+if(@PINGCORE_CONFIG_HAS_FREETYPE@)
+    find_dependency(Freetype)
+endif()
+
+if(@PINGCORE_CONFIG_HAS_HARFBUZZ@)
+    list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
+    find_dependency(HarfBuzz)
+endif()
+
+if(@PINGCORE_CONFIG_HAS_OPENSSL@)
+    find_dependency(OpenSSL)
+endif()
+
 if(APPLE)
     find_library(SECURITY_FRAMEWORK Security REQUIRED)
+endif()
+
+set(_pingcore_compiler_library
+    "${CMAKE_CURRENT_LIST_DIR}/../../../@CMAKE_INSTALL_LIBDIR@/@CMAKE_STATIC_LIBRARY_PREFIX@pingdart_compiler@CMAKE_STATIC_LIBRARY_SUFFIX@")
+if(NOT EXISTS "${_pingcore_compiler_library}")
+    set(_pingcore_compiler_library "@RUST_LIB_STATIC@")
+endif()
+if(NOT TARGET pingdart_compiler)
+    add_library(pingdart_compiler STATIC IMPORTED)
+    set_target_properties(pingdart_compiler PROPERTIES
+        IMPORTED_LOCATION "${_pingcore_compiler_library}")
 endif()
 
 if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/PingCoreTargets.cmake")

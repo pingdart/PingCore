@@ -7,12 +7,14 @@
 #include <pingdart/ui/leaf_widgets.h>
 #include <pingdart/ui/focus_node.h>
 #include <pingdart/ui/text_editing_controller.h>
+#include <pingdart/web/url_security.h>
 #include <pingcore/reactive.h>
 #include <string>
 #include <vector>
 #include <memory>
 #include <functional>
 #include <iostream>
+#include <stdexcept>
 
 namespace pingcore {
 
@@ -124,10 +126,31 @@ public:
         return *this;
     }
 
+    Button& navigateTo(std::string_view path) {
+        std::string decoded_path;
+        if (path.empty() || path.front() != '/' ||
+            !pingdart::web::UrlSecurity::is_safe_uri_path(path) ||
+            !pingdart::web::UrlSecurity::percent_decode(path, decoded_path) ||
+            decoded_path.starts_with("//") || decoded_path.find('\\') != std::string::npos) {
+            throw std::invalid_argument("Button navigation target must be a safe absolute route path");
+        }
+        navigation_target_ = path;
+        on_click_ = [target = navigation_target_] {
+            navigate(target);
+        };
+        return *this;
+    }
+
     [[nodiscard]] std::shared_ptr<const pingdart::ui::Widget> build() const {
         return std::make_shared<pingdart::ui::Button>(
             label_,
-            on_click_
+            on_click_,
+            nullptr,
+            pingdart::ui::Color::from_argb(255, 37, 99, 235),
+            pingdart::ui::EdgeInsets::symmetric(10.0f, 16.0f),
+            6.0f,
+            nullptr,
+            navigation_target_
         );
     }
 
@@ -138,6 +161,7 @@ public:
 private:
     std::string label_;
     std::function<void()> on_click_;
+    std::string navigation_target_;
 };
 
 // --- Fluent Column Layout ---

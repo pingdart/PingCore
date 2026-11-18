@@ -163,6 +163,7 @@ add_library(PingCore::Network ALIAS pingcore_network)
 
 # SDK Umbrella Target
 add_library(pingcore_sdk INTERFACE)
+set_target_properties(pingcore_sdk PROPERTIES EXPORT_NAME SDK)
 target_include_directories(pingcore_sdk INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
@@ -194,6 +195,8 @@ set_target_properties(pingdart_safety PROPERTIES EXPORT_NAME Safety)
 set_target_properties(pingdart_pkg PROPERTIES EXPORT_NAME Database)
 set_target_properties(pingdart_pal PROPERTIES EXPORT_NAME PAL)
 set_target_properties(pingdart_rhi PROPERTIES EXPORT_NAME RHI)
+set_target_properties(pingdart_sanitizers PROPERTIES EXPORT_NAME Sanitizers)
+set_target_properties(pingdart_security_hardening PROPERTIES EXPORT_NAME SecurityHardening)
 
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
@@ -205,12 +208,19 @@ install(TARGETS
     pingdart_pkg
     pingdart_pal
     pingdart_rhi
+    pingdart_sanitizers
+    pingdart_security_hardening
     EXPORT PingCoreTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
+install(TARGETS pingcore_sdk
+    EXPORT PingCoreTargets
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+install(FILES "${RUST_LIB_STATIC}" DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
 if(TARGET pingdart_text)
     set_target_properties(pingdart_text PROPERTIES EXPORT_NAME Text)
@@ -233,11 +243,29 @@ install(EXPORT PingCoreTargets
     NAMESPACE PingCore::
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/PingCore
 )
+export(EXPORT PingCoreTargets
+    FILE "${CMAKE_CURRENT_BINARY_DIR}/PingCoreTargets.cmake"
+    NAMESPACE PingCore::
+)
 
 write_basic_package_version_file(
     "${CMAKE_CURRENT_BINARY_DIR}/PingCoreConfigVersion.cmake"
     VERSION ${PROJECT_VERSION}
     COMPATIBILITY SameMajorVersion
+)
+
+get_property(PINGCORE_CONFIG_HAS_FREETYPE GLOBAL PROPERTY PINGCORE_HAS_FREETYPE)
+get_property(PINGCORE_CONFIG_HAS_HARFBUZZ GLOBAL PROPERTY PINGCORE_HAS_HARFBUZZ)
+get_property(PINGCORE_CONFIG_HAS_OPENSSL GLOBAL PROPERTY PINGCORE_HAS_OPENSSL)
+foreach(dependency Freetype HarfBuzz OpenSSL)
+    if(NOT PINGCORE_CONFIG_HAS_${dependency})
+        set(PINGCORE_CONFIG_HAS_${dependency} FALSE)
+    endif()
+endforeach()
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/FindHarfBuzz.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/FindHarfBuzz.cmake"
+    COPYONLY
 )
 
 configure_package_config_file(
@@ -249,23 +277,31 @@ configure_package_config_file(
 install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/PingCoreConfig.cmake"
     "${CMAKE_CURRENT_BINARY_DIR}/PingCoreConfigVersion.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/FindHarfBuzz.cmake"
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/PingCore
 )
 
 # Examples
-add_subdirectory(examples/desktop_host)
-add_subdirectory(examples/desktop_login)
-add_subdirectory(examples/shared_login)
-add_subdirectory(examples/my_first_app)
-add_subdirectory(examples/web_hello)
-add_subdirectory(examples/doctor_card)
-add_subdirectory(examples/component_gallery)
-add_subdirectory(examples/reactive_counter)
-add_subdirectory(examples/login_form)
-add_subdirectory(examples/doctor_profile)
-add_subdirectory(examples/responsive_dashboard)
-add_subdirectory(examples/interactive_datagrid)
-add_subdirectory(examples/gesture_playground)
+set(PINGDART_EXAMPLES
+    examples/desktop_host
+    examples/desktop_login
+    examples/shared_login
+    examples/my_first_app
+    examples/web_hello
+    examples/doctor_card
+    examples/component_gallery
+    examples/reactive_counter
+    examples/login_form
+    examples/doctor_profile
+    examples/responsive_dashboard
+    examples/interactive_datagrid
+    examples/gesture_playground
+)
+foreach(example_dir IN LISTS PINGDART_EXAMPLES)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${example_dir}/CMakeLists.txt")
+        add_subdirectory("${example_dir}")
+    endif()
+endforeach()
 
 # Testing
 if(BUILD_TESTING)

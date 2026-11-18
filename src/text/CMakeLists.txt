@@ -3,6 +3,8 @@
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 find_package(Freetype QUIET)
 find_package(HarfBuzz QUIET)
+set_property(GLOBAL PROPERTY PINGCORE_HAS_FREETYPE "${Freetype_FOUND}")
+set_property(GLOBAL PROPERTY PINGCORE_HAS_HARFBUZZ "${HarfBuzz_FOUND}")
 
 set(TEXT_SOURCES
     unicode_analyzer.cpp

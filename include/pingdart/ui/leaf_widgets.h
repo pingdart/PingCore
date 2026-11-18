@@ -28,6 +28,9 @@ public:
     [[nodiscard]] const std::string& text() const noexcept { return text_; }
     [[nodiscard]] float font_size() const noexcept { return font_size_; }
     [[nodiscard]] const Color& color() const noexcept { return color_; }
+    [[nodiscard]] const std::string& font_family() const noexcept { return font_family_; }
+    [[nodiscard]] bool bold() const noexcept { return bold_; }
+    [[nodiscard]] bool italic() const noexcept { return italic_; }
 
     void perform_layout() override;
     void paint(PaintContext& context, Offset offset) override;
@@ -66,6 +69,11 @@ public:
     void update_render_object(BuildContext& context, RenderObject& render_object) const override;
 
     [[nodiscard]] const std::string& text() const noexcept { return text_; }
+    [[nodiscard]] float font_size() const noexcept { return font_size_; }
+    [[nodiscard]] const Color& color() const noexcept { return color_; }
+    [[nodiscard]] const std::string& font_family() const noexcept { return font_family_; }
+    [[nodiscard]] bool bold() const noexcept { return bold_; }
+    [[nodiscard]] bool italic() const noexcept { return italic_; }
 
 private:
     std::string text_;
@@ -85,7 +93,8 @@ public:
            Color background_color = Color::from_argb(255, 37, 99, 235),
            EdgeInsets padding = EdgeInsets::symmetric(10.0f, 16.0f),
            float border_radius = 6.0f,
-           std::shared_ptr<const Key> key = nullptr);
+           std::shared_ptr<const Key> key = nullptr,
+           std::string navigation_target = {});
 
     Button(std::string text,
            std::function<void()> on_pressed,
@@ -93,7 +102,8 @@ public:
            Color background_color = Color::from_argb(255, 37, 99, 235),
            EdgeInsets padding = EdgeInsets::symmetric(10.0f, 16.0f),
            float border_radius = 6.0f,
-           std::shared_ptr<const Key> key = nullptr);
+           std::shared_ptr<const Key> key = nullptr,
+           std::string navigation_target = {});
 
     [[nodiscard]] std::string_view widget_type() const noexcept override { return "Button"; }
 
@@ -105,6 +115,7 @@ public:
     [[nodiscard]] const Color& background_color() const noexcept { return background_color_; }
     [[nodiscard]] const EdgeInsets& padding() const noexcept { return padding_; }
     [[nodiscard]] float border_radius() const noexcept { return border_radius_; }
+    [[nodiscard]] const std::string& navigation_target() const noexcept { return navigation_target_; }
 
 private:
     std::shared_ptr<const Widget> child_;
@@ -113,6 +124,7 @@ private:
     Color background_color_;
     EdgeInsets padding_;
     float border_radius_;
+    std::string navigation_target_;
 };
 
 // TextField Widget
