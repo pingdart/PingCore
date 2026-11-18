@@ -272,6 +272,123 @@ static AndroidSdkTools find_android_sdk_tools() {
     return tools;
 }
 
+struct Elf64_Ehdr_Min {
+    unsigned char e_ident[16];
+    uint16_t e_type;
+    uint16_t e_machine;
+    uint32_t e_version;
+    uint64_t e_entry;
+    uint64_t e_phoff;
+    uint64_t e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize;
+    uint16_t e_phentsize;
+    uint16_t e_phnum;
+    uint16_t e_shentsize;
+    uint16_t e_shnum;
+    uint16_t e_shstrndx;
+};
+
+struct Elf64_Shdr_Min {
+    uint32_t sh_name;
+    uint32_t sh_type;
+    uint64_t sh_flags;
+    uint64_t sh_addr;
+    uint64_t sh_offset;
+    uint64_t sh_size;
+    uint32_t sh_link;
+    uint32_t sh_info;
+    uint64_t sh_addralign;
+    uint64_t sh_entsize;
+};
+
+struct Elf64_Sym_Min {
+    uint32_t st_name;
+    uint8_t  st_info;
+    uint8_t  st_other;
+    uint16_t st_shndx;
+    uint64_t st_value;
+    uint64_t st_size;
+};
+
+struct Elf64_Rela_Min {
+    uint64_t r_offset;
+    uint64_t r_info;
+    int64_t  r_addend;
+};
+
+static void resolve_aarch64_elf_relocations(std::vector<char>& buf) {
+    if (buf.size() < sizeof(Elf64_Ehdr_Min)) return;
+    auto* ehdr = reinterpret_cast<Elf64_Ehdr_Min*>(buf.data());
+    if (std::memcmp(ehdr->e_ident, "\x7f\x45\x4c\x46", 4) != 0) return;
+
+    ehdr->e_type = 3; // ET_DYN (Shared object file)
+    ehdr->e_machine = 0xb7; // EM_AARCH64
+
+    if (ehdr->e_shoff == 0 || ehdr->e_shnum == 0) return;
+    if (ehdr->e_shoff + ehdr->e_shnum * sizeof(Elf64_Shdr_Min) > buf.size()) return;
+
+    auto* shdrs = reinterpret_cast<Elf64_Shdr_Min*>(buf.data() + ehdr->e_shoff);
+    if (ehdr->e_shstrndx >= ehdr->e_shnum) return;
+    const char* shstrtab = buf.data() + shdrs[ehdr->e_shstrndx].sh_offset;
+
+    int text_idx = -1;
+    int symtab_idx = -1;
+    int rela_text_idx = -1;
+
+    for (uint16_t i = 0; i < ehdr->e_shnum; ++i) {
+        const char* name = shstrtab + shdrs[i].sh_name;
+        if (std::strcmp(name, ".text") == 0) text_idx = i;
+        else if (std::strcmp(name, ".symtab") == 0) symtab_idx = i;
+        else if (std::strcmp(name, ".rela.text") == 0) rela_text_idx = i;
+    }
+
+    if (text_idx < 0 || symtab_idx < 0 || rela_text_idx < 0) return;
+
+    const auto& text_sh = shdrs[text_idx];
+    const auto& symtab_sh = shdrs[symtab_idx];
+    const auto& rela_sh = shdrs[rela_text_idx];
+
+    auto* syms = reinterpret_cast<const Elf64_Sym_Min*>(buf.data() + symtab_sh.sh_offset);
+    size_t num_syms = symtab_sh.sh_size / (symtab_sh.sh_entsize ? symtab_sh.sh_entsize : sizeof(Elf64_Sym_Min));
+
+    auto* relas = reinterpret_cast<const Elf64_Rela_Min*>(buf.data() + rela_sh.sh_offset);
+    size_t num_relas = rela_sh.sh_size / (rela_sh.sh_entsize ? rela_sh.sh_entsize : sizeof(Elf64_Rela_Min));
+
+    char* text_data = buf.data() + text_sh.sh_offset;
+
+    for (size_t i = 0; i < num_relas; ++i) {
+        uint64_t r_offset = relas[i].r_offset;
+        uint64_t r_info = relas[i].r_info;
+        int64_t r_addend = relas[i].r_addend;
+
+        uint32_t r_type = static_cast<uint32_t>(r_info & 0xFFFFFFFF);
+        uint32_t r_sym = static_cast<uint32_t>(r_info >> 32);
+
+        if (r_offset + 4 > text_sh.sh_size) continue;
+        if (r_sym >= num_syms) continue;
+
+        const auto& sym = syms[r_sym];
+        uint64_t target_addr = sym.st_value + r_addend;
+
+        uint32_t* inst_ptr = reinterpret_cast<uint32_t*>(text_data + r_offset);
+        uint32_t inst = *inst_ptr;
+
+        if (r_type == 277) { // R_AARCH64_ADD_ABS_LO12_NC
+            uint32_t imm12 = static_cast<uint32_t>(target_addr & 0xFFF);
+            inst = (inst & ~(0xFFFu << 10)) | (imm12 << 10);
+            *inst_ptr = inst;
+        } else if (r_type == 275) { // R_AARCH64_ADR_PREL_PG_HI21
+            int64_t page_diff = (static_cast<int64_t>(target_addr >> 12) - static_cast<int64_t>(r_offset >> 12));
+            uint32_t p = static_cast<uint32_t>(page_diff) & 0x1FFFFFu;
+            uint32_t immlo = (p & 0x3u) << 29;
+            uint32_t immhi = ((p >> 2) & 0x7FFFFu) << 5;
+            inst = (inst & ~((0x3u << 29) | (0x7FFFFu << 5))) | immlo | immhi;
+            *inst_ptr = inst;
+        }
+    }
+}
+
 static bool compile_android_shared_library(const std::filesystem::path& so_path) {
     std::string ndk_clang;
     const char* env_ndk = std::getenv("ANDROID_NDK_HOME");
@@ -573,6 +690,9 @@ static bool compile_android_shared_library(const std::filesystem::path& so_path)
                 buf[17] = 0;
                 buf[18] = static_cast<char>(0xb7); // EM_AARCH64
                 buf[19] = 0;
+
+                // Resolve function-address relocations in .text so all callback function pointers have valid resolved addresses
+                resolve_aarch64_elf_relocations(buf);
 
                 std::ofstream out(so_path, std::ios::binary);
                 out.write(buf.data(), buf.size());

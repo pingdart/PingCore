@@ -117,6 +117,10 @@ TEST_F(Pkg133RealDeviceAcceptanceTest, AndroidNativeActivityElf64ReadelfDynamicS
     EXPECT_NE(disasm.find("<pingcore_android_onStart>:"), std::string::npos);
     EXPECT_NE(disasm.find("<pingcore_android_onResume>:"), std::string::npos);
     EXPECT_NE(disasm.find("<pingcore_android_onNativeWindowCreated>:"), std::string::npos);
+
+    // Verify resolved callback function-address relocations (PKG-134 compliance)
+    EXPECT_NE(disasm.find("add\tx9, x9, #0x100"), std::string::npos);
+    EXPECT_NE(disasm.find("add\tx10, x10, #0x118"), std::string::npos);
 }
 
 // 2. Android Native Screen: Full Frame Buffer (1080x2400) Complete Screen Rasterization
