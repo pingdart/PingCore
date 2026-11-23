@@ -1,0 +1,513 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		000000000000000000000101 /* main.mm in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000201 /* main.mm */; };
+		000000000000000000000102 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000203 /* LaunchScreen.storyboard */; };
+		000000000000000000000103 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000208 /* Assets.xcassets */; };
+		000000000000000000000104 /* notification_view_controller.mm in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000212; };
+		000000000000000000000105 /* DownloadNotification.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = 000000000000000000000211; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		000000000000000000000106 /* main.mm in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000201; };
+		000000000000000000000107 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000203; };
+		000000000000000000000108 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000208; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		000000000000000000000200 /* PingCore Examples.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "PingCore Examples.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		000000000000000000000201 /* main.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main.mm; sourceTree = "<group>"; };
+		000000000000000000000202 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		000000000000000000000203 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+		000000000000000000000204 /* Base.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Base.xcconfig; sourceTree = "<group>"; };
+		000000000000000000000205 /* Debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Debug.xcconfig; sourceTree = "<group>"; };
+		000000000000000000000206 /* Release.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Release.xcconfig; sourceTree = "<group>"; };
+		000000000000000000000207 /* Local.xcconfig.example */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Local.xcconfig.example; sourceTree = "<group>"; };
+		000000000000000000000208 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		000000000000000000000210 /* PingCore Notifications.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "PingCore Notifications.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		000000000000000000000211 /* DownloadNotification.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = DownloadNotification.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		000000000000000000000212 /* notification_view_controller.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = notification_view_controller.mm; sourceTree = "<group>"; };
+		000000000000000000000213 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		000000000000000000000302 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		000000000000000000000312 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		000000000000000000000322 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		000000000000000000000400 = {
+			isa = PBXGroup;
+			children = (
+				000000000000000000000401 /* App */,
+				000000000000000000000402 /* Config */,
+				000000000000000000000404 /* Download Notification */,
+				000000000000000000000403 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		000000000000000000000401 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				000000000000000000000201 /* main.mm */,
+				000000000000000000000202 /* Info.plist */,
+				000000000000000000000203 /* LaunchScreen.storyboard */,
+				000000000000000000000208 /* Assets.xcassets */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		000000000000000000000402 /* Config */ = {
+			isa = PBXGroup;
+			children = (
+				000000000000000000000204 /* Base.xcconfig */,
+				000000000000000000000205 /* Debug.xcconfig */,
+				000000000000000000000206 /* Release.xcconfig */,
+				000000000000000000000207 /* Local.xcconfig.example */,
+			);
+			path = Config;
+			sourceTree = "<group>";
+		};
+		000000000000000000000403 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				000000000000000000000200 /* PingCore Examples.app */,
+				000000000000000000000210 /* PingCore Notifications.app */,
+				000000000000000000000211 /* DownloadNotification.appex */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		000000000000000000000404 /* Download Notification */ = {
+			isa = PBXGroup;
+			children = (000000000000000000000212, 000000000000000000000213, );
+			name = "Download Notification";
+			path = ../../../examples/local_notification/ios;
+			sourceTree = SOURCE_ROOT;
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		000000000000000000000500 /* PingCoreExamples */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 000000000000000000000702 /* Build configuration list for PBXNativeTarget "PingCoreExamples" */;
+			buildPhases = (
+				000000000000000000000304 /* Build PingCore Example */,
+				000000000000000000000301 /* Sources */,
+				000000000000000000000302 /* Frameworks */,
+				000000000000000000000303 /* Resources */,
+				000000000000000000000305 /* Stage PingCore Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = PingCoreExamples;
+			productName = "PingCore Examples";
+			productReference = 000000000000000000000200 /* PingCore Examples.app */;
+			productType = "com.apple.product-type.application";
+		};
+		000000000000000000000501 /* PingCoreNotifications */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 000000000000000000000703 /* Build configuration list for PBXNativeTarget "PingCoreNotifications" */;
+			buildPhases = (
+				000000000000000000000314 /* Build PingCore Example */,
+				000000000000000000000311 /* Sources */,
+				000000000000000000000312 /* Frameworks */,
+				000000000000000000000313 /* Resources */,
+				000000000000000000000315 /* Stage PingCore Resources */,
+				000000000000000000000316 /* Embed App Extensions */,
+			);
+			buildRules = (
+			);
+			dependencies = (000000000000000000000902, );
+			name = PingCoreNotifications;
+			productName = "PingCore Notifications";
+			productReference = 000000000000000000000210 /* PingCore Notifications.app */;
+			productType = "com.apple.product-type.application";
+		};
+		000000000000000000000502 /* DownloadNotification */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 000000000000000000000704;
+			buildPhases = (000000000000000000000324, 000000000000000000000321, 000000000000000000000322, 000000000000000000000323, );
+			buildRules = ();
+			dependencies = ();
+			name = DownloadNotification;
+			productName = DownloadNotification;
+			productReference = 000000000000000000000211;
+			productType = "com.apple.product-type.app-extension";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		000000000000000000000600 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+					000000000000000000000501 = {CreatedOnToolsVersion = 16.0; };
+					000000000000000000000502 = {CreatedOnToolsVersion = 16.0; };
+					000000000000000000000500 = {
+						CreatedOnToolsVersion = 16.0;
+					};
+				};
+			};
+			buildConfigurationList = 000000000000000000000701 /* Build configuration list for PBXProject "PingCoreExamples" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 000000000000000000000400;
+			productRefGroup = 000000000000000000000403 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				000000000000000000000500 /* PingCoreExamples */,
+				000000000000000000000501 /* PingCoreNotifications */,
+				000000000000000000000502 /* DownloadNotification */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		000000000000000000000303 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				000000000000000000000102 /* LaunchScreen.storyboard in Resources */,
+				000000000000000000000103 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		000000000000000000000313 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				000000000000000000000107 /* LaunchScreen.storyboard in Resources */,
+				000000000000000000000108 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		000000000000000000000323 /* Extension Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = ();
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		000000000000000000000304 /* Build PingCore Example */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build PingCore Example";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -eu\nPINGCORE_CMAKE_ARCHS=$(printf '%s' \"$ARCHS\" | tr ' ' ';')\ncmake -S \"$PINGCORE_PROJECT_ROOT\" -B \"$PINGCORE_CORE_BUILD_DIR\" \\\n  -DCMAKE_SYSTEM_NAME=iOS \\\n  -DCMAKE_OSX_SYSROOT=\"$SDKROOT\" \\\n  -DCMAKE_OSX_ARCHITECTURES=\"$PINGCORE_CMAKE_ARCHS\" \\\n  -DCMAKE_OSX_DEPLOYMENT_TARGET=\"$IPHONEOS_DEPLOYMENT_TARGET\" \\\n  -DCMAKE_BUILD_TYPE=\"$CONFIGURATION\" \\\n  -DPINGCORE_BUILD_SHARED=OFF \\\n  -DPINGCORE_BUILD_TESTS=OFF \\\n  -DPINGCORE_BUILD_EXAMPLES=ON \\\n  -DPINGCORE_BUILD_CLI=OFF\ncmake --build \"$PINGCORE_CORE_BUILD_DIR\" --target \"${PINGCORE_APP_TARGET}_pingcore_ios_core\" --parallel\n";
+		};
+		000000000000000000000305 /* Stage PingCore Resources */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Stage PingCore Resources";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -eu\nPINGCORE_RESOURCE_SOURCE=\"$PINGCORE_CORE_BUILD_DIR/pingcore-ios/$PINGCORE_APP_TARGET/resources/package\"\nPINGCORE_RESOURCE_DESTINATION=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/PingCore\"\nif [ ! -f \"$PINGCORE_RESOURCE_SOURCE/pingcore/resources.bin\" ]; then\n  echo \"error: PingCore resource package is missing: $PINGCORE_RESOURCE_SOURCE\" >&2\n  exit 1\nfi\ncmake -E remove_directory \"$PINGCORE_RESOURCE_DESTINATION\"\ncmake -E make_directory \"$PINGCORE_RESOURCE_DESTINATION\"\ncmake -E copy_directory \"$PINGCORE_RESOURCE_SOURCE\" \"$PINGCORE_RESOURCE_DESTINATION\"\n";
+		};
+		000000000000000000000314 /* Build PingCore Example */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build PingCore Example";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -eu\nPINGCORE_CMAKE_ARCHS=$(printf '%s' \"$ARCHS\" | tr ' ' ';')\ncmake -S \"$PINGCORE_PROJECT_ROOT\" -B \"$PINGCORE_CORE_BUILD_DIR\" \\\n  -DCMAKE_SYSTEM_NAME=iOS \\\n  -DCMAKE_OSX_SYSROOT=\"$SDKROOT\" \\\n  -DCMAKE_OSX_ARCHITECTURES=\"$PINGCORE_CMAKE_ARCHS\" \\\n  -DCMAKE_OSX_DEPLOYMENT_TARGET=\"$IPHONEOS_DEPLOYMENT_TARGET\" \\\n  -DCMAKE_BUILD_TYPE=\"$CONFIGURATION\" \\\n  -DPINGCORE_BUILD_SHARED=OFF \\\n  -DPINGCORE_BUILD_TESTS=OFF \\\n  -DPINGCORE_BUILD_EXAMPLES=ON \\\n  -DPINGCORE_BUILD_CLI=OFF\ncmake --build \"$PINGCORE_CORE_BUILD_DIR\" --target \"${PINGCORE_APP_TARGET}_pingcore_ios_core\" --parallel\n";
+		};
+		000000000000000000000315 /* Stage PingCore Resources */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Stage PingCore Resources";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -eu\nPINGCORE_RESOURCE_SOURCE=\"$PINGCORE_CORE_BUILD_DIR/pingcore-ios/$PINGCORE_APP_TARGET/resources/package\"\nPINGCORE_RESOURCE_DESTINATION=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/PingCore\"\nif [ ! -f \"$PINGCORE_RESOURCE_SOURCE/pingcore/resources.bin\" ]; then\n  echo \"error: PingCore resource package is missing: $PINGCORE_RESOURCE_SOURCE\" >&2\n  exit 1\nfi\ncmake -E remove_directory \"$PINGCORE_RESOURCE_DESTINATION\"\ncmake -E make_directory \"$PINGCORE_RESOURCE_DESTINATION\"\ncmake -E copy_directory \"$PINGCORE_RESOURCE_SOURCE\" \"$PINGCORE_RESOURCE_DESTINATION\"\n";
+		};
+		000000000000000000000324 /* Build PingCore SDK */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build PingCore SDK";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -eu\nPINGCORE_CMAKE_ARCHS=$(printf '%s' \"$ARCHS\" | tr ' ' ';')\ncmake -S \"$PINGCORE_PROJECT_ROOT\" -B \"$PINGCORE_CORE_BUILD_DIR\" \\\n  -DCMAKE_SYSTEM_NAME=iOS \\\n  -DCMAKE_OSX_SYSROOT=\"$SDKROOT\" \\\n  -DCMAKE_OSX_ARCHITECTURES=\"$PINGCORE_CMAKE_ARCHS\" \\\n  -DCMAKE_OSX_DEPLOYMENT_TARGET=\"$IPHONEOS_DEPLOYMENT_TARGET\" \\\n  -DCMAKE_BUILD_TYPE=\"$CONFIGURATION\" \\\n  -DPINGCORE_BUILD_STATIC=ON -DPINGCORE_BUILD_SHARED=OFF \\\n  -DPINGCORE_BUILD_TESTS=OFF \\\n  -DPINGCORE_BUILD_EXAMPLES=ON \\\n  -DPINGCORE_BUILD_CLI=OFF\ncmake --build \"$PINGCORE_CORE_BUILD_DIR\" --target pingcore_static --parallel\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		000000000000000000000301 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				000000000000000000000101 /* main.mm in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		000000000000000000000311 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				000000000000000000000106 /* main.mm in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		000000000000000000000321 /* Extension Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (000000000000000000000104, );
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		000000000000000000000801 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+			};
+			name = Debug;
+		};
+		000000000000000000000802 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+			};
+			name = Release;
+		};
+		000000000000000000000803 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 000000000000000000000205 /* Debug.xcconfig */;
+			buildSettings = {
+				INFOPLIST_FILE = "$(PINGCORE_APP_INFO_PLIST)";
+				PRODUCT_NAME = "$(inherited)";
+				SDKROOT = iphoneos;
+			};
+			name = Debug;
+		};
+		000000000000000000000804 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 000000000000000000000206 /* Release.xcconfig */;
+			buildSettings = {
+				INFOPLIST_FILE = "$(PINGCORE_APP_INFO_PLIST)";
+				PRODUCT_NAME = "$(inherited)";
+				SDKROOT = iphoneos;
+			};
+			name = Release;
+		};
+		000000000000000000000813 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 000000000000000000000205 /* Debug.xcconfig */;
+			buildSettings = {
+				INFOPLIST_FILE = App/Info.plist;
+				PRODUCT_NAME = "PingCore Notifications";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(PINGCORE_NOTIFICATION_BUNDLE_IDENTIFIER)";
+				PINGCORE_APP_TARGET = example_local_notification;
+				PINGCORE_CORE_BUILD_DIR = "$(PROJECT_TEMP_DIR)/notification-core/$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)";
+				SDKROOT = iphoneos;
+			};
+			name = Debug;
+		};
+		000000000000000000000823 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 000000000000000000000205 /* Debug.xcconfig */;
+			buildSettings = {
+				INFOPLIST_FILE = ../../../examples/local_notification/ios/Info.plist;
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				DEAD_CODE_STRIPPING = YES;
+				SKIP_INSTALL = YES;
+				ASSETCATALOG_COMPILER_APPICON_NAME = "";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(PINGCORE_NOTIFICATION_BUNDLE_IDENTIFIER).content";
+				PINGCORE_APP_TARGET = example_local_notification;
+				PINGCORE_CORE_BUILD_DIR = "$(PROJECT_TEMP_DIR)/notification-core/$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)";
+				OTHER_LDFLAGS = "@\"$(PINGCORE_CORE_BUILD_DIR)/pingcore-ios/notification-extension-link.rsp\"";
+				PRODUCT_NAME = DownloadNotification;
+				SDKROOT = iphoneos;
+			};
+			name = Debug;
+		};
+		000000000000000000000814 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 000000000000000000000206 /* Release.xcconfig */;
+			buildSettings = {
+				INFOPLIST_FILE = App/Info.plist;
+				PRODUCT_NAME = "PingCore Notifications";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(PINGCORE_NOTIFICATION_BUNDLE_IDENTIFIER)";
+				PINGCORE_APP_TARGET = example_local_notification;
+				PINGCORE_CORE_BUILD_DIR = "$(PROJECT_TEMP_DIR)/notification-core/$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)";
+				SDKROOT = iphoneos;
+			};
+			name = Release;
+		};
+		000000000000000000000824 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 000000000000000000000206 /* Release.xcconfig */;
+			buildSettings = {
+				INFOPLIST_FILE = ../../../examples/local_notification/ios/Info.plist;
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				DEAD_CODE_STRIPPING = YES;
+				SKIP_INSTALL = YES;
+				ASSETCATALOG_COMPILER_APPICON_NAME = "";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(PINGCORE_NOTIFICATION_BUNDLE_IDENTIFIER).content";
+				PINGCORE_APP_TARGET = example_local_notification;
+				PINGCORE_CORE_BUILD_DIR = "$(PROJECT_TEMP_DIR)/notification-core/$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)";
+				OTHER_LDFLAGS = "@\"$(PINGCORE_CORE_BUILD_DIR)/pingcore-ios/notification-extension-link.rsp\"";
+				PRODUCT_NAME = DownloadNotification;
+				SDKROOT = iphoneos;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		000000000000000000000701 /* Build configuration list for PBXProject "PingCoreExamples" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				000000000000000000000801 /* Debug */,
+				000000000000000000000802 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		000000000000000000000702 /* Build configuration list for PBXNativeTarget "PingCoreExamples" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				000000000000000000000803 /* Debug */,
+				000000000000000000000804 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		000000000000000000000703 /* Build configuration list for PingCoreNotifications */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (000000000000000000000813, 000000000000000000000814, );
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		000000000000000000000704 /* Build configuration list for DownloadNotification */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (000000000000000000000823, 000000000000000000000824, );
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin PBXContainerItemProxy section */
+		000000000000000000000901 /* DownloadNotification proxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 000000000000000000000600;
+			proxyType = 1;
+			remoteGlobalIDString = 000000000000000000000502;
+			remoteInfo = DownloadNotification;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXTargetDependency section */
+		000000000000000000000902 /* DownloadNotification dependency */ = {
+			isa = PBXTargetDependency;
+			target = 000000000000000000000502;
+			targetProxy = 000000000000000000000901;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		000000000000000000000316 /* Embed App Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (000000000000000000000105, );
+			name = "Embed App Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+	};
+	rootObject = 000000000000000000000600 /* Project object */;
+}

@@ -1,0 +1,2244 @@
+#include "runtime_test_support.h"
+#include "async_test_support.h"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <exception>
+#include <filesystem>
+#include <functional>
+#include <future>
+#include <mutex>
+#include <thread>
+#include <bit>
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <optional>
+#include <set>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "image_test_support.h"
+#include "font_test_support.h"
+#include "resources/resource_internal.h"
+#include "components/text_field_internal.h"
+#include "io/stream_internal.h"
+#include "macros_internal.h"
+
+namespace pingcore::test {
+
+namespace {
+
+struct IndexEntry {
+  detail::ResourceEntryKind kind;
+  std::string key;
+  std::string path;
+  std::string mime_type;
+  std::string locale;
+  std::string value;
+  float scale = 1.0F;
+  std::uint32_t width = 0;
+  std::uint32_t height = 0;
+  std::uint64_t content_hash = 0;
+  std::uint32_t argument_count = 0;
+  std::string domain = "test";
+};
+
+void AppendU32(std::vector<std::byte>& bytes, std::uint32_t value) {
+  for (unsigned shift = 0; shift < 32; shift += 8) {
+    bytes.push_back(static_cast<std::byte>((value >> shift) & 0xFFU));
+  }
+}
+
+void AppendU64(std::vector<std::byte>& bytes, std::uint64_t value) {
+  AppendU32(bytes, static_cast<std::uint32_t>(value));
+  AppendU32(bytes, static_cast<std::uint32_t>(value >> 32U));
+}
+
+void AppendString(std::vector<std::byte>& bytes, std::string_view value) {
+  AppendU32(bytes, static_cast<std::uint32_t>(value.size()));
+  for (char character : value) {
+    bytes.push_back(static_cast<std::byte>(character));
+  }
+}
+
+std::uint8_t WireKind(detail::ResourceEntryKind kind) {
+  switch (kind) {
+  case detail::ResourceEntryKind::Raw:
+    return 1;
+  case detail::ResourceEntryKind::Image:
+    return 2;
+  case detail::ResourceEntryKind::String:
+    return 3;
+  }
+  throw std::logic_error("test resource entry has an unknown kind");
+}
+
+RawAsset EncodeIndex(const std::vector<IndexEntry>& entries) {
+  std::vector<std::byte> bytes{
+      std::byte{'H'},
+      std::byte{'U'},
+      std::byte{'X'},
+      std::byte{'R'},
+      std::byte{'E'},
+      std::byte{'S'},
+      std::byte{0},
+      std::byte{0},
+  };
+  AppendU32(bytes, 1);
+  AppendU32(bytes, static_cast<std::uint32_t>(entries.size()));
+  for (const IndexEntry& entry : entries) {
+    bytes.push_back(static_cast<std::byte>(WireKind(entry.kind)));
+    AppendString(bytes, entry.domain);
+    AppendString(bytes, entry.key);
+    AppendString(bytes, entry.path);
+    AppendString(bytes, entry.mime_type);
+    AppendString(bytes, entry.locale);
+    AppendString(bytes, entry.value);
+    AppendU32(bytes, std::bit_cast<std::uint32_t>(entry.scale));
+    AppendU32(bytes, entry.width);
+    AppendU32(bytes, entry.height);
+    AppendU64(bytes, entry.content_hash);
+    AppendU32(bytes, entry.kind == detail::ResourceEntryKind::String ? entry.argument_count : 0);
+    const float intrinsic_width =
+        entry.kind == detail::ResourceEntryKind::Image ? static_cast<float>(entry.width) / entry.scale : 0.0F;
+    const float intrinsic_height =
+        entry.kind == detail::ResourceEntryKind::Image ? static_cast<float>(entry.height) / entry.scale : 0.0F;
+    AppendU32(bytes, std::bit_cast<std::uint32_t>(intrinsic_width));
+    AppendU32(bytes, std::bit_cast<std::uint32_t>(intrinsic_height));
+  }
+  return RawAsset::FromBytes(std::move(bytes));
+}
+
+RawAsset TestPng(std::uint32_t width, std::uint32_t height) {
+  return RawAsset::FromBytes(MakeTestPng(width, height), "image/png");
+}
+
+std::uint64_t Hash(std::span<const std::byte> bytes) {
+  std::uint64_t result = 14695981039346656037ULL;
+  for (std::byte byte : bytes) {
+    result ^= std::to_integer<std::uint8_t>(byte);
+    result *= 1099511628211ULL;
+  }
+  return result;
+}
+
+class TestResources final : public PlatformResources {
+public:
+  ResourceConfiguration Configuration() const override {
+    return configuration;
+  }
+
+  std::optional<InputStream> OpenRead(std::string_view package_path) override {
+    std::scoped_lock lock(mutex);
+    const std::string path(package_path);
+    ++read_counts[path];
+    if (open_payload && package_path != detail::resource_index_path) {
+      return open_payload();
+    }
+    const auto found = assets.find(path);
+    return found == assets.end() ? std::nullopt : std::optional<InputStream>(found->second.OpenRead());
+  }
+
+  ResourceConfiguration configuration{Locale::FromLanguageTag("zh-Hans-CN"), 1.5F};
+  std::unordered_map<std::string, RawAsset> assets;
+  std::unordered_map<std::string, std::size_t> read_counts;
+  std::function<InputStream()> open_payload;
+  std::mutex mutex;
+};
+
+class TestClipboard final : public PlatformClipboard {
+public:
+  std::optional<std::string> ReadText() override {
+    return text;
+  }
+
+  bool WriteText(std::string_view value) override {
+    text = std::string(value);
+    return true;
+  }
+
+  std::optional<std::string> text = "paste";
+};
+
+std::optional<MenuHandle> resource_menu;
+std::optional<ViewHandle> resource_menu_target;
+std::optional<DialogHandle> resource_dialog;
+int density_image_compositions = 0;
+int density_unrelated_compositions = 0;
+int virtual_density_compositions = 0;
+int direct_literal_resource_compositions = 0;
+int literal_text_field_compositions = 0;
+int literal_semantics_compositions = 0;
+int resource_semantics_compositions = 0;
+int literal_tooltip_compositions = 0;
+int resource_tooltip_compositions = 0;
+State<bool> missing_text_field_placeholder;
+ImageAsset direct_image_asset;
+State<bool> alternate_nested_shaping_locale;
+int inherited_shaping_compositions = 0;
+int explicit_shaping_compositions = 0;
+int resource_explicit_shaping_compositions = 0;
+int nested_inherited_shaping_compositions = 0;
+int nested_explicit_shaping_compositions = 0;
+int shaping_unrelated_compositions = 0;
+int text_measurer_shaping_compositions = 0;
+
+class ShapingRecordingPlatform final : public TestPlatform {
+public:
+  struct Measurement {
+    std::string text;
+    TextLayoutOptions options;
+  };
+
+  TextLayoutMetrics MeasureText(const pingcore::AttributedText& text, const TextStyle& style, float max_width,
+      const TextLayoutOptions& options) override {
+    measurements.push_back({text.PlainText(), options});
+    return TestPlatform::MeasureText(text, style, max_width, options);
+  }
+
+  std::vector<Measurement> measurements;
+};
+
+View InheritedShapingContent() {
+  ++inherited_shaping_compositions;
+  return Column {
+    Text("root inherited"),
+    Text(StringResource("test", "strings/shaped")),
+    Button("button inherited"),
+    Chip("chip inherited"),
+    RadioButton("radio inherited", false),
+    Switch("switch inherited", false),
+    Canvas([](PaintContext& paint, Size) {
+      const TextStyle style = TextStyle::Default();
+      paint.DrawText({0.0F, 0.0F, 120.0F, 20.0F}, "canvas paragraph", style);
+      paint.DrawTextRun({0.0F, 20.0F, 70.0F, 20.0F}, {0.0F, 35.0F}, "canvas run", style);
+      paint.DrawTextRuns({
+          TextRun{{0.0F, 40.0F, 80.0F, 20.0F}, {0.0F, 55.0F}, "canvas batch", style, {}},
+          TextRun{
+              {0.0F, 60.0F, 90.0F, 20.0F},
+              {0.0F, 75.0F},
+              "canvas explicit",
+              style,
+              {.locale = "ko-KR"},
+          },
+      });
+    }).With(pingcore::Frame{120.0F, 80.0F}),
+  };
+}
+
+View ExplicitShapingContent() {
+  ++explicit_shaping_compositions;
+  return Text("root explicit").Shaping({.direction = TextDirection::RightToLeft, .locale = "fa-IR"});
+}
+
+View ResourceExplicitShapingContent() {
+  ++resource_explicit_shaping_compositions;
+  return Text(StringResource("test", "strings/explicit_shaped")).Shaping({.locale = "fa-IR"});
+}
+
+View NestedInheritedShapingContent() {
+  ++nested_inherited_shaping_compositions;
+  auto alternate_nested = UseState(false);
+  alternate_nested_shaping_locale = alternate_nested;
+  const Locale locale = Locale::FromLanguageTag(alternate_nested.Get() ? "de-DE" : "ar-EG");
+  return ProvideEnvironment(locale, Text("nested inherited"));
+}
+
+View NestedExplicitShapingContent() {
+  ++nested_explicit_shaping_compositions;
+  return Text("nested explicit").Shaping({.locale = "ja-JP"});
+}
+
+View ShapingUnrelatedContent() {
+  ++shaping_unrelated_compositions;
+  return Spacer();
+}
+
+View ExplicitTextMeasurerContent() {
+  ++text_measurer_shaping_compositions;
+  UseTextMeasurer().MeasureText("explicit measurer", TextStyle::Default());
+  return Spacer();
+}
+
+View InheritedTextShapingApp() {
+  return Column {
+    Scope(InheritedShapingContent),
+    Scope(ExplicitShapingContent),
+    Scope(ResourceExplicitShapingContent),
+    Scope(NestedInheritedShapingContent),
+    ProvideEnvironment(Locale::FromLanguageTag("ar-EG"), Scope(NestedExplicitShapingContent)),
+    Scope(ShapingUnrelatedContent),
+    Scope(ExplicitTextMeasurerContent),
+  };
+}
+
+View ResourceMenuApp() {
+  auto menu = UseMenu();
+  resource_menu = menu;
+  resource_menu_target = UseViewHandle();
+  return Button("resource menu").With(pingcore::Frame{120.0F, 36.0F}, *resource_menu_target);
+}
+
+View FrameworkDialogResourceApp() {
+  resource_dialog = UseDialog();
+  return Spacer();
+}
+
+View FrameworkValidationResourceApp() {
+  return TextField(TextEditingValue::FromText(""))
+      .Validation(Validate("", Required()))
+      .With(pingcore::Frame{220.0F, 80.0F});
+}
+
+View FrameworkSelectionResourceApp() {
+  return TextField(TextEditingValue::FromText("alpha beta")).With(pingcore::Frame{180.0F, 40.0F});
+}
+
+View PartialSelectionLabelsResourceApp() {
+  return ProvideEnvironment(
+      TextSelectionMenuLabels{.copy = "Duplicate"},
+      TextField(TextEditingValue::FromText("alpha beta")).With(pingcore::Frame{180.0F, 40.0F})
+  );
+}
+
+View LocalizedResourceApp() {
+  const StringVariant greeting = StringVariant::Format(StringResource("test", "strings/greeting"), "Ada");
+  return Text(UseString(greeting));
+}
+
+View DirectLocalizedResourceApp() {
+  return Column {
+    Text(StringResource("test", "strings/title"), TextRole::Title),
+    Button(StringResource("test", "strings/action")),
+    TextField(TextEditingValue::FromText("")).Placeholder(StringResource("test", "strings/placeholder")),
+  };
+}
+
+View TextFieldResourceFailureApp() {
+  auto missing = UseState(false);
+  missing_text_field_placeholder = missing;
+  const StringResource placeholder("test", missing.Get() ? "strings/missing_placeholder" : "strings/placeholder");
+  return TextField(TextEditingValue::FromText("")).Placeholder(placeholder);
+}
+
+View LocalizedWindowControlsApp() {
+  return Spacer();
+}
+
+View MissingResourceArgumentsApp() {
+  return Text(UseString(StringResource("test", "strings/greeting")));
+}
+
+View ExtraResourceArgumentsApp() {
+  return Text(UseString(StringResource("test", "strings/greeting"), "Ada", "extra"));
+}
+
+View DensityImageResourceContent() {
+  ++density_image_compositions;
+  return Image(ImageResource("test", "images/density"));
+}
+
+View DensityUnrelatedResourceContent() {
+  ++density_unrelated_compositions;
+  return Text("unrelated").Shaping({.locale = "en-US"});
+}
+
+View ResourceConfigurationDependencyApp() {
+  return Column {
+    Scope(DensityImageResourceContent),
+    Scope(DensityUnrelatedResourceContent),
+  };
+}
+
+View DirectLiteralResourceHelperApp() {
+  ++direct_literal_resource_compositions;
+  const detail::ResolvedImageAsset resolved = detail::UseImageVariant(ImageVariant{direct_image_asset});
+  REQUIRE(std::get<ImageAsset>(resolved) == direct_image_asset);
+  return Text(UseString(StringVariant{"literal"})).Shaping({.locale = "en-US"});
+}
+
+View VirtualDensityResourceContent() {
+  ++virtual_density_compositions;
+  return VirtualList(std::size_t{1}, [](std::size_t) {
+    return Image(ImageResource("test", "images/density")).With(pingcore::Frame{20.0F, 10.0F});
+  }).ItemExtent(10.0F);
+}
+
+View VirtualResourceConfigurationDependencyApp() {
+  return Column {
+    Scope(VirtualDensityResourceContent),
+    Scope(DensityUnrelatedResourceContent),
+  };
+}
+
+View LiteralTextFieldResourceContent() {
+  ++literal_text_field_compositions;
+  return TextField(TextEditingValue::FromText("literal")).Placeholder("placeholder");
+}
+
+View LiteralTextFieldResourceDependencyApp() {
+  return Scope(LiteralTextFieldResourceContent);
+}
+
+View LiteralSemanticsResourceContent() {
+  ++literal_semantics_compositions;
+  return Text("semantic").Shaping({.locale = "en-US"}).With(Semantics{.label = "literal"});
+}
+
+View LiteralSemanticsResourceDependencyApp() {
+  return Scope(LiteralSemanticsResourceContent);
+}
+
+View ResourceSemanticsContent() {
+  ++resource_semantics_compositions;
+  return Text("semantic").With(Semantics{.label = StringResource("test", "strings/semantic_label")});
+}
+
+View ResourceSemanticsDependencyApp() {
+  return Scope(ResourceSemanticsContent);
+}
+
+View LiteralTooltipContent() {
+  ++literal_tooltip_compositions;
+  return Text("tooltip target").Shaping({.locale = "en-US"}).With(Tooltip("literal hint"));
+}
+
+View LiteralTooltipDependencyApp() {
+  return Scope(LiteralTooltipContent);
+}
+
+View ResourceTooltipContent() {
+  ++resource_tooltip_compositions;
+  return Text("tooltip target").With(Tooltip(StringResource("test", "strings/tooltip_hint")));
+}
+
+View ResourceTooltipDependencyApp() {
+  return Scope(ResourceTooltipContent);
+}
+
+} // namespace
+
+TEST_CASE("BuiltinStringCatalogsContainEveryDefaultKeyWithoutFallback") {
+  auto index = BuiltinTestResources()->OpenRead(detail::resource_index_path);
+  REQUIRE(index.has_value());
+  const auto entries = detail::ParseResourceIndex(RawAsset::FromBytes(detail::ReadStreamBytes(std::move(*index))));
+  std::map<std::string, std::set<std::string>> catalogs;
+  for (const auto& entry : entries) {
+    if (entry.kind != detail::ResourceEntryKind::String || entry.id.Domain() != "pingcore") {
+      continue;
+    }
+    CAPTURE(entry.locale, entry.id.Key());
+    REQUIRE(entry.value.find_first_not_of(" \t\r\n") != std::string::npos);
+    REQUIRE(catalogs[entry.locale].emplace(entry.id.Key()).second);
+  }
+  REQUIRE(catalogs.contains(""));
+  REQUIRE(catalogs.size() > 1);
+  const auto& default_keys = catalogs.at("");
+  REQUIRE_FALSE(default_keys.empty());
+  for (const auto& [locale, keys] : catalogs) {
+    CAPTURE(locale);
+    REQUIRE(keys == default_keys);
+  }
+}
+
+TEST_CASE("AppResourcesResolveLocaleScaleAndRawPayloads") {
+  TestResources resources;
+  const RawAsset config = RawAsset::CopyBytes(std::as_bytes(std::span("enabled", std::size("enabled") - 1)));
+  const RawAsset logo = TestPng(20, 10);
+  const RawAsset logo_2x = TestPng(40, 20);
+  resources.assets.emplace(
+      detail::resource_index_path,
+      EncodeIndex({
+          {detail::ResourceEntryKind::Raw,
+           "raw/config.txt",
+           "pingcore/test/raw/config.txt",
+           "text/plain",
+           {},
+           {},
+           1.0F,
+           0,
+           0,
+           Hash(config.ReadBytes())},
+          {detail::ResourceEntryKind::Image,
+           "images/logo",
+           "pingcore/test/images/logo.png",
+           "image/png",
+           {},
+           {},
+           1.0F,
+           20,
+           10,
+           Hash(logo.ReadBytes())},
+          {detail::ResourceEntryKind::Image,
+           "images/logo",
+           "pingcore/test/images/logo@2x.png",
+           "image/png",
+           {},
+           {},
+           2.0F,
+           40,
+           20,
+           Hash(logo_2x.ReadBytes())},
+      }));
+  resources.assets.emplace("pingcore/test/raw/config.txt", config);
+  resources.assets.emplace("pingcore/test/images/logo.png", logo);
+  resources.assets.emplace("pingcore/test/images/logo@2x.png", logo_2x);
+
+  auto service_owner = std::make_shared<detail::AppResources>(&resources);
+  auto& service = *service_owner;
+  const RawAsset resolved_config = service.Resolve(RawResource("test", "raw/config.txt"));
+  REQUIRE(resolved_config.ReadBytes().size() == 7);
+  REQUIRE(resolved_config.MimeType() == "text/plain");
+  const ImageAsset image = service.Resolve(ImageResource("test", "images/logo"), Locale::Default());
+  REQUIRE(image.Scale() == 2.0F);
+  REQUIRE(image.IntrinsicSize() == Size{20.0F, 10.0F});
+}
+
+TEST_CASE("AppResourcesResolveShuffledResourceIdentities") {
+  TestResources resources;
+  const RawAsset raw = RawAsset::FromBytes({std::byte{42}});
+  const RawAsset image = TestPng(20, 10);
+  std::vector<IndexEntry> entries{
+      {.kind = detail::ResourceEntryKind::String, .key = "shared/value", .value = "Other", .domain = "other"},
+      {.kind = detail::ResourceEntryKind::Image, .key = "shared/value", .path = "pingcore/test/value.png",
+       .mime_type = "image/png", .width = 20, .height = 10, .content_hash = Hash(image.ReadBytes())},
+      {.kind = detail::ResourceEntryKind::String, .key = "shared/value", .locale = "fr", .value = "French {0}",
+       .argument_count = 1},
+      {.kind = detail::ResourceEntryKind::Raw, .key = "shared/value", .path = "pingcore/test/value.bin",
+       .content_hash = Hash(raw.ReadBytes())},
+      {.kind = detail::ResourceEntryKind::String, .key = "shared/value/child", .value = "Child"},
+      {.kind = detail::ResourceEntryKind::String, .key = "shared/value", .value = "Default {0}", .argument_count = 1},
+  };
+  for (int index = 127; index >= 0; --index) {
+    entries.push_back({.kind = detail::ResourceEntryKind::String, .key = "noise/" + std::to_string(index),
+                      .value = std::to_string(index)});
+  }
+  std::ranges::rotate(entries, entries.begin() + GENERATE(0, 3, 37));
+  resources.assets.emplace(detail::resource_index_path, EncodeIndex(entries));
+  resources.assets.emplace("pingcore/test/value.bin", raw);
+  resources.assets.emplace("pingcore/test/value.png", image);
+
+  auto service_owner = std::make_shared<detail::AppResources>(&resources);
+  auto& service = *service_owner;
+  const Locale locale = Locale::FromLanguageTag("fr-CA");
+  const StringResource text("test", "shared/value");
+  REQUIRE(service.Resolve(text, locale).value == "French {0}");
+  REQUIRE(service.Resolve(text, locale).argument_count == 1);
+  REQUIRE(service.Resolve(text, Locale::FromLanguageTag("ja-JP")).value == "Default {0}");
+  REQUIRE(service.Resolve(StringResource("other", "shared/value"), locale).value == "Other");
+  REQUIRE(service.Resolve(StringResource("test", "shared/value/child"), locale).value == "Child");
+  REQUIRE(service.Resolve(StringResource("test", "noise/0"), locale).value == "0");
+  REQUIRE(service.Resolve(StringResource("test", "noise/127"), locale).value == "127");
+  REQUIRE(service.Resolve(RawResource("test", "shared/value")).ReadBytes().front() == std::byte{42});
+  REQUIRE(service.Resolve(ImageResource("test", "shared/value"), locale).IntrinsicSize() == Size{20.0F, 10.0F});
+  REQUIRE_THROWS_AS(service.Resolve(RawResource("other", "shared/value")), std::logic_error);
+  REQUIRE_THROWS_AS(service.Resolve(ImageResource("other", "shared/value"), locale), std::logic_error);
+  for (const char* key : {"aaa", "shared/absent", "zzz"}) {
+    REQUIRE_THROWS_AS(service.Resolve(StringResource("test", key), locale), std::logic_error);
+  }
+
+  auto empty_owner = std::make_shared<detail::AppResources>(nullptr);
+  auto& empty = *empty_owner;
+  REQUIRE_THROWS_AS(empty.Resolve(RawResource("test", "shared/value")), std::logic_error);
+  REQUIRE_THROWS_AS(empty.Resolve(ImageResource("test", "shared/value"), locale), std::logic_error);
+  REQUIRE_THROWS_AS(empty.Resolve(text, locale), std::logic_error);
+}
+
+TEST_CASE("AppResourcesSelectLocaleBeforeDensityAndReuseAssets") {
+  TestResources resources;
+  std::vector<IndexEntry> entries;
+  const auto add_image = [&](std::string locale, float scale) {
+    const auto width = static_cast<std::uint32_t>(20.0F * scale);
+    const auto height = static_cast<std::uint32_t>(10.0F * scale);
+    const RawAsset image = TestPng(width, height);
+    const std::string path = "pingcore/test/" + locale + std::to_string(scale) + ".png";
+    entries.push_back({.kind = detail::ResourceEntryKind::Image, .key = "images/logo", .path = path,
+                      .mime_type = "image/png", .locale = std::move(locale), .scale = scale, .width = width,
+                      .height = height, .content_hash = Hash(image.ReadBytes())});
+    resources.assets.emplace(path, image);
+  };
+  add_image("zh-TW", 3.0F);
+  add_image("", 4.0F);
+  add_image("zh", 3.0F);
+  add_image("zh-Hant", 2.0F);
+  add_image("", 1.0F);
+  add_image("zh-TW", 1.0F);
+  add_image("", 2.0F);
+  resources.assets.emplace(detail::resource_index_path, EncodeIndex(entries));
+
+  auto service_owner = std::make_shared<detail::AppResources>(&resources);
+  auto& service = *service_owner;
+  const ImageResource logo("test", "images/logo");
+  const Locale locale = Locale::FromLanguageTag("zh-Hant-TW");
+  const ImageAsset original = service.Resolve(logo, locale);
+  REQUIRE(original.Scale() == 3.0F);
+  REQUIRE(service.Resolve(logo, locale) == original);
+  for (const auto& [scale, expected] :
+       {std::pair{0.5F, 1.0F}, {1.0F, 1.0F}, {1.5F, 3.0F}, {3.0F, 3.0F}, {5.0F, 3.0F}}) {
+    CAPTURE(scale);
+    resources.configuration.display_scale = scale;
+    service.UpdateConfiguration(resources.configuration);
+    const ImageAsset selected = service.Resolve(logo, locale);
+    REQUIRE(selected.Scale() == expected);
+    REQUIRE(selected.IntrinsicSize() == Size{20.0F, 10.0F});
+  }
+  resources.configuration = {Locale::FromLanguageTag("fr-FR"), 1.5F};
+  service.UpdateConfiguration(resources.configuration);
+  REQUIRE(service.Resolve(logo, resources.configuration.locale).Scale() == 2.0F);
+  REQUIRE(service.Resolve(logo, Locale::FromLanguageTag("zh-Hant")).Scale() == 2.0F);
+  REQUIRE(service.Resolve(logo, Locale::FromLanguageTag("zh-MO")).Scale() == 3.0F);
+  REQUIRE(service.Resolve(logo, locale) == original);
+  for (const auto& [path, reads] : resources.read_counts) {
+    CAPTURE(path);
+    REQUIRE(reads == 1);
+  }
+}
+
+TEST_CASE("ImageResourceScopesObserveDisplayScalePrecisely") {
+  density_image_compositions = 0;
+  density_unrelated_compositions = 0;
+  TestResources resources;
+  const RawAsset image = TestPng(20, 10);
+  const RawAsset image_2x = TestPng(40, 20);
+  resources.assets.emplace(
+      detail::resource_index_path,
+      EncodeIndex({
+          {detail::ResourceEntryKind::Image,
+           "images/density",
+           "pingcore/test/images/density.png",
+           "image/png",
+           {},
+           {},
+           1.0F,
+           20,
+           10,
+           Hash(image.ReadBytes())},
+          {detail::ResourceEntryKind::Image,
+           "images/density",
+           "pingcore/test/images/density@2x.png",
+           "image/png",
+           {},
+           {},
+           2.0F,
+           40,
+           20,
+           Hash(image_2x.ReadBytes())},
+      }));
+  resources.assets.emplace("pingcore/test/images/density.png", image);
+  resources.assets.emplace("pingcore/test/images/density@2x.png", image_2x);
+  TestPlatform platform;
+  platform.platform_resources = &resources;
+  UiWindow runtime{ResourceConfigurationDependencyApp, platform};
+  runtime.SetWindowMetrics({.viewport = {200.0F, 80.0F}});
+
+  runtime.BuildFrame();
+  const auto* root = runtime.RootNode();
+  REQUIRE(root != nullptr);
+  REQUIRE(std::get<ImageAsset>(root->children[0]->children[0]->image_properties.source).Scale() == 2.0F);
+  REQUIRE(density_image_compositions == 1);
+  REQUIRE(density_unrelated_compositions == 1);
+
+  resources.configuration.display_scale = 1.0F;
+  runtime.UpdateResourceConfiguration(resources.configuration);
+  runtime.BuildFrame();
+  root = runtime.RootNode();
+  REQUIRE(std::get<ImageAsset>(root->children[0]->children[0]->image_properties.source).Scale() == 1.0F);
+  REQUIRE(density_image_compositions == 2);
+  REQUIRE(density_unrelated_compositions == 1);
+
+  resources.configuration.locale = Locale::FromLanguageTag("en-US");
+  runtime.UpdateResourceConfiguration(resources.configuration);
+  runtime.BuildFrame();
+  REQUIRE(density_image_compositions == 3);
+  REQUIRE(density_unrelated_compositions == 1);
+
+  runtime.UpdateResourceConfiguration(resources.configuration);
+  runtime.BuildFrame();
+  REQUIRE(density_image_compositions == 3);
+  REQUIRE(density_unrelated_compositions == 1);
+}
+
+TEST_CASE("DirectLiteralResourceHelpersDoNotObserveResourceConfiguration") {
+  direct_literal_resource_compositions = 0;
+  TestResources resources;
+  resources.assets.emplace(detail::resource_index_path, EncodeIndex({}));
+  TestPlatform platform;
+  platform.platform_resources = &resources;
+  direct_image_asset = ImageAsset::FromEncoded(MakeTestPng(20, 10));
+  UiWindow runtime{DirectLiteralResourceHelperApp, platform};
+  runtime.SetWindowMetrics({.viewport = {200.0F, 80.0F}});
+
+  REQUIRE(FirstText(runtime.BuildFrame()) == "literal");
+  REQUIRE(direct_literal_resource_compositions == 1);
+
+  resources.configuration = {Locale::FromLanguageTag("fr-FR"), 2.0F};
+  runtime.UpdateResourceConfiguration(resources.configuration);
+  runtime.BuildFrame();
+  REQUIRE(direct_literal_resource_compositions == 1);
+}
+
+TEST_CASE("MountedTextAndCanvasInheritLocaleWithoutSubscribingExplicitShaping") {
+  inherited_shaping_compositions = 0;
+  explicit_shaping_compositions = 0;
+  resource_explicit_shaping_compositions = 0;
+  nested_inherited_shaping_compositions = 0;
+  nested_explicit_shaping_compositions = 0;
+  shaping_unrelated_compositions = 0;
+  text_measurer_shaping_compositions = 0;
+  TestResources resources;
+  resources.assets.emplace(
+      detail::resource_index_path,
+      EncodeIndex({
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/shaped",
+              .mime_type = "text/plain",
+              .value = "resource default",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/shaped",
+              .mime_type = "text/plain",
+              .locale = "zh",
+              .value = "resource inherited",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/explicit_shaped",
+              .mime_type = "text/plain",
+              .value = "explicit resource default",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/explicit_shaped",
+              .mime_type = "text/plain",
+              .locale = "zh",
+              .value = "explicit resource localized",
+          },
+      })
+  );
+  ShapingRecordingPlatform platform;
+  platform.platform_resources = &resources;
+  UiWindow runtime{InheritedTextShapingApp, platform};
+  runtime.SetWindowMetrics({.viewport = {400.0F, 700.0F}});
+
+  const auto find_paragraph = [](const FlattenedScene& scene, std::string_view text) {
+    for (const PaintCommand& command : scene.Commands()) {
+      if (const auto* paragraph = std::get_if<DrawTextCommand>(&command);
+          paragraph != nullptr && paragraph->text.PlainText() == text) {
+        return paragraph;
+      }
+    }
+    return static_cast<const DrawTextCommand*>(nullptr);
+  };
+  const auto find_run = [](const FlattenedScene& scene, std::string_view text) {
+    for (const PaintCommand& command : scene.Commands()) {
+      if (const auto* batch = std::get_if<DrawTextRunsCommand>(&command)) {
+        const auto found = std::ranges::find(batch->runs, text, &TextRun::text);
+        if (found != batch->runs.end()) {
+          return &*found;
+        }
+      }
+    }
+    return static_cast<const TextRun*>(nullptr);
+  };
+  const auto last_measurement = [&platform](std::string_view text) {
+    const auto found = std::find_if(
+        platform.measurements.rbegin(),
+        platform.measurements.rend(),
+        [text](const ShapingRecordingPlatform::Measurement& measurement) {
+          return measurement.text == text;
+        }
+    );
+    return found == platform.measurements.rend() ? nullptr : &*found;
+  };
+  const auto require_measurement_matches = [&last_measurement](
+                                               std::string_view text,
+                                               const DrawTextCommand& command
+                                           ) {
+    const ShapingRecordingPlatform::Measurement* measurement = last_measurement(text);
+    REQUIRE(measurement != nullptr);
+    REQUIRE(measurement->options == command.options);
+  };
+
+  const FlattenedScene& initial = runtime.BuildFrame();
+  const DrawTextCommand* root_text = find_paragraph(initial, "root inherited");
+  const DrawTextCommand* resource_text = find_paragraph(initial, "resource inherited");
+  const DrawTextCommand* root_button = find_paragraph(initial, "button inherited");
+  const DrawTextCommand* root_chip = find_paragraph(initial, "chip inherited");
+  const DrawTextCommand* root_radio = find_paragraph(initial, "radio inherited");
+  const DrawTextCommand* root_switch = find_paragraph(initial, "switch inherited");
+  const DrawTextCommand* explicit_text = find_paragraph(initial, "root explicit");
+  const DrawTextCommand* explicit_resource_text = find_paragraph(initial, "explicit resource localized");
+  const DrawTextCommand* nested_text = find_paragraph(initial, "nested inherited");
+  const DrawTextCommand* nested_explicit = find_paragraph(initial, "nested explicit");
+  REQUIRE(root_text != nullptr);
+  REQUIRE(resource_text != nullptr);
+  REQUIRE(root_button != nullptr);
+  REQUIRE(root_chip != nullptr);
+  REQUIRE(root_radio != nullptr);
+  REQUIRE(root_switch != nullptr);
+  REQUIRE(explicit_text != nullptr);
+  REQUIRE(explicit_resource_text != nullptr);
+  REQUIRE(nested_text != nullptr);
+  REQUIRE(nested_explicit != nullptr);
+  const DrawTextCommand* canvas_paragraph = find_paragraph(initial, "canvas paragraph");
+  const TextRun* canvas_run = find_run(initial, "canvas run");
+  const TextRun* canvas_batch = find_run(initial, "canvas batch");
+  const TextRun* canvas_explicit = find_run(initial, "canvas explicit");
+  const ShapingRecordingPlatform::Measurement* root_measurement = last_measurement("root inherited");
+  const ShapingRecordingPlatform::Measurement* measurer_measurement = last_measurement("explicit measurer");
+  REQUIRE(canvas_paragraph != nullptr);
+  REQUIRE(canvas_run != nullptr);
+  REQUIRE(canvas_batch != nullptr);
+  REQUIRE(canvas_explicit != nullptr);
+  REQUIRE(root_measurement != nullptr);
+  REQUIRE(measurer_measurement != nullptr);
+  REQUIRE(root_text->options.shaping.locale == "zh-Hans-CN");
+  REQUIRE(resource_text->options.shaping.locale == "zh-Hans-CN");
+  REQUIRE(root_button->options.shaping.locale == "zh-Hans-CN");
+  REQUIRE(root_chip->options.shaping.locale == "zh-Hans-CN");
+  REQUIRE(root_radio->options.shaping.locale == "zh-Hans-CN");
+  REQUIRE(root_switch->options.shaping.locale == "zh-Hans-CN");
+  const TextShapingOptions explicit_options{.direction = TextDirection::RightToLeft, .locale = "fa-IR"};
+  REQUIRE(explicit_text->options.shaping == explicit_options);
+  REQUIRE(explicit_resource_text->options.shaping.locale == "fa-IR");
+  REQUIRE(nested_text->options.shaping.locale == "ar-EG");
+  REQUIRE(nested_explicit->options.shaping.locale == "ja-JP");
+  REQUIRE(canvas_paragraph->options.shaping.locale == "zh-Hans-CN");
+  REQUIRE(canvas_run->shaping.locale == "zh-Hans-CN");
+  REQUIRE(canvas_batch->shaping.locale == "zh-Hans-CN");
+  REQUIRE(canvas_explicit->shaping.locale == "ko-KR");
+  REQUIRE(root_measurement->options == root_text->options);
+  require_measurement_matches("button inherited", *root_button);
+  require_measurement_matches("chip inherited", *root_chip);
+  require_measurement_matches("radio inherited", *root_radio);
+  require_measurement_matches("switch inherited", *root_switch);
+  REQUIRE(measurer_measurement->options.shaping.locale.empty());
+  REQUIRE(inherited_shaping_compositions == 1);
+  REQUIRE(explicit_shaping_compositions == 1);
+  REQUIRE(resource_explicit_shaping_compositions == 1);
+  REQUIRE(nested_inherited_shaping_compositions == 1);
+  REQUIRE(nested_explicit_shaping_compositions == 1);
+  REQUIRE(shaping_unrelated_compositions == 1);
+  REQUIRE(text_measurer_shaping_compositions == 1);
+
+  resources.configuration.locale = Locale::FromLanguageTag("fr-FR");
+  runtime.UpdateResourceConfiguration(resources.configuration);
+  const FlattenedScene& root_updated = runtime.BuildFrame();
+  root_text = find_paragraph(root_updated, "root inherited");
+  resource_text = find_paragraph(root_updated, "resource default");
+  canvas_paragraph = find_paragraph(root_updated, "canvas paragraph");
+  explicit_text = find_paragraph(root_updated, "root explicit");
+  explicit_resource_text = find_paragraph(root_updated, "explicit resource default");
+  nested_text = find_paragraph(root_updated, "nested inherited");
+  REQUIRE(root_text != nullptr);
+  REQUIRE(resource_text != nullptr);
+  REQUIRE(canvas_paragraph != nullptr);
+  REQUIRE(explicit_text != nullptr);
+  REQUIRE(explicit_resource_text != nullptr);
+  REQUIRE(nested_text != nullptr);
+  REQUIRE(root_text->options.shaping.locale == "fr-FR");
+  REQUIRE(resource_text->options.shaping.locale == "fr-FR");
+  REQUIRE(canvas_paragraph->options.shaping.locale == "fr-FR");
+  REQUIRE(explicit_text->options.shaping.locale == "fa-IR");
+  REQUIRE(explicit_resource_text->options.shaping.locale == "fa-IR");
+  REQUIRE(nested_text->options.shaping.locale == "ar-EG");
+  REQUIRE(inherited_shaping_compositions == 2);
+  REQUIRE(explicit_shaping_compositions == 1);
+  REQUIRE(resource_explicit_shaping_compositions == 2);
+  REQUIRE(nested_inherited_shaping_compositions == 1);
+  REQUIRE(nested_explicit_shaping_compositions == 1);
+  REQUIRE(shaping_unrelated_compositions == 1);
+  REQUIRE(text_measurer_shaping_compositions == 1);
+
+  alternate_nested_shaping_locale = true;
+  const FlattenedScene& nested_updated = runtime.BuildFrame();
+  nested_text = find_paragraph(nested_updated, "nested inherited");
+  nested_explicit = find_paragraph(nested_updated, "nested explicit");
+  REQUIRE(nested_text != nullptr);
+  REQUIRE(nested_explicit != nullptr);
+  REQUIRE(nested_text->options.shaping.locale == "de-DE");
+  REQUIRE(nested_explicit->options.shaping.locale == "ja-JP");
+  REQUIRE(inherited_shaping_compositions == 2);
+  REQUIRE(explicit_shaping_compositions == 1);
+  REQUIRE(resource_explicit_shaping_compositions == 2);
+  REQUIRE(nested_inherited_shaping_compositions == 2);
+  REQUIRE(nested_explicit_shaping_compositions == 1);
+  REQUIRE(shaping_unrelated_compositions == 1);
+  REQUIRE(text_measurer_shaping_compositions == 1);
+}
+
+TEST_CASE("LiteralTextFieldsDoNotObserveResourceConfiguration") {
+  literal_text_field_compositions = 0;
+  TestResources resources;
+  resources.assets.emplace(detail::resource_index_path, EncodeIndex({}));
+  TestPlatform platform;
+  platform.platform_resources = &resources;
+  UiWindow runtime{LiteralTextFieldResourceDependencyApp, platform};
+  runtime.SetWindowMetrics({.viewport = {240.0F, 80.0F}});
+
+  runtime.BuildFrame();
+  REQUIRE(literal_text_field_compositions == 1);
+
+  resources.configuration.display_scale = 2.0F;
+  runtime.UpdateResourceConfiguration(resources.configuration);
+  runtime.BuildFrame();
+  REQUIRE(literal_text_field_compositions == 1);
+}
+
+TEST_CASE("LiteralSemanticsDoNotObserveResourceConfiguration") {
+  literal_semantics_compositions = 0;
+  TestResources resources;
+  resources.assets.emplace(detail::resource_index_path, EncodeIndex({}));
+  TestPlatform platform;
+  platform.platform_resources = &resources;
+  UiWindow runtime{LiteralSemanticsResourceDependencyApp, platform};
+  runtime.SetWindowMetrics({.viewport = {240.0F, 80.0F}});
+
+  runtime.BuildFrame();
+  REQUIRE(literal_semantics_compositions == 1);
+
+  resources.configuration.locale = Locale::FromLanguageTag("fr-FR");
+  runtime.UpdateResourceConfiguration(resources.configuration);
+  runtime.BuildFrame();
+  REQUIRE(literal_semantics_compositions == 1);
+}
+
+TEST_CASE("ResourceSemanticsObserveLocalePrecisely") {
+  resource_semantics_compositions = 0;
+  TestResources resources;
+  resources.assets.emplace(
+      detail::resource_index_path,
+      EncodeIndex({
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/semantic_label",
+              .mime_type = "text/plain",
+              .value = "English label",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/semantic_label",
+              .mime_type = "text/plain",
+              .locale = "zh",
+              .value = "Chinese label",
+          },
+      })
+  );
+  TestPlatform platform;
+  platform.platform_resources = &resources;
+  UiWindow runtime{ResourceSemanticsDependencyApp, platform};
+  runtime.SetWindowMetrics({.viewport = {240.0F, 80.0F}});
+
+  const auto contains_label = [](const FrameCommit& frame, std::string_view label) {
+    return frame.semantic_frame != nullptr &&
+           std::ranges::any_of(frame.semantic_frame->nodes, [label](const SemanticNode& node) {
+             return node.label == label;
+           });
+  };
+  REQUIRE(contains_label(runtime.BuildCommit(), "Chinese label"));
+  REQUIRE(resource_semantics_compositions == 1);
+
+  resources.configuration.locale = Locale::FromLanguageTag("en-US");
+  runtime.UpdateResourceConfiguration(resources.configuration);
+  REQUIRE(contains_label(runtime.BuildCommit(), "English label"));
+  REQUIRE(resource_semantics_compositions == 2);
+}
+
+TEST_CASE("TooltipCompileObservesOnlyResourceBackedMessages") {
+  literal_tooltip_compositions = 0;
+  resource_tooltip_compositions = 0;
+  TestResources resources;
+  resources.assets.emplace(
+      detail::resource_index_path,
+      EncodeIndex({
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/tooltip_hint",
+              .mime_type = "text/plain",
+              .value = "English hint",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/tooltip_hint",
+              .mime_type = "text/plain",
+              .locale = "zh",
+              .value = "Chinese hint",
+          },
+      })
+  );
+  TestPlatform platform;
+  platform.platform_resources = &resources;
+  UiWindow literal{LiteralTooltipDependencyApp, platform};
+  TestPlatform localized_platform{platform.platform_resources};
+  UiWindow localized{ResourceTooltipDependencyApp, localized_platform};
+  literal.SetWindowMetrics({.viewport = {240.0F, 80.0F}});
+  localized.SetWindowMetrics({.viewport = {240.0F, 80.0F}});
+
+  const auto contains_hint = [](const FrameCommit& frame, std::string_view hint) {
+    return frame.semantic_frame != nullptr &&
+           std::ranges::any_of(frame.semantic_frame->nodes, [hint](const SemanticNode& node) {
+             return node.hint == hint;
+           });
+  };
+  REQUIRE(contains_hint(literal.BuildCommit(), "literal hint"));
+  REQUIRE(contains_hint(localized.BuildCommit(), "Chinese hint"));
+  REQUIRE(literal_tooltip_compositions == 1);
+  REQUIRE(resource_tooltip_compositions == 1);
+
+  resources.configuration.locale = Locale::FromLanguageTag("en-US");
+  literal.UpdateResourceConfiguration(resources.configuration);
+  localized.UpdateResourceConfiguration(resources.configuration);
+  REQUIRE(contains_hint(literal.BuildCommit(), "literal hint"));
+  REQUIRE(contains_hint(localized.BuildCommit(), "English hint"));
+  REQUIRE(literal_tooltip_compositions == 1);
+  REQUIRE(resource_tooltip_compositions == 2);
+}
+
+TEST_CASE("VirtualItemsRetainResourceDependenciesOnTheirDeclaringScope") {
+  virtual_density_compositions = 0;
+  density_unrelated_compositions = 0;
+  TestResources resources;
+  const RawAsset image = TestPng(20, 10);
+  const RawAsset image_2x = TestPng(40, 20);
+  resources.assets.emplace(
+      detail::resource_index_path,
+      EncodeIndex({
+          {detail::ResourceEntryKind::Image,
+           "images/density",
+           "pingcore/test/images/density.png",
+           "image/png",
+           {},
+           {},
+           1.0F,
+           20,
+           10,
+           Hash(image.ReadBytes())},
+          {detail::ResourceEntryKind::Image,
+           "images/density",
+           "pingcore/test/images/density@2x.png",
+           "image/png",
+           {},
+           {},
+           2.0F,
+           40,
+           20,
+           Hash(image_2x.ReadBytes())},
+      }));
+  resources.assets.emplace("pingcore/test/images/density.png", image);
+  resources.assets.emplace("pingcore/test/images/density@2x.png", image_2x);
+  TestPlatform platform;
+  platform.platform_resources = &resources;
+  UiWindow runtime{VirtualResourceConfigurationDependencyApp, platform};
+  runtime.SetWindowMetrics({.viewport = {200.0F, 80.0F}});
+
+  runtime.BuildFrame();
+  const auto* root = runtime.RootNode();
+  REQUIRE(root != nullptr);
+  REQUIRE(std::get<ImageAsset>(root->children[0]->children[0]->children[0]->image_properties.source).Scale() == 2.0F);
+  REQUIRE(virtual_density_compositions == 1);
+  REQUIRE(density_unrelated_compositions == 1);
+
+  resources.configuration.display_scale = 1.0F;
+  runtime.UpdateResourceConfiguration(resources.configuration);
+  runtime.BuildFrame();
+  root = runtime.RootNode();
+  REQUIRE(std::get<ImageAsset>(root->children[0]->children[0]->children[0]->image_properties.source).Scale() == 1.0F);
+  REQUIRE(virtual_density_compositions == 2);
+  REQUIRE(density_unrelated_compositions == 1);
+}
+
+TEST_CASE("AppResourcesPrefersRegionBeforeScriptDuringLocaleFallback") {
+  TestResources resources;
+  resources.assets.emplace(
+      detail::resource_index_path,
+      EncodeIndex({
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/greeting",
+              .mime_type = "text/plain",
+              .locale = "zh",
+              .value = "Language",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/greeting",
+              .mime_type = "text/plain",
+              .locale = "zh-Hant",
+              .value = "Script",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/greeting",
+              .mime_type = "text/plain",
+              .locale = "zh-TW",
+              .value = "Region",
+          },
+      }));
+
+  auto service_owner = std::make_shared<detail::AppResources>(&resources);
+  auto& service = *service_owner;
+  const StringResource greeting("test", "strings/greeting");
+  REQUIRE(service.Resolve(greeting, Locale::FromLanguageTag("zh-Hant-TW")).value == "Region");
+  REQUIRE(service.Resolve(greeting, Locale::FromLanguageTag("zh-Hant")).value == "Script");
+}
+
+TEST_CASE("RuntimeRefreshesLocalizedResourcesWhenPlatformContextChanges") {
+  TestResources resources;
+  resources.assets.emplace(
+      detail::resource_index_path,
+      EncodeIndex({
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/greeting",
+              .mime_type = "text/plain",
+              .value = "Hello {0}",
+              .argument_count = 1,
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/greeting",
+              .mime_type = "text/plain",
+              .locale = "zh",
+              .value = "你好，{0}",
+              .argument_count = 1,
+          },
+      })
+  );
+  TestPlatform platform;
+  platform.platform_resources = &resources;
+  UiWindow runtime{LocalizedResourceApp, platform};
+  runtime.SetWindowMetrics({.viewport = {200.0F, 60.0F}});
+
+  REQUIRE(FirstText(runtime.BuildFrame()) == "你好，Ada");
+  resources.configuration.locale = Locale::FromLanguageTag("en-US");
+  const int requests_before_update = platform.requested_frames;
+  runtime.UpdateResourceConfiguration(resources.configuration);
+  REQUIRE(platform.requested_frames == requests_before_update + 1);
+  runtime.UpdateResourceConfiguration(resources.configuration);
+  REQUIRE(platform.requested_frames == requests_before_update + 1);
+  REQUIRE(FirstText(runtime.BuildFrame()) == "Hello Ada");
+}
+
+TEST_CASE("DialogDefaultsResolveFrameworkResourcesAndTrackLocale") {
+  resource_dialog.reset();
+  TestResources resources;
+  resources.assets.emplace(
+      detail::resource_index_path,
+      EncodeIndex({
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/dialog_ok",
+              .mime_type = "text/plain",
+              .value = "OK",
+              .domain = "pingcore",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/dialog_ok",
+              .mime_type = "text/plain",
+              .locale = "zh",
+              .value = "确定",
+              .domain = "pingcore",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/dialog_cancel",
+              .mime_type = "text/plain",
+              .value = "Cancel",
+              .domain = "pingcore",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/dialog_cancel",
+              .mime_type = "text/plain",
+              .locale = "zh",
+              .value = "取消",
+              .domain = "pingcore",
+          },
+      })
+  );
+  TestPlatform platform;
+  platform.platform_resources = &resources;
+  UiWindow runtime{FrameworkDialogResourceApp, platform};
+  runtime.SetWindowMetrics({.viewport = {320.0F, 240.0F}});
+  runtime.BuildFrame();
+  REQUIRE(resource_dialog.has_value());
+
+  resource_dialog->Show("Title", "Message", StringVariant{}, StringVariant{});
+  runtime.BuildFrame();
+  SettlePresentation(platform, runtime);
+  REQUIRE(ContainsText(runtime.BuildFrame(), "确定"));
+  REQUIRE(ContainsText(runtime.BuildFrame(), "取消"));
+
+  resources.configuration.locale = Locale::FromLanguageTag("en-US");
+  runtime.UpdateResourceConfiguration(resources.configuration);
+  REQUIRE(ContainsText(runtime.BuildFrame(), "OK"));
+  REQUIRE(ContainsText(runtime.BuildFrame(), "Cancel"));
+}
+
+TEST_CASE("ValidationDefaultsResolveFrameworkResourcesAndTrackLocale") {
+  TestResources resources;
+  resources.assets.emplace(
+      detail::resource_index_path,
+      EncodeIndex({
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/validation_required",
+              .mime_type = "text/plain",
+              .value = "This field is required",
+              .domain = "pingcore",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/validation_required",
+              .mime_type = "text/plain",
+              .locale = "zh",
+              .value = "此字段为必填项",
+              .domain = "pingcore",
+          },
+      })
+  );
+  TestPlatform platform;
+  platform.platform_resources = &resources;
+  UiWindow runtime{FrameworkValidationResourceApp, platform};
+  runtime.SetWindowMetrics({.viewport = {240.0F, 100.0F}});
+
+  REQUIRE(ContainsText(runtime.BuildFrame(), "此字段为必填项"));
+  resources.configuration.locale = Locale::FromLanguageTag("en-US");
+  runtime.UpdateResourceConfiguration(resources.configuration);
+  REQUIRE(ContainsText(runtime.BuildFrame(), "This field is required"));
+}
+
+TEST_CASE("TextSelectionLabelsResolveFrameworkResourcesAndTrackLocale") {
+  TestResources resources;
+  resources.assets.emplace(
+      detail::resource_index_path,
+      EncodeIndex({
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/text_selection_cut",
+              .mime_type = "text/plain",
+              .value = "Cut",
+              .domain = "pingcore",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/text_selection_cut",
+              .mime_type = "text/plain",
+              .locale = "zh",
+              .value = "剪切",
+              .domain = "pingcore",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/text_selection_copy",
+              .mime_type = "text/plain",
+              .value = "Copy",
+              .domain = "pingcore",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/text_selection_copy",
+              .mime_type = "text/plain",
+              .locale = "zh",
+              .value = "复制",
+              .domain = "pingcore",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/text_selection_paste",
+              .mime_type = "text/plain",
+              .value = "Paste",
+              .domain = "pingcore",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/text_selection_paste",
+              .mime_type = "text/plain",
+              .locale = "zh",
+              .value = "粘贴",
+              .domain = "pingcore",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/text_selection_select_all",
+              .mime_type = "text/plain",
+              .value = "Select all",
+              .domain = "pingcore",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/text_selection_select_all",
+              .mime_type = "text/plain",
+              .locale = "zh",
+              .value = "全选",
+              .domain = "pingcore",
+          },
+      })
+  );
+  TestClipboard clipboard;
+  TestPlatform platform;
+  platform.platform_clipboard = &clipboard;
+  platform.platform_resources = &resources;
+  UiWindow runtime{FrameworkSelectionResourceApp, platform};
+  runtime.SetWindowMetrics({.viewport = {280.0F, 120.0F}});
+  runtime.BuildFrame();
+
+  runtime.HandlePointerEvent({PointerEventType::Down, 901, {20.0F, 20.0F}, PointerDeviceKind::Touch});
+  platform.AdvanceTime(0.5);
+  REQUIRE(ContainsText(runtime.BuildFrame(), "复制"));
+
+  resources.configuration.locale = Locale::FromLanguageTag("en-US");
+  runtime.UpdateResourceConfiguration(resources.configuration);
+  const FlattenedScene& updated = runtime.BuildFrame();
+  REQUIRE_FALSE(ContainsText(updated, "复制"));
+  REQUIRE(ContainsText(updated, "Copy"));
+
+  resources.configuration.locale = Locale::FromLanguageTag("zh-CN");
+  TestPlatform partial_platform;
+  partial_platform.platform_clipboard = &clipboard;
+  partial_platform.platform_resources = &resources;
+  UiWindow partial_runtime{PartialSelectionLabelsResourceApp, partial_platform};
+  partial_runtime.SetWindowMetrics({.viewport = {280.0F, 120.0F}});
+  partial_runtime.BuildFrame();
+  partial_runtime.HandlePointerEvent({PointerEventType::Down, 902, {20.0F, 20.0F}, PointerDeviceKind::Touch});
+  partial_platform.AdvanceTime(0.5);
+  const FlattenedScene& partial = partial_runtime.BuildFrame();
+  REQUIRE(ContainsText(partial, "剪切"));
+  REQUIRE(ContainsText(partial, "Duplicate"));
+}
+
+TEST_CASE("TextAndControlsResolveStringResourcesDirectly") {
+  TestResources resources;
+  resources.assets.emplace(
+      detail::resource_index_path,
+      EncodeIndex({
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/title",
+              .mime_type = "text/plain",
+              .value = "Title",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/title",
+              .mime_type = "text/plain",
+              .locale = "zh",
+              .value = "Localized title",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/action",
+              .mime_type = "text/plain",
+              .value = "Action",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/action",
+              .mime_type = "text/plain",
+              .locale = "zh",
+              .value = "Localized action",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/placeholder",
+              .mime_type = "text/plain",
+              .value = "Placeholder",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/placeholder",
+              .mime_type = "text/plain",
+              .locale = "zh",
+              .value = "Localized placeholder",
+          },
+      })
+  );
+  TestPlatform platform;
+  platform.platform_resources = &resources;
+  UiWindow runtime{DirectLocalizedResourceApp, platform};
+  runtime.SetWindowMetrics({.viewport = {200.0F, 160.0F}});
+
+  const FlattenedScene& scene = runtime.BuildFrame();
+  REQUIRE(ContainsText(scene, "Localized title"));
+  REQUIRE(ContainsText(scene, "Localized action"));
+  REQUIRE(ContainsText(scene, "Localized placeholder"));
+
+  resources.configuration.locale = Locale::FromLanguageTag("en-US");
+  runtime.UpdateResourceConfiguration(resources.configuration);
+  const FlattenedScene& updated = runtime.BuildFrame();
+  REQUIRE(ContainsText(updated, "Title"));
+  REQUIRE(ContainsText(updated, "Action"));
+  REQUIRE(ContainsText(updated, "Placeholder"));
+  REQUIRE_FALSE(ContainsText(updated, "Localized title"));
+}
+
+TEST_CASE("TextFieldResourceFailurePreservesTheCommittedExtensionValue") {
+  TestResources resources;
+  resources.assets.emplace(
+      detail::resource_index_path,
+      EncodeIndex({
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/placeholder",
+              .mime_type = "text/plain",
+              .value = "Placeholder",
+          },
+      })
+  );
+  TestPlatform platform;
+  platform.platform_resources = &resources;
+  UiWindow runtime{TextFieldResourceFailureApp, platform};
+  runtime.SetWindowMetrics({.viewport = {200.0F, 80.0F}});
+  runtime.BuildFrame();
+
+  const auto find_text_field_modifier = [](const detail::MountedNode& node) -> const detail::TextFieldModifier* {
+    const auto found = std::ranges::find_if(node.extensions, [](const detail::NodeExtensionEntry& entry) {
+      return entry.descriptor == &detail::TextFieldModifier::Descriptor();
+    });
+    if (found == node.extensions.end()) {
+      return nullptr;
+    }
+    return static_cast<const detail::TextFieldModifier*>(found->value.get());
+  };
+  const detail::MountedNode* field = runtime.RootNode();
+  REQUIRE(field != nullptr);
+  const auto* committed = find_text_field_modifier(*field);
+  REQUIRE(committed != nullptr);
+  REQUIRE(detail::StringLiteral(committed->placeholder) == "Placeholder");
+
+  missing_text_field_placeholder = true;
+  REQUIRE_THROWS(runtime.BuildFrame());
+
+  field = runtime.RootNode();
+  REQUIRE(field != nullptr);
+  committed = find_text_field_modifier(*field);
+  REQUIRE(committed != nullptr);
+  REQUIRE(detail::StringLiteral(committed->placeholder) == "Placeholder");
+}
+
+TEST_CASE("MenuItemsResolveStringAndImageResources") {
+  resource_menu.reset();
+  TestResources resources;
+  const RawAsset icon = TestPng(16, 16);
+  resources.assets.emplace(
+      detail::resource_index_path,
+      EncodeIndex({
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/menu_item",
+              .mime_type = "text/plain",
+              .value = "Resource item",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/greeting",
+              .mime_type = "text/plain",
+              .value = "Hello {0}",
+              .argument_count = 1,
+          },
+          {
+              .kind = detail::ResourceEntryKind::Image,
+              .key = "images/menu_icon",
+              .path = "pingcore/test/images/menu_icon.png",
+              .mime_type = "image/png",
+              .width = 16,
+              .height = 16,
+              .content_hash = Hash(icon.ReadBytes()),
+          },
+      })
+  );
+  resources.assets.emplace("pingcore/test/images/menu_icon.png", icon);
+
+  TestPlatform platform;
+  platform.platform_resources = &resources;
+  UiWindow runtime{ResourceMenuApp, platform};
+  runtime.SetWindowMetrics({.viewport = {320.0F, 240.0F}});
+  runtime.BuildFrame();
+  REQUIRE(resource_menu.has_value());
+
+  resource_menu->Show(*resource_menu_target, {
+      MenuItem(ImageResource("test", "images/menu_icon"), StringResource("test", "strings/menu_item"), [] {}),
+      MenuItem(StringVariant::Format(StringResource("test", "strings/greeting"), "Ada"), [] {}),
+  });
+  const FlattenedScene& shown = runtime.BuildFrame();
+  REQUIRE(ContainsText(shown, "Resource item"));
+  REQUIRE(ContainsText(shown, "Hello Ada"));
+  REQUIRE(std::ranges::any_of(shown.Commands(), [](const PaintCommand& command) {
+    return std::holds_alternative<pingcore::DrawImageCommand>(command);
+  }));
+}
+
+TEST_CASE("PresentedStringVariantsRefreshWhenTheResourceConfigurationChanges") {
+  resource_menu.reset();
+  TestResources resources;
+  resources.assets.emplace(
+      detail::resource_index_path,
+      EncodeIndex({
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/menu_item",
+              .mime_type = "text/plain",
+              .value = "English item",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/menu_item",
+              .mime_type = "text/plain",
+              .locale = "zh",
+              .value = "Chinese item",
+          },
+      })
+  );
+
+  TestPlatform platform;
+  platform.platform_resources = &resources;
+  UiWindow runtime{ResourceMenuApp, platform};
+  runtime.SetWindowMetrics({.viewport = {320.0F, 240.0F}});
+  runtime.BuildFrame();
+  REQUIRE(resource_menu.has_value());
+
+  resource_menu->Show(*resource_menu_target, {MenuItem(StringResource("test", "strings/menu_item"), [] {})});
+  REQUIRE(ContainsText(runtime.BuildFrame(), "Chinese item"));
+
+  resources.configuration.locale = Locale::FromLanguageTag("en-US");
+  runtime.UpdateResourceConfiguration(resources.configuration);
+  const FlattenedScene& updated = runtime.BuildFrame();
+  REQUIRE(!ContainsText(updated, "Chinese item"));
+  REQUIRE(ContainsText(updated, "English item"));
+}
+
+TEST_CASE("WindowCaptionLabelsRefreshWhenTheResourceConfigurationChanges") {
+  TestResources resources;
+  resources.assets.emplace(
+      detail::resource_index_path,
+      EncodeIndex({
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/minimize_window",
+              .mime_type = "text/plain",
+              .value = "Minimize window",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/minimize_window",
+              .mime_type = "text/plain",
+              .locale = "zh",
+              .value = "Minimize localized window",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/window_maximize",
+              .mime_type = "text/plain",
+              .value = "Maximize",
+              .domain = "pingcore",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/window_maximize",
+              .mime_type = "text/plain",
+              .locale = "zh",
+              .value = "最大化",
+              .domain = "pingcore",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/window_restore",
+              .mime_type = "text/plain",
+              .value = "Restore",
+              .domain = "pingcore",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/window_restore",
+              .mime_type = "text/plain",
+              .locale = "zh",
+              .value = "还原",
+              .domain = "pingcore",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/window_close",
+              .mime_type = "text/plain",
+              .value = "Close",
+              .domain = "pingcore",
+          },
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/window_close",
+              .mime_type = "text/plain",
+              .locale = "zh",
+              .value = "关闭",
+              .domain = "pingcore",
+          },
+      })
+  );
+
+  TestPlatform platform;
+  platform.platform_resources = &resources;
+  AppOptions options;
+  options.show_debug_overlay = false;
+  options.window.chrome_mode = WindowChromeMode::Custom;
+  options.window.caption_labels.minimize = StringResource("test", "strings/minimize_window");
+  UiWindow runtime{LocalizedWindowControlsApp, platform, options};
+  runtime.SetWindowMetrics({
+      .viewport = {300.0F, 100.0F},
+      .title_bar = WindowTitleBarMetrics{.height = 40.0F, .right_inset = 138.0F},
+  });
+
+  const auto contains_label = [](const FrameCommit& frame, std::string_view label) {
+    return frame.semantic_frame != nullptr &&
+           std::ranges::any_of(frame.semantic_frame->nodes, [label](const SemanticNode& node) {
+             return node.label == label;
+           });
+  };
+  const FrameCommit& localized = runtime.BuildCommit();
+  REQUIRE(contains_label(localized, "Minimize localized window"));
+  REQUIRE(contains_label(localized, "最大化"));
+  REQUIRE(contains_label(localized, "关闭"));
+
+  runtime.SetWindowMetrics({
+      .viewport = {300.0F, 100.0F},
+      .title_bar = WindowTitleBarMetrics{.height = 40.0F, .right_inset = 138.0F, .maximized = true},
+  });
+  REQUIRE(contains_label(runtime.BuildCommit(), "还原"));
+
+  resources.configuration.locale = Locale::FromLanguageTag("en-US");
+  runtime.UpdateResourceConfiguration(resources.configuration);
+  const FrameCommit& updated = runtime.BuildCommit();
+  REQUIRE(contains_label(updated, "Minimize window"));
+  REQUIRE(contains_label(updated, "Restore"));
+  REQUIRE(contains_label(updated, "Close"));
+}
+
+TEST_CASE("LocalizedResourcesRequireTheDefaultArgumentSchema") {
+  TestResources resources;
+  resources.assets.emplace(
+      detail::resource_index_path,
+      EncodeIndex({
+          {
+              .kind = detail::ResourceEntryKind::String,
+              .key = "strings/greeting",
+              .mime_type = "text/plain",
+              .value = "Hello {0}",
+              .argument_count = 1,
+          },
+      })
+  );
+  TestPlatform platform;
+  platform.platform_resources = &resources;
+
+  UiWindow missing{MissingResourceArgumentsApp, platform};
+  missing.SetWindowMetrics({.viewport = {200.0F, 60.0F}});
+  REQUIRE_THROWS_AS(missing.BuildFrame(), std::invalid_argument);
+
+  TestPlatform extra_platform{platform.platform_resources};
+  UiWindow extra{ExtraResourceArgumentsApp, extra_platform};
+  extra.SetWindowMetrics({.viewport = {200.0F, 60.0F}});
+  REQUIRE_THROWS_AS(extra.BuildFrame(), std::invalid_argument);
+}
+
+TEST_CASE("AppResourcesDoNotValidatePayloadContentHashes") {
+  TestResources resources;
+  resources.assets.emplace(
+      detail::resource_index_path,
+      EncodeIndex({
+          {detail::ResourceEntryKind::Raw,
+           "raw/config.txt",
+           "pingcore/test/raw/config.txt",
+           "text/plain",
+           {},
+           {},
+           1.0F,
+           0,
+           0,
+           1},
+      })
+  );
+  resources.assets.emplace(
+      "pingcore/test/raw/config.txt",
+      RawAsset::CopyBytes(std::as_bytes(std::span("enabled", std::size("enabled") - 1)), "text/plain"));
+
+  auto service_owner = std::make_shared<detail::AppResources>(&resources);
+  auto& service = *service_owner;
+  REQUIRE(service.Resolve(RawResource("test", "raw/config.txt")).ReadString() == "enabled");
+}
+
+namespace {
+
+constexpr std::string_view lazy_path = "pingcore/test/lazy.bin";
+const RawResource lazy_resource("test", "raw/lazy");
+
+std::function<View()> resource_test_root;
+View ResourceTestRoot() { return resource_test_root(); }
+
+void InstallLazyResource(TestResources& resources, Bytes bytes = {std::byte{1}, std::byte{0}, std::byte{255}}) {
+  resources.assets.emplace(detail::resource_index_path, EncodeIndex({
+      {.kind = detail::ResourceEntryKind::Raw, .key = "raw/lazy", .path = std::string(lazy_path),
+       .mime_type = "application/test"},
+  }));
+  resources.assets.emplace(lazy_path, RawAsset::FromBytes(std::move(bytes)));
+}
+
+struct ResourceProbe {
+  std::atomic<int> reads = 0;
+  std::atomic<int> released = 0;
+  std::atomic<bool> fail = false;
+  std::function<void()> before_read;
+};
+
+class ProbedResourceInput final : public detail::InputStreamBackend {
+public:
+  explicit ProbedResourceInput(std::shared_ptr<ResourceProbe> probe) : probe_(std::move(probe)) {}
+
+  IoResult<std::size_t> Read(std::span<std::byte> buffer) override {
+    if (probe_->before_read) {
+      probe_->before_read();
+    }
+    ++probe_->reads;
+    if (offset_ == 3) {
+      if (probe_->fail) {
+        return IoResult<std::size_t>(IoError{IoErrorCode::Io, "PingCore test resource read failed"});
+      }
+      return IoResult<std::size_t>(std::size_t{0});
+    }
+    const std::size_t count = std::min(buffer.size(), 3 - offset_);
+    for (std::size_t i = 0; i < count; ++i) {
+      buffer[i] = static_cast<std::byte>(++offset_);
+    }
+    return IoResult<std::size_t>(count);
+  }
+
+  void Release() noexcept override { ++probe_->released; }
+
+private:
+  std::shared_ptr<ResourceProbe> probe_;
+  std::size_t offset_ = 0;
+};
+
+struct ResourceTaskQueue {
+  UiThreadDispatcher Dispatcher() {
+    return [this](std::function<void()> task) {
+      {
+        std::scoped_lock lock(mutex);
+        tasks.push_back(std::move(task));
+      }
+      condition.notify_one();
+    };
+  }
+
+  void RunUntil(const std::function<bool()>& complete) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!complete()) {
+      std::function<void()> task;
+      {
+        std::unique_lock lock(mutex);
+        REQUIRE(WaitForTestCondition(condition, lock, deadline, [&] { return !tasks.empty(); }));
+        task = std::move(tasks.front());
+        tasks.pop_front();
+      }
+      task();
+    }
+  }
+
+  std::mutex mutex;
+  std::condition_variable condition;
+  std::deque<std::function<void()>> tasks;
+};
+
+} // namespace
+
+#if !defined(__EMSCRIPTEN__)
+TEST_CASE("BitmapCodecRoundTripsAndSavesEncodedAssetsWithoutRewriting") {
+  ResourceTaskQueue queue;
+  TestPlatform platform(queue.Dispatcher());
+  TaskScope tasks;
+  resource_test_root = [&] {
+    tasks = UseTaskScope();
+    return Text("bitmap");
+  };
+  UiWindow runtime{ResourceTestRoot, platform};
+  runtime.SetWindowMetrics({.viewport = {200.0F, 60.0F}});
+  runtime.BuildFrame();
+
+  const Bitmap source = Bitmap::FromRgba8(2, 1, {
+      std::byte{255}, std::byte{0}, std::byte{0}, std::byte{128},
+      std::byte{0}, std::byte{0}, std::byte{255}, std::byte{255},
+  }, 2.0F);
+  const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+  const File destination((std::filesystem::temp_directory_path() /
+      ("pingcore-bitmap-" + std::to_string(suffix))).u8string());
+  bool finished = false;
+  std::exception_ptr failure;
+  tasks.Launch([&]() -> Task<void> {
+    try {
+      auto png = co_await source.EncodeAsync();
+      auto asset = ImageAsset::FromEncoded(png, 2.0F);
+      auto decode = asset.DecodeAsync();
+      const bool asset_saved = co_await asset.SaveAsync(destination);
+      REQUIRE(asset_saved);
+      asset = {};
+      const auto decoded = co_await std::move(decode);
+      REQUIRE(decoded.IntrinsicSize() == source.IntrinsicSize());
+      REQUIRE(std::ranges::equal(decoded.Pixels(), source.Pixels()));
+      REQUIRE(destination.ReadBytes().Value() == png);
+      const auto loaded = ImageAsset::FromFile(destination, 2.0F);
+      REQUIRE(loaded.IntrinsicSize() == source.IntrinsicSize());
+      REQUIRE(std::ranges::equal(loaded.EncodedBytes(), png));
+
+      try {
+        PINGCORE_DISCARD(co_await source.SaveAsync(destination, ImageEncodeOptions{
+            .format = ImageFormat::Jpeg, .jpeg_quality = 101,
+        }));
+        FAIL("The invalid JPEG quality was accepted");
+      } catch (const std::invalid_argument&) {
+        REQUIRE(destination.ReadBytes().Value() == png);
+      }
+
+      const bool bitmap_saved = co_await source.SaveAsync(destination, {.format = ImageFormat::Jpeg});
+      REQUIRE(bitmap_saved);
+      auto jpeg = destination.ReadBytes().Value();
+      const std::array<unsigned char, 26> orientation{
+          'I', 'I', 42, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0,
+          1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0,
+      };
+      const auto tiff = std::as_bytes(std::span(orientation));
+      const std::array<unsigned char, 10> app1_header{
+          0xff, 0xe1, 0x00, 0x22, 'E', 'x', 'i', 'f', 0, 0,
+      };
+      const auto app1 = std::as_bytes(std::span(app1_header));
+      jpeg.insert(jpeg.begin() + 2, app1.begin(), app1.end());
+      jpeg.insert(jpeg.begin() + 2 + app1.size(), tiff.begin(), tiff.end());
+      const auto oriented_jpeg = co_await ImageAsset::FromEncoded(std::move(jpeg)).DecodeAsync();
+      REQUIRE(oriented_jpeg.IntrinsicSize() == Size{1.0F, 2.0F});
+
+      const std::array<unsigned char, 8> png_header{0, 0, 0, 26, 'e', 'X', 'I', 'f'};
+      const std::array<unsigned char, 4> png_checksum{0xb7, 0x48, 0x11, 0x29};
+      const auto chunk = std::as_bytes(std::span(png_header));
+      const auto checksum = std::as_bytes(std::span(png_checksum));
+      constexpr std::ptrdiff_t after_ihdr = 33;
+      png.insert(png.begin() + after_ihdr, chunk.begin(), chunk.end());
+      png.insert(png.begin() + after_ihdr + chunk.size(), tiff.begin(), tiff.end());
+      png.insert(png.begin() + after_ihdr + chunk.size() + tiff.size(), checksum.begin(), checksum.end());
+      const auto tagged_png = ImageAsset::FromEncoded(std::move(png), 2.0F);
+      REQUIRE(tagged_png.IntrinsicSize() == Size{1.0F, 0.5F});
+      const auto oriented_png = co_await tagged_png.DecodeAsync();
+      REQUIRE(oriented_png.IntrinsicSize() == Size{0.5F, 1.0F});
+      REQUIRE(std::ranges::equal(oriented_png.Pixels(), source.Pixels()));
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    finished = true;
+  });
+  queue.RunUntil([&] { return finished; });
+  REQUIRE(destination.Delete());
+  if (failure) {
+    std::rethrow_exception(failure);
+  }
+}
+#endif
+
+TEST_CASE("RawResourceLookupAndRecompositionDoNotOpenThePayload") {
+  TestResources resources;
+  InstallLazyResource(resources);
+  TestPlatform platform(&resources);
+  RawAsset first;
+  RawAsset current;
+  State<int> revision;
+  int compositions = 0;
+  resource_test_root = [&] {
+    revision = UseState(0);
+    current = UseRawResource(lazy_resource);
+    ++compositions;
+    return Text(std::to_string(revision.Get()));
+  };
+  UiWindow runtime{ResourceTestRoot, platform};
+  runtime.SetWindowMetrics({.viewport = {200.0F, 60.0F}});
+  runtime.BuildFrame();
+  first = current;
+  revision = 1;
+  runtime.BuildFrame();
+  REQUIRE(compositions == 2);
+  REQUIRE(current == first);
+  REQUIRE(current.HasValue());
+  REQUIRE(current.MimeType() == "application/test");
+  REQUIRE(resources.read_counts[std::string(lazy_path)] == 0);
+  REQUIRE(current.ReadBytes().size() == 3);
+  REQUIRE(resources.read_counts[std::string(lazy_path)] == 1);
+}
+
+TEST_CASE("RawResourceCacheIsExplicitSharedAndIndependentOfReturnedCopies") {
+  TestResources resources;
+  InstallLazyResource(resources, {std::byte{0xEF}, std::byte{0xBB}, std::byte{0xBF}, std::byte{0}, std::byte{255}});
+  auto service = std::make_shared<detail::AppResources>(&resources);
+  RawAsset asset = service->Resolve(lazy_resource);
+  RawAsset copy = asset;
+  auto initial = asset.ReadBytes();
+  REQUIRE(copy.ReadBytes() == initial);
+  REQUIRE(resources.read_counts[std::string(lazy_path)] == 2);
+  REQUIRE(copy.ReadString(true).size() == initial.size());
+  auto returned = asset.ReadBytes();
+  returned[0] = std::byte{0};
+  REQUIRE(service->Resolve(lazy_resource).ReadBytes() == initial);
+  REQUIRE(resources.read_counts[std::string(lazy_path)] == 3);
+  REQUIRE(copy == asset);
+  service->Disconnect();
+  service.reset();
+  REQUIRE(asset.ReadBytes() == initial);
+  auto cached_stream = copy.OpenRead();
+  asset = {};
+  copy = {};
+  REQUIRE(detail::ReadStreamBytes(std::move(cached_stream)) == initial);
+}
+
+TEST_CASE("RawResourceStreamsAreIncrementalIndependentAndOutliveTheirService") {
+  TestResources resources;
+  InstallLazyResource(resources);
+  auto probe = std::make_shared<ResourceProbe>();
+  resources.open_payload = [probe] {
+    return detail::StreamAccess::MakeInputStream(std::make_shared<ProbedResourceInput>(probe));
+  };
+  auto service = std::make_shared<detail::AppResources>(&resources);
+  RawAsset asset = service->Resolve(lazy_resource);
+  auto first = asset.OpenRead();
+  auto second = asset.OpenRead();
+  REQUIRE(probe->reads == 0);
+  std::array<std::byte, 1> buffer;
+  REQUIRE(first.Read(buffer).Value() == 1);
+  REQUIRE(buffer[0] == std::byte{1});
+  REQUIRE(second.Read(buffer).Value() == 1);
+  REQUIRE(buffer[0] == std::byte{1});
+  service->Disconnect();
+  REQUIRE_THROWS_AS(asset.OpenRead(), std::logic_error);
+  service.reset();
+  REQUIRE_THROWS_AS(asset.ReadBytes(), std::logic_error);
+  REQUIRE(first.Read(buffer).Value() == 1);
+  REQUIRE(buffer[0] == std::byte{2});
+}
+
+TEST_CASE("RawResourceFailedReadsDoNotPublishPartialCaches") {
+  const bool read_string = GENERATE(false, true);
+  TestResources resources;
+  InstallLazyResource(resources);
+  auto probe = std::make_shared<ResourceProbe>();
+  probe->fail = true;
+  resources.open_payload = [probe] {
+    return detail::StreamAccess::MakeInputStream(std::make_shared<ProbedResourceInput>(probe));
+  };
+  auto service = std::make_shared<detail::AppResources>(&resources);
+  RawAsset asset = service->Resolve(lazy_resource);
+  if (read_string) {
+    REQUIRE_THROWS_AS(asset.ReadString(true), std::runtime_error);
+  } else {
+    REQUIRE_THROWS_AS(asset.ReadBytes(true), std::runtime_error);
+  }
+  REQUIRE(probe->released == 1);
+  probe->fail = false;
+  REQUIRE((asset.ReadBytes(true) == Bytes{std::byte{1}, std::byte{2}, std::byte{3}}));
+  REQUIRE(resources.read_counts[std::string(lazy_path)] == 2);
+  REQUIRE(asset.ReadBytes().size() == 3);
+  REQUIRE(resources.read_counts[std::string(lazy_path)] == 2);
+}
+
+TEST_CASE("RawResourceMissingAndEmptyPayloadsRemainDistinct") {
+  TestResources resources;
+  InstallLazyResource(resources, {});
+  auto service = std::make_shared<detail::AppResources>(&resources);
+  RawAsset asset = service->Resolve(lazy_resource);
+  REQUIRE(asset.ReadBytes(true).empty());
+  REQUIRE(asset.HasValue());
+  auto empty = asset.OpenRead();
+  std::array<std::byte, 1> buffer;
+  REQUIRE(empty.Read(buffer).Value() == 0);
+  resources.assets.erase(std::string(lazy_path));
+  auto other_service = std::make_shared<detail::AppResources>(&resources);
+  RawAsset missing = other_service->Resolve(lazy_resource);
+  REQUIRE(missing.HasValue());
+  REQUIRE_THROWS_AS(missing.OpenRead(), std::logic_error);
+  REQUIRE(asset != missing);
+  REQUIRE(asset.ReadBytes().empty());
+}
+
+TEST_CASE("RawResourceAsyncOpenRetainsAssetAndDeliversCallerSizedReads") {
+  ResourceTaskQueue queue;
+  TestResources resources;
+  InstallLazyResource(resources);
+  TestPlatform platform(queue.Dispatcher());
+  platform.platform_resources = &resources;
+  TaskScope tasks;
+  RawAsset asset;
+  resource_test_root = [&] {
+    tasks = UseTaskScope();
+    asset = UseRawResource(lazy_resource);
+    return Text("resources");
+  };
+  UiWindow runtime{ResourceTestRoot, platform};
+  runtime.SetWindowMetrics({.viewport = {200.0F, 60.0F}});
+  runtime.BuildFrame();
+  auto opened = asset.OpenReadAsync();
+  asset = {};
+  REQUIRE(resources.read_counts[std::string(lazy_path)] == 0);
+  bool complete = false;
+  Bytes result;
+  std::thread::id resumed;
+  tasks.Launch([&, opened = std::move(opened)]() mutable -> Task<void> {
+    auto input = co_await std::move(opened);
+    while (true) {
+      Bytes bytes = (co_await input.ReadAsync(1)).Value();
+      if (bytes.empty()) {
+        break;
+      }
+      REQUIRE(bytes.size() == 1);
+      result.insert(result.end(), bytes.begin(), bytes.end());
+    }
+    resumed = std::this_thread::get_id();
+    complete = true;
+  });
+  queue.RunUntil([&] { return complete; });
+  REQUIRE((result == Bytes{std::byte{1}, std::byte{0}, std::byte{255}}));
+  REQUIRE(resumed == std::this_thread::get_id());
+  REQUIRE(resources.read_counts[std::string(lazy_path)] == 1);
+}
+
+TEST_CASE("RawResourceAsyncFailuresAndRetainedMemoryUseTheSameContract") {
+  ResourceTaskQueue queue;
+  TestResources resources;
+  InstallLazyResource(resources);
+  auto service = std::make_shared<detail::AppResources>(&resources);
+  RawAsset asset = service->Resolve(lazy_resource);
+  bool failure = false;
+  SECTION("Disconnected service fails while awaiting open") {
+    service->Disconnect();
+    failure = true;
+  }
+  SECTION("Cached bytes remain readable after disconnect") {
+    PINGCORE_DISCARD(asset.ReadBytes(true));
+    service->Disconnect();
+  }
+  SECTION("Memory storage does not depend on a service") {
+    asset = RawAsset::FromBytes({std::byte{1}, std::byte{0}, std::byte{255}});
+  }
+  SECTION("Read failure propagates after successful open") {
+    auto probe = std::make_shared<ResourceProbe>();
+    probe->fail = true;
+    resources.open_payload = [probe] {
+      return detail::StreamAccess::MakeInputStream(std::make_shared<ProbedResourceInput>(probe));
+    };
+    failure = true;
+  }
+  TestPlatform platform(queue.Dispatcher());
+  TaskScope tasks;
+  resource_test_root = [&] {
+    tasks = UseTaskScope();
+    return Text("resources");
+  };
+  UiWindow runtime{ResourceTestRoot, platform};
+  runtime.SetWindowMetrics({.viewport = {200.0F, 60.0F}});
+  runtime.BuildFrame();
+  bool complete = false;
+  bool caught = false;
+  tasks.Launch([&]() -> Task<void> {
+    std::optional<AsyncInputStream> input;
+    try {
+      input.emplace(co_await asset.OpenReadAsync());
+    } catch (const std::logic_error&) {
+      caught = true;
+    }
+    if (input) {
+      const auto first = co_await input->ReadAsync(3);
+      REQUIRE(first.Succeeded());
+      REQUIRE(first.Value().size() == 3);
+      const auto end = co_await input->ReadAsync(3);
+      if (end.Succeeded()) {
+        REQUIRE(end.Value().empty());
+      } else {
+        REQUIRE(end.Error().code == IoErrorCode::Io);
+        caught = true;
+      }
+    }
+    complete = true;
+  });
+  queue.RunUntil([&] { return complete; });
+  REQUIRE(caught == failure);
+}
+
+TEST_CASE("RawResourceConcurrentCachePublicationPreservesImmutableContents") {
+#if defined(__EMSCRIPTEN__)
+  SKIP("PingCore Web has no worker-thread execution capability");
+#endif
+  TestResources resources;
+  InstallLazyResource(resources);
+  auto service = std::make_shared<detail::AppResources>(&resources);
+  RawAsset asset = service->Resolve(lazy_resource);
+  auto first = std::async(std::launch::async, [asset] { return asset.ReadBytes(true); });
+  auto second = std::async(std::launch::async, [asset] { return asset.ReadString(true); });
+  const auto bytes = first.get();
+  const auto text = second.get();
+  REQUIRE(bytes == asset.ReadBytes());
+  REQUIRE(text == asset.ReadString());
+  const auto reads = resources.read_counts[std::string(lazy_path)];
+  REQUIRE(reads >= 1);
+  REQUIRE(reads <= 2);
+  REQUIRE(asset.ReadBytes(false) == bytes);
+  REQUIRE(resources.read_counts[std::string(lazy_path)] == reads);
+}
+
+TEST_CASE("RawResourceCancellationReleasesPendingOpenOrReadWithoutDelivery") {
+  const bool opening = GENERATE(true, false);
+#if defined(__EMSCRIPTEN__)
+  // Web cancellation runs before the queued operation; native workers can be canceled while blocked inside it.
+  const auto block = [] {};
+#else
+  struct Gate {
+    void Block() {
+      std::unique_lock lock(mutex);
+      entered = true;
+      condition.notify_all();
+      condition.wait_for(lock, std::chrono::seconds(5), [&] { return released; });
+    }
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool entered = false;
+    bool released = false;
+  };
+  auto gate = std::make_shared<Gate>();
+  const auto block = [gate] { gate->Block(); };
+#endif
+  auto probe = std::make_shared<ResourceProbe>();
+  if (!opening) {
+    probe->before_read = block;
+  }
+  ResourceTaskQueue queue;
+  TestResources resources;
+  InstallLazyResource(resources);
+  resources.open_payload = [block, probe, opening] {
+    if (opening) {
+      block();
+    }
+    return detail::StreamAccess::MakeInputStream(std::make_shared<ProbedResourceInput>(probe));
+  };
+  TestPlatform platform(queue.Dispatcher());
+  platform.platform_resources = &resources;
+  TaskScope tasks;
+  RawAsset asset;
+  resource_test_root = [&] {
+    tasks = UseTaskScope();
+    asset = UseRawResource(lazy_resource);
+    return Text("resources");
+  };
+  UiWindow runtime{ResourceTestRoot, platform};
+  runtime.SetWindowMetrics({.viewport = {200.0F, 60.0F}});
+  runtime.BuildFrame();
+  bool delivered = false;
+  bool started = false;
+  bool opened = false;
+  auto task = tasks.Launch([&]() -> Task<void> {
+    started = true;
+    auto input = co_await asset.OpenReadAsync();
+    opened = true;
+    const auto bytes = co_await input.ReadAsync(1);
+    delivered = true;
+  });
+  queue.RunUntil([&] { return opening ? started : opened; });
+#if !defined(__EMSCRIPTEN__)
+  {
+    std::unique_lock lock(gate->mutex);
+    REQUIRE(gate->condition.wait_for(lock, std::chrono::seconds(5), [&] { return gate->entered; }));
+  }
+#endif
+  task.Cancel();
+#if defined(__EMSCRIPTEN__)
+  {
+    std::unique_lock lock(queue.mutex);
+    REQUIRE(WaitForTestCondition(queue.condition, lock, std::chrono::steady_clock::now() + std::chrono::seconds(5),
+                                 [&] { return probe->released == 1; }));
+  }
+#else
+  {
+    std::scoped_lock lock(gate->mutex);
+    gate->released = true;
+  }
+  gate->condition.notify_all();
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (probe->released == 0 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+#endif
+  REQUIRE(probe->released == 1);
+  REQUIRE_FALSE(delivered);
+  if (opening) {
+    REQUIRE_FALSE(opened);
+    REQUIRE(probe->reads == 0);
+  }
+}
+
+TEST_CASE("RawResourceRuntimeDestructionDisconnectsEvenRetainedServices") {
+  TestResources resources;
+  InstallLazyResource(resources);
+  TestPlatform platform(&resources);
+  RawAsset asset;
+  std::shared_ptr<detail::AppResources> retained_service;
+  std::optional<InputStream> opened;
+  {
+    resource_test_root = [&] {
+      asset = UseRawResource(lazy_resource);
+      retained_service = UseService<detail::AppResources>();
+      return Text("resources");
+    };
+    UiWindow runtime{ResourceTestRoot, platform};
+    runtime.SetWindowMetrics({.viewport = {200.0F, 60.0F}});
+    runtime.BuildFrame();
+    opened.emplace(asset.OpenRead());
+  }
+  REQUIRE(retained_service != nullptr);
+  REQUIRE_THROWS_AS(asset.OpenRead(), std::logic_error);
+  REQUIRE(detail::ReadStreamBytes(std::move(*opened)).size() == 3);
+}
+
+TEST_CASE("CustomFontResourcesLoadWithoutAWindowAndRetainSnapshotsAfterShutdown") {
+  TestResources resources;
+  const RawResource regular("test", "raw/regular");
+  const RawResource bold("test", "raw/bold");
+  resources.assets[std::string(detail::resource_index_path)] = EncodeIndex({
+      {detail::ResourceEntryKind::Raw, "raw/regular", "pingcore/test/raw/regular.ttf", "font/ttf", {}, {}},
+      {detail::ResourceEntryKind::Raw, "raw/bold", "pingcore/test/raw/bold.ttf", "font/ttf", {}, {}},
+  });
+  resources.assets["pingcore/test/raw/regular.ttf"] = RawAsset::FromBytes(TestFontBytes());
+  resources.assets["pingcore/test/raw/bold.ttf"] = RawAsset::FromBytes(TestFontBytes(FontWeight::Bold));
+  FontFamily retained;
+  {
+    TestPlatform platform(&resources);
+    Application application([]() -> View { return Text("unused"); });
+    RuntimeLifetime lifetime(application, platform, std::nullopt);
+    retained = FontFamily::FromResources({regular, bold});
+    REQUIRE(retained == FontFamily::FromResources({bold, regular}));
+    REQUIRE(Font::FromResource(regular) == Font::FromBytes(TestFontBytes()));
+    REQUIRE(resources.read_counts["pingcore/test/raw/regular.ttf"] == 1);
+    REQUIRE(resources.read_counts["pingcore/test/raw/bold.ttf"] == 1);
+#if !defined(__EMSCRIPTEN__)
+    bool rejected = false;
+    std::thread worker([&] {
+      try { FontFamily::FromResources({regular}); }
+      catch (const std::logic_error&) { rejected = true; }
+    });
+    worker.join();
+    REQUIRE(rejected);
+#endif
+    REQUIRE_THROWS_AS(Font::FromResource(RawResource("test", "raw/missing")), std::logic_error);
+  }
+  REQUIRE(retained == FontFamily::FromBytes({TestFontBytes(), TestFontBytes(FontWeight::Bold)}));
+  REQUIRE_THROWS_AS(Font::FromResource(regular), std::logic_error);
+}
+
+} // namespace pingcore::test

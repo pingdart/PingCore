@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="description" content="@PROJECT_NAME@ application">
+  <meta name="robots" content="index,follow">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="@PROJECT_NAME@">
+  <meta name="twitter:card" content="summary">
+  <link rel="icon" type="image/svg+xml" href="./@PINGCORE_WEB_FAVICON_FILE@">
+  <link rel="apple-touch-icon" href="./@PINGCORE_WEB_APPLE_TOUCH_ICON_FILE@">
+  <title>@PROJECT_NAME@</title>
+  <style>
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+    }
+
+    #pingcore-root {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+</head>
+<body>
+  <div id="pingcore-root"></div>
+  <script type="module">
+    import createPingCoreApp from "./@PINGCORE_WEB_MODULE_FILE@";
+
+    const module = await createPingCoreApp({
+      pingcoreStorageKey: "@PINGCORE_WEB_STORAGE_KEY@",
+    });
+    await document.fonts.ready;
+    const session = module.mountPingCore("#pingcore-root");
+    if (!session) {
+      throw new Error("PingCore Web session could not be mounted");
+    }
+  </script>
+</body>
+</html>

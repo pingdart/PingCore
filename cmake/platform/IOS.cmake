@@ -1,0 +1,41 @@
+set(PINGCORE_PLATFORM_SOURCE_FILES
+        "${PINGCORE_PROJECT_DIR}/platform/ios/ios_application.mm"
+        "${PINGCORE_PROJECT_DIR}/platform/ios/ios_external_texture.mm"
+        "${PINGCORE_PROJECT_DIR}/platform/ios/ios_file.mm"
+        "${PINGCORE_PROJECT_DIR}/platform/ios/ios_file_picker.mm"
+        "${PINGCORE_PROJECT_DIR}/platform/ios/ios_file_drop.mm"
+        "${PINGCORE_PROJECT_DIR}/platform/ios/ios_http.mm"
+        "${PINGCORE_PROJECT_DIR}/platform/ios/ios_platform_registry.mm"
+        "${PINGCORE_PROJECT_DIR}/platform/ios/ios_presentation.mm"
+        "${PINGCORE_PROJECT_DIR}/platform/ios/uikit_accessibility.mm"
+        "${PINGCORE_PROJECT_DIR}/platform/ios/uikit_adapter.mm"
+        "${PINGCORE_PROJECT_DIR}/platform/ios/uikit_platform_view.mm"
+        "${PINGCORE_PROJECT_DIR}/platform/ios/uikit_renderer.mm"
+        "${PINGCORE_PROJECT_DIR}/platform/ios/uikit_text_input.mm"
+)
+set(PINGCORE_PLATFORM_COMPILE_OPTIONS
+        -fobjc-arc
+)
+set(PINGCORE_PLATFORM_LINK_LIBRARIES
+        "-framework Contacts"
+        "-framework CoreBluetooth"
+        "-framework CoreFoundation"
+        "-framework CoreGraphics"
+        "-framework CoreImage"
+        "-framework CoreLocation"
+        "-framework CoreText"
+        "-framework CoreVideo"
+        "-framework EventKit"
+        "-framework Foundation"
+        "-framework ImageIO"
+        "-framework Metal"
+        "-framework MetalPerformanceShaders"
+        "-framework MobileCoreServices"
+        "-framework AVFoundation"
+        "-framework BackgroundTasks"
+        "-framework Photos"
+        "-framework QuartzCore"
+        "-framework UIKit"
+        "-framework UserNotifications"
+        "-weak_framework UniformTypeIdentifiers"
+)

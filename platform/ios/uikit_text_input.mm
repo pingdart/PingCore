@@ -1,0 +1,880 @@
+#import "uikit_text_input.h"
+
+#import <UIKit/UIKit.h>
+
+#include <algorithm>
+#include <limits>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+
+#include "text/text_input_internal.h"
+#include "uikit_view.h"
+
+@interface PingCoreTextPosition : UITextPosition {
+  NSInteger pingcoreOffset;
+}
+@property(nonatomic, readonly) NSInteger offset;
++ (instancetype)positionWithOffset:(NSInteger)offset;
+@end
+
+@implementation PingCoreTextPosition
+
++ (instancetype)positionWithOffset:(NSInteger)offset {
+  PingCoreTextPosition* position = [[self alloc] init];
+  position->pingcoreOffset = offset;
+  return position;
+}
+
+- (NSInteger)offset {
+  return pingcoreOffset;
+}
+
+@end
+
+@interface PingCoreTextRange : UITextRange {
+  __strong PingCoreTextPosition* pingcoreStart;
+  __strong PingCoreTextPosition* pingcoreEnd;
+}
+@property(nonatomic, readonly) PingCoreTextPosition* start;
+@property(nonatomic, readonly) PingCoreTextPosition* end;
++ (instancetype)rangeWithStart:(NSInteger)start end:(NSInteger)end;
+@end
+
+@implementation PingCoreTextRange
+
++ (instancetype)rangeWithStart:(NSInteger)start end:(NSInteger)end {
+  PingCoreTextRange* range = [[self alloc] init];
+  range->pingcoreStart = [PingCoreTextPosition positionWithOffset:start];
+  range->pingcoreEnd = [PingCoreTextPosition positionWithOffset:end];
+  return range;
+}
+
+- (PingCoreTextPosition*)start {
+  return pingcoreStart;
+}
+
+- (PingCoreTextPosition*)end {
+  return pingcoreEnd;
+}
+
+- (BOOL)isEmpty {
+  return self.start.offset == self.end.offset;
+}
+
+@end
+
+@interface PingCoreTextInputView : UIView <UITextInput> {
+@public
+  pingcore::detail::UIKitTextInput* pingcoreTextInput;
+  __weak PingCoreView* pingcoreHostView;
+  __weak id<UITextInputDelegate> pingcoreInputDelegate;
+  __strong UITextInputStringTokenizer* pingcoreTokenizer;
+  __strong NSDictionary<NSAttributedStringKey, id>* pingcoreMarkedTextStyle;
+  UITextStorageDirection pingcoreSelectionAffinity;
+}
+- (instancetype)initWithHostView:(PingCoreView*)hostView;
+@end
+
+namespace pingcore::detail {
+namespace {
+
+PingCoreTextPosition* ToPosition(UITextPosition* position) {
+  return [position isKindOfClass:PingCoreTextPosition.class] ? static_cast<PingCoreTextPosition*>(position) : nil;
+}
+
+PingCoreTextRange* ToRange(UITextRange* range) {
+  return [range isKindOfClass:PingCoreTextRange.class] ? static_cast<PingCoreTextRange*>(range) : nil;
+}
+
+std::optional<TextRange> ToTextRange(UITextRange* range) {
+  PingCoreTextRange* value = ToRange(range);
+  if (value == nil || value.start.offset < 0 || value.end.offset < value.start.offset) {
+    return std::nullopt;
+  }
+  return TextRange{value.start.offset, value.end.offset};
+}
+
+PingCoreTextRange* ToUIKitRange(TextRange range) {
+  if (!range.IsValid() || range.end > std::numeric_limits<NSInteger>::max()) {
+    return nil;
+  }
+  return [PingCoreTextRange rangeWithStart:static_cast<NSInteger>(range.start) end:static_cast<NSInteger>(range.end)];
+}
+
+std::optional<std::string> ToUtf8(NSString* value) {
+  if (value == nil) {
+    return std::nullopt;
+  }
+  const char* utf8 = value.UTF8String;
+  return utf8 == nullptr ? std::nullopt : std::optional<std::string>{utf8};
+}
+
+NSString* ToNSString(std::string_view value) {
+  return [[NSString alloc] initWithBytes:value.data() length:value.size() encoding:NSUTF8StringEncoding];
+}
+
+UIKeyboardType KeyboardType(const TextInputConfiguration& configuration) {
+  switch (configuration.type) {
+  case TextInputType::Email:
+    return UIKeyboardTypeEmailAddress;
+  case TextInputType::Number:
+    return UIKeyboardTypeNumberPad;
+  case TextInputType::Decimal:
+    return UIKeyboardTypeDecimalPad;
+  case TextInputType::Phone:
+    return UIKeyboardTypePhonePad;
+  case TextInputType::Url:
+    return UIKeyboardTypeURL;
+  case TextInputType::Text:
+    return UIKeyboardTypeDefault;
+  }
+  return UIKeyboardTypeDefault;
+}
+
+UITextAutocapitalizationType Capitalization(const TextInputConfiguration& configuration) {
+  switch (configuration.capitalization) {
+  case TextCapitalization::Characters:
+    return UITextAutocapitalizationTypeAllCharacters;
+  case TextCapitalization::Words:
+    return UITextAutocapitalizationTypeWords;
+  case TextCapitalization::Sentences:
+    return UITextAutocapitalizationTypeSentences;
+  case TextCapitalization::None:
+    return UITextAutocapitalizationTypeNone;
+  }
+  return UITextAutocapitalizationTypeNone;
+}
+
+UIReturnKeyType ReturnKeyType(const TextInputConfiguration& configuration) {
+  switch (configuration.action) {
+  case TextInputAction::Go:
+    return UIReturnKeyGo;
+  case TextInputAction::Next:
+    return UIReturnKeyNext;
+  case TextInputAction::Search:
+    return UIReturnKeySearch;
+  case TextInputAction::Send:
+    return UIReturnKeySend;
+  case TextInputAction::Default:
+  case TextInputAction::Done:
+    return UIReturnKeyDone;
+  case TextInputAction::Newline:
+    return UIReturnKeyDefault;
+  }
+  return UIReturnKeyDefault;
+}
+
+TextInputAction ResolvedAction(const TextInputConfiguration& configuration) {
+  if (configuration.action != TextInputAction::Default) {
+    return configuration.action;
+  }
+  return configuration.multiline ? TextInputAction::Newline : TextInputAction::Done;
+}
+
+void ApplyCommittedText(
+    UIKitTextInput& text_input, std::string text, std::optional<TextRange> replacement = std::nullopt
+) {
+  const TextInputContext context = text_input.QueryContext();
+  if (context.result_code != TextInputResultCode::Ok) {
+    return;
+  }
+  TextInputCommand command;
+  command.kind = TextInputCommandKind::CommitText;
+  command.text = std::move(text);
+  if (!context.composition.has_value() && replacement.has_value()) {
+    if (replacement->end > context.total_length) {
+      return;
+    }
+    command.target = replacement;
+  }
+  text_input.Apply(std::move(command));
+}
+
+} // namespace
+
+class UIKitTextInputBridge {
+public:
+  UIKitTextInputBridge(UiWindow& ui_window, PingCoreView* host_view, UIKitTextInput& text_input)
+      : ui_window_(&ui_window), input_view_([[PingCoreTextInputView alloc] initWithHostView:host_view]) {
+    input_view_->pingcoreTextInput = &text_input;
+    [host_view.superview addSubview:input_view_];
+  }
+
+  ~UIKitTextInputBridge() {
+    if (input_view_ != nil) {
+      if (input_view_.isFirstResponder) {
+        [input_view_ resignFirstResponder];
+      }
+      input_view_->pingcoreTextInput = nullptr;
+      [input_view_ removeFromSuperview];
+    }
+  }
+
+  bool IsActive() const noexcept {
+    return session_id_ != 0;
+  }
+
+  const TextInputConfiguration& Configuration() const noexcept {
+    return configuration_;
+  }
+
+  TextInputContext QueryContext(TextOffset start, TextOffset length) const {
+    if (!IsActive()) {
+      TextInputContext result;
+      result.result_code = TextInputResultCode::SessionMismatch;
+      return result;
+    }
+    return ui_window_->QueryTextInputContext(session_id_, start, length);
+  }
+
+  TextInputGeometry QueryGeometry(TextRange range) const {
+    if (!IsActive()) {
+      TextInputGeometry result;
+      result.result_code = TextInputResultCode::SessionMismatch;
+      return result;
+    }
+    return ui_window_->QueryTextInputGeometry(session_id_, range);
+  }
+
+  TextInputPositionResult QueryPosition(Point point) const {
+    if (!IsActive()) {
+      TextInputPositionResult result;
+      result.result_code = TextInputResultCode::SessionMismatch;
+      return result;
+    }
+    return ui_window_->QueryTextInputPosition(session_id_, point);
+  }
+
+  id<UITextInput> Responder() const noexcept {
+    return input_view_;
+  }
+
+  TextInputApplyResult Apply(TextInputCommand command) {
+    if (!IsActive()) {
+      return {.result_code = TextInputResultCode::SessionMismatch};
+    }
+    applying_command_ = true;
+    try {
+      TextInputApplyResult result = ui_window_->HandleTextInputCommands({session_id_, {std::move(command)}});
+      applying_command_ = false;
+      return result;
+    } catch (...) {
+      applying_command_ = false;
+      throw;
+    }
+  }
+
+  bool PerformAction(TextInputAction action) {
+    return IsActive() && ui_window_->PerformTextInputAction(session_id_, action);
+  }
+
+  void Start(
+      TextInputSessionId session_id,
+      const TextInputConfiguration& configuration,
+      const TextInputState& state,
+      const TextInputGeometry&
+  ) {
+    session_id_ = session_id;
+    configuration_ = configuration;
+    input_state_ = state;
+  }
+
+  void Update(TextInputSessionId session_id, const TextInputState& state, const TextInputGeometry&) {
+    if (session_id != session_id_) {
+      return;
+    }
+    if (applying_command_) {
+      input_state_ = state;
+      return;
+    }
+    PingCoreTextInputView* view = input_view_;
+    id<UITextInputDelegate> delegate = view == nil ? nil : view->pingcoreInputDelegate;
+    const bool text_changed = state.content_revision != input_state_.content_revision;
+    const bool selection_changed =
+        state.selection != input_state_.selection || state.composition != input_state_.composition;
+    if (text_changed) {
+      [delegate textWillChange:view];
+    }
+    if (selection_changed) {
+      [delegate selectionWillChange:view];
+    }
+    input_state_ = state;
+    if (selection_changed) {
+      [delegate selectionDidChange:view];
+    }
+    if (text_changed) {
+      [delegate textDidChange:view];
+    }
+  }
+
+  void Restart(
+      TextInputSessionId session_id,
+      const TextInputConfiguration& configuration,
+      const TextInputState& state,
+      const TextInputGeometry& geometry
+  ) {
+    if (session_id != session_id_) {
+      return;
+    }
+    configuration_ = configuration;
+    Update(session_id, state, geometry);
+    PingCoreTextInputView* view = input_view_;
+    if (view.isFirstResponder) {
+      [view reloadInputViews];
+    }
+  }
+
+  void Stop(TextInputSessionId session_id) {
+    if (session_id != session_id_) {
+      return;
+    }
+    session_id_ = 0;
+    configuration_ = {};
+    input_state_ = {};
+    PingCoreTextInputView* view = input_view_;
+    if (view != nil && view.isFirstResponder) {
+      [view resignFirstResponder];
+    }
+  }
+
+  void RequestShowKeyboard(TextInputSessionId session_id) {
+    if (session_id == 0 || session_id != session_id_) {
+      return;
+    }
+    PingCoreTextInputView* view = input_view_;
+    if (view != nil) {
+      [view reloadInputViews];
+      [view becomeFirstResponder];
+    }
+  }
+
+  void RequestHideKeyboard(TextInputSessionId session_id) {
+    PingCoreTextInputView* view = input_view_;
+    if (session_id != 0 && session_id == session_id_ && view.isFirstResponder) {
+      [view resignFirstResponder];
+    }
+  }
+
+private:
+  UiWindow* ui_window_ = nullptr;
+  __strong PingCoreTextInputView* input_view_ = nil;
+  TextInputSessionId session_id_ = 0;
+  TextInputConfiguration configuration_;
+  TextInputState input_state_;
+  bool applying_command_ = false;
+};
+
+UIKitTextInput::UIKitTextInput(UiWindow& ui_window, PingCoreView* view)
+    : bridge_(std::make_unique<UIKitTextInputBridge>(ui_window, view, *this)) {}
+
+UIKitTextInput::~UIKitTextInput() = default;
+
+bool UIKitTextInput::IsActive() const noexcept {
+  return bridge_->IsActive();
+}
+
+const TextInputConfiguration& UIKitTextInput::Configuration() const noexcept {
+  return bridge_->Configuration();
+}
+
+TextInputContext UIKitTextInput::QueryContext(TextOffset start, TextOffset length) const {
+  return bridge_->QueryContext(start, length);
+}
+
+TextInputGeometry UIKitTextInput::QueryGeometry(TextRange range) const {
+  return bridge_->QueryGeometry(range);
+}
+
+TextInputPositionResult UIKitTextInput::QueryPosition(Point point) const {
+  return bridge_->QueryPosition(point);
+}
+
+id<UITextInput> UIKitTextInput::Responder() const noexcept {
+  return bridge_->Responder();
+}
+
+TextInputApplyResult UIKitTextInput::Apply(TextInputCommand command) {
+  return bridge_->Apply(std::move(command));
+}
+
+bool UIKitTextInput::PerformAction(TextInputAction action) {
+  return bridge_->PerformAction(action);
+}
+
+void UIKitTextInput::Start(
+    TextInputSessionId session_id,
+    const TextInputConfiguration& configuration,
+    const TextInputState& state,
+    const TextInputGeometry& geometry
+) {
+  bridge_->Start(session_id, configuration, state, geometry);
+}
+
+void UIKitTextInput::Update(
+    TextInputSessionId session_id, const TextInputState& state, const TextInputGeometry& geometry
+) {
+  bridge_->Update(session_id, state, geometry);
+}
+
+void UIKitTextInput::Restart(
+    TextInputSessionId session_id,
+    const TextInputConfiguration& configuration,
+    const TextInputState& state,
+    const TextInputGeometry& geometry
+) {
+  bridge_->Restart(session_id, configuration, state, geometry);
+}
+
+void UIKitTextInput::Stop(TextInputSessionId session_id) {
+  bridge_->Stop(session_id);
+}
+
+void UIKitTextInput::RequestShowKeyboard(TextInputSessionId session_id) {
+  bridge_->RequestShowKeyboard(session_id);
+}
+
+void UIKitTextInput::RequestHideKeyboard(TextInputSessionId session_id) {
+  bridge_->RequestHideKeyboard(session_id);
+}
+
+} // namespace pingcore::detail
+
+@implementation PingCoreTextInputView
+
+- (instancetype)initWithHostView:(PingCoreView*)hostView {
+  self = [super initWithFrame:CGRectZero];
+  if (self == nil) {
+    return nil;
+  }
+  pingcoreHostView = hostView;
+  self.backgroundColor = UIColor.clearColor;
+  self.opaque = NO;
+  self.isAccessibilityElement = NO;
+  return self;
+}
+
+- (BOOL)canBecomeFirstResponder {
+  return YES;
+}
+
+- (UIResponder*)nextResponder {
+  PingCoreView* host_view = pingcoreHostView;
+  return host_view == nil ? [super nextResponder] : host_view;
+}
+
+- (BOOL)hasText {
+  if (pingcoreTextInput == nullptr) {
+    return NO;
+  }
+  const pingcore::TextInputContext context = pingcoreTextInput->QueryContext();
+  return context.result_code == pingcore::TextInputResultCode::Ok && context.total_length > 0;
+}
+
+- (void)insertText:(NSString*)text {
+  if (pingcoreTextInput == nullptr) {
+    return;
+  }
+  const std::optional<std::string> utf8 = pingcore::detail::ToUtf8(text);
+  if (!utf8.has_value()) {
+    return;
+  }
+  const pingcore::TextInputConfiguration& configuration = pingcoreTextInput->Configuration();
+  const pingcore::TextInputAction action = pingcore::detail::ResolvedAction(configuration);
+  if (([text isEqualToString:@"\n"] || [text isEqualToString:@"\r"]) && action != pingcore::TextInputAction::Newline) {
+    pingcoreTextInput->PerformAction(action);
+    return;
+  }
+  pingcore::detail::ApplyCommittedText(*pingcoreTextInput, *utf8);
+}
+
+- (void)deleteBackward {
+  if (pingcoreTextInput == nullptr) {
+    return;
+  }
+  const pingcore::TextInputContext context = pingcoreTextInput->QueryContext();
+  if (context.result_code != pingcore::TextInputResultCode::Ok) {
+    return;
+  }
+  const pingcore::TextRange selection = context.selection.Range();
+  if (!selection.IsCollapsed()) {
+    pingcore::detail::ApplyCommittedText(*pingcoreTextInput, {}, selection);
+    return;
+  }
+  pingcore::TextInputCommand command;
+  command.kind = pingcore::TextInputCommandKind::DeleteSurrounding;
+  command.delete_before = 1;
+  command.delete_unit = pingcore::TextInputUnit::UnicodeCodePoint;
+  pingcoreTextInput->Apply(std::move(command));
+}
+
+- (NSString*)textInRange:(UITextRange*)range {
+  if (pingcoreTextInput == nullptr || pingcoreTextInput->Configuration().secure) {
+    return nil;
+  }
+  const std::optional<pingcore::TextRange> requested = pingcore::detail::ToTextRange(range);
+  if (!requested.has_value()) {
+    return nil;
+  }
+  const pingcore::TextInputContext context = pingcoreTextInput->QueryContext(requested->start, requested->Length());
+  if (context.result_code != pingcore::TextInputResultCode::Ok) {
+    return nil;
+  }
+  const std::optional<pingcore::TextOffset> slice_length = pingcore::detail::Utf16Length(context.text);
+  if (!slice_length.has_value()) {
+    return nil;
+  }
+  const pingcore::TextRange available{
+      context.slice_start,
+      context.slice_start + *slice_length,
+  };
+  if (requested->start < available.start || requested->end > available.end || requested->end > context.total_length) {
+    return nil;
+  }
+  const std::optional<std::string> result = pingcore::detail::Utf8TextInRange(
+      context.text,
+      {
+          requested->start - context.slice_start,
+          requested->end - context.slice_start,
+      }
+  );
+  return result.has_value() ? pingcore::detail::ToNSString(*result) : nil;
+}
+
+- (void)replaceRange:(UITextRange*)range withText:(NSString*)text {
+  if (pingcoreTextInput == nullptr) {
+    return;
+  }
+  const std::optional<pingcore::TextRange> target = pingcore::detail::ToTextRange(range);
+  const std::optional<std::string> utf8 = pingcore::detail::ToUtf8(text);
+  if (!target.has_value() || !utf8.has_value()) {
+    return;
+  }
+  pingcore::detail::ApplyCommittedText(*pingcoreTextInput, *utf8, target);
+}
+
+- (UITextRange*)selectedTextRange {
+  if (pingcoreTextInput == nullptr) {
+    return nil;
+  }
+  const pingcore::TextInputContext context = pingcoreTextInput->QueryContext();
+  return context.result_code == pingcore::TextInputResultCode::Ok
+             ? pingcore::detail::ToUIKitRange(context.selection.Range())
+             : nil;
+}
+
+- (void)setSelectedTextRange:(UITextRange*)selectedTextRange {
+  if (pingcoreTextInput == nullptr) {
+    return;
+  }
+  const std::optional<pingcore::TextRange> range = pingcore::detail::ToTextRange(selectedTextRange);
+  if (!range.has_value()) {
+    return;
+  }
+  pingcore::TextInputCommand command;
+  command.kind = pingcore::TextInputCommandKind::SetSelection;
+  command.selection_after = pingcore::TextSelection{range->start, range->end};
+  pingcoreTextInput->Apply(std::move(command));
+}
+
+- (UITextRange*)markedTextRange {
+  if (pingcoreTextInput == nullptr) {
+    return nil;
+  }
+  const pingcore::TextInputContext context = pingcoreTextInput->QueryContext();
+  return context.result_code == pingcore::TextInputResultCode::Ok && context.composition.has_value()
+             ? pingcore::detail::ToUIKitRange(*context.composition)
+             : nil;
+}
+
+- (NSDictionary<NSAttributedStringKey, id>*)markedTextStyle {
+  return pingcoreMarkedTextStyle;
+}
+
+- (void)setMarkedTextStyle:(NSDictionary<NSAttributedStringKey, id>*)markedTextStyle {
+  pingcoreMarkedTextStyle = [markedTextStyle copy];
+}
+
+- (void)setMarkedText:(NSString*)markedText selectedRange:(NSRange)selectedRange {
+  if (pingcoreTextInput == nullptr || markedText == nil || selectedRange.location == NSNotFound) {
+    return;
+  }
+  const std::optional<std::string> utf8 = pingcore::detail::ToUtf8(markedText);
+  const pingcore::TextInputContext context = pingcoreTextInput->QueryContext();
+  if (!utf8.has_value() || context.result_code != pingcore::TextInputResultCode::Ok ||
+      selectedRange.location > markedText.length || selectedRange.length > markedText.length - selectedRange.location) {
+    return;
+  }
+  pingcore::TextOffset insertion_start = context.selection.Range().start;
+  if (context.composition.has_value()) {
+    insertion_start = context.composition->start;
+  }
+  pingcore::TextInputCommand command;
+  command.kind = pingcore::TextInputCommandKind::UpdateComposition;
+  command.text = *utf8;
+  if (!context.composition.has_value()) {
+    command.target = context.selection.Range();
+  }
+  command.selection_after = pingcore::TextSelection{
+      insertion_start + static_cast<pingcore::TextOffset>(selectedRange.location),
+      insertion_start + static_cast<pingcore::TextOffset>(NSMaxRange(selectedRange)),
+  };
+  pingcoreTextInput->Apply(std::move(command));
+}
+
+- (void)unmarkText {
+  if (pingcoreTextInput == nullptr) {
+    return;
+  }
+  pingcore::TextInputCommand command;
+  command.kind = pingcore::TextInputCommandKind::FinishComposition;
+  pingcoreTextInput->Apply(std::move(command));
+}
+
+- (UITextPosition*)beginningOfDocument {
+  return [PingCoreTextPosition positionWithOffset:0];
+}
+
+- (UITextPosition*)endOfDocument {
+  if (pingcoreTextInput == nullptr) {
+    return [PingCoreTextPosition positionWithOffset:0];
+  }
+  const pingcore::TextInputContext context = pingcoreTextInput->QueryContext();
+  const pingcore::TextOffset end =
+      std::clamp<pingcore::TextOffset>(context.total_length, 0, std::numeric_limits<NSInteger>::max());
+  return [PingCoreTextPosition positionWithOffset:static_cast<NSInteger>(end)];
+}
+
+- (UITextRange*)textRangeFromPosition:(UITextPosition*)fromPosition toPosition:(UITextPosition*)toPosition {
+  PingCoreTextPosition* from = pingcore::detail::ToPosition(fromPosition);
+  PingCoreTextPosition* to = pingcore::detail::ToPosition(toPosition);
+  return from == nil || to == nil
+             ? nil
+             : [PingCoreTextRange rangeWithStart:std::min(from.offset, to.offset) end:std::max(from.offset, to.offset)];
+}
+
+- (UITextPosition*)positionFromPosition:(UITextPosition*)position offset:(NSInteger)offset {
+  PingCoreTextPosition* value = pingcore::detail::ToPosition(position);
+  if (value == nil || pingcoreTextInput == nullptr) {
+    return nil;
+  }
+  const pingcore::TextInputContext context = pingcoreTextInput->QueryContext();
+  const NSInteger end = static_cast<NSInteger>(
+      std::clamp<pingcore::TextOffset>(context.total_length, 0, std::numeric_limits<NSInteger>::max())
+  );
+  if (value.offset < 0 || value.offset > end || offset < -value.offset || offset > end - value.offset) {
+    return nil;
+  }
+  return [PingCoreTextPosition positionWithOffset:value.offset + offset];
+}
+
+- (UITextPosition*)positionFromPosition:(UITextPosition*)position
+                            inDirection:(UITextLayoutDirection)direction
+                                 offset:(NSInteger)offset {
+  if ((direction == UITextLayoutDirectionLeft || direction == UITextLayoutDirectionUp) &&
+      offset == std::numeric_limits<NSInteger>::min()) {
+    return nil;
+  }
+  const NSInteger signed_offset =
+      direction == UITextLayoutDirectionLeft || direction == UITextLayoutDirectionUp ? -offset : offset;
+  return [self positionFromPosition:position offset:signed_offset];
+}
+
+- (NSComparisonResult)comparePosition:(UITextPosition*)position toPosition:(UITextPosition*)other {
+  PingCoreTextPosition* left = pingcore::detail::ToPosition(position);
+  PingCoreTextPosition* right = pingcore::detail::ToPosition(other);
+  if (left == nil || right == nil) {
+    return NSOrderedSame;
+  }
+  if (left.offset < right.offset) {
+    return NSOrderedAscending;
+  }
+  if (left.offset > right.offset) {
+    return NSOrderedDescending;
+  }
+  return NSOrderedSame;
+}
+
+- (NSInteger)offsetFromPosition:(UITextPosition*)from toPosition:(UITextPosition*)toPosition {
+  PingCoreTextPosition* left = pingcore::detail::ToPosition(from);
+  PingCoreTextPosition* right = pingcore::detail::ToPosition(toPosition);
+  return left == nil || right == nil ? 0 : right.offset - left.offset;
+}
+
+- (id<UITextInputDelegate>)inputDelegate {
+  return pingcoreInputDelegate;
+}
+
+- (void)setInputDelegate:(id<UITextInputDelegate>)inputDelegate {
+  pingcoreInputDelegate = inputDelegate;
+}
+
+- (id<UITextInputTokenizer>)tokenizer {
+  if (pingcoreTokenizer == nil) {
+    pingcoreTokenizer = [[UITextInputStringTokenizer alloc] initWithTextInput:self];
+  }
+  return pingcoreTokenizer;
+}
+
+- (UITextPosition*)positionWithinRange:(UITextRange*)range farthestInDirection:(UITextLayoutDirection)direction {
+  PingCoreTextRange* value = pingcore::detail::ToRange(range);
+  if (value == nil) {
+    return nil;
+  }
+  return direction == UITextLayoutDirectionLeft || direction == UITextLayoutDirectionUp ? value.start : value.end;
+}
+
+- (UITextRange*)characterRangeByExtendingPosition:(UITextPosition*)position
+                                      inDirection:(UITextLayoutDirection)direction {
+  PingCoreTextPosition* value = pingcore::detail::ToPosition(position);
+  if (value == nil) {
+    return nil;
+  }
+  UITextPosition* other = [self positionFromPosition:position inDirection:direction offset:1];
+  PingCoreTextPosition* endpoint = pingcore::detail::ToPosition(other);
+  if (endpoint == nil) {
+    return nil;
+  }
+  return [PingCoreTextRange rangeWithStart:std::min(value.offset, endpoint.offset)
+                                      end:std::max(value.offset, endpoint.offset)];
+}
+
+- (NSWritingDirection)baseWritingDirectionForPosition:(UITextPosition*)position
+                                          inDirection:(UITextStorageDirection)direction {
+  return NSWritingDirectionNatural;
+}
+
+- (void)setBaseWritingDirection:(NSWritingDirection)writingDirection forRange:(UITextRange*)range {}
+
+- (CGRect)firstRectForRange:(UITextRange*)range {
+  if (pingcoreTextInput == nullptr) {
+    return CGRectZero;
+  }
+  const std::optional<pingcore::TextRange> requested = pingcore::detail::ToTextRange(range);
+  if (!requested.has_value()) {
+    return CGRectZero;
+  }
+  const pingcore::TextInputGeometry geometry = pingcoreTextInput->QueryGeometry(*requested);
+  if (geometry.result_code != pingcore::TextInputResultCode::Ok) {
+    return CGRectZero;
+  }
+  const pingcore::Rect rect = geometry.range_rects.empty() ? geometry.caret : geometry.range_rects.front();
+  return CGRectMake(rect.x, rect.y, rect.width, rect.height);
+}
+
+- (CGRect)caretRectForPosition:(UITextPosition*)position {
+  if (pingcoreTextInput == nullptr) {
+    return CGRectZero;
+  }
+  PingCoreTextPosition* value = pingcore::detail::ToPosition(position);
+  if (value == nil) {
+    return CGRectZero;
+  }
+  const pingcore::TextInputGeometry geometry = pingcoreTextInput->QueryGeometry({value.offset, value.offset});
+  return geometry.result_code == pingcore::TextInputResultCode::Ok
+             ? CGRectMake(geometry.caret.x, geometry.caret.y, geometry.caret.width, geometry.caret.height)
+             : CGRectZero;
+}
+
+- (NSArray<UITextSelectionRect*>*)selectionRectsForRange:(UITextRange*)range {
+  return @[];
+}
+
+- (UITextPosition*)closestPositionToPoint:(CGPoint)point {
+  if (pingcoreTextInput == nullptr) {
+    return nil;
+  }
+  const pingcore::TextInputPositionResult result =
+      pingcoreTextInput->QueryPosition({static_cast<float>(point.x), static_cast<float>(point.y)});
+  return result.result_code == pingcore::TextInputResultCode::Ok
+             ? [PingCoreTextPosition positionWithOffset:static_cast<NSInteger>(result.position.offset)]
+             : nil;
+}
+
+- (UITextPosition*)closestPositionToPoint:(CGPoint)point withinRange:(UITextRange*)range {
+  PingCoreTextPosition* position = static_cast<PingCoreTextPosition*>([self closestPositionToPoint:point]);
+  PingCoreTextRange* limit = pingcore::detail::ToRange(range);
+  if (position == nil || limit == nil) {
+    return nil;
+  }
+  return [PingCoreTextPosition positionWithOffset:std::clamp(position.offset, limit.start.offset, limit.end.offset)];
+}
+
+- (UITextRange*)characterRangeAtPoint:(CGPoint)point {
+  PingCoreTextPosition* position = static_cast<PingCoreTextPosition*>([self closestPositionToPoint:point]);
+  if (position == nil) {
+    return nil;
+  }
+  UITextPosition* end = [self positionFromPosition:position offset:1];
+  PingCoreTextPosition* end_position = pingcore::detail::ToPosition(end);
+  return [PingCoreTextRange rangeWithStart:position.offset
+                                      end:end_position == nil ? position.offset : end_position.offset];
+}
+
+- (UIView*)textInputView {
+  return pingcoreHostView;
+}
+
+- (UITextStorageDirection)selectionAffinity {
+  return pingcoreSelectionAffinity;
+}
+
+- (void)setSelectionAffinity:(UITextStorageDirection)selectionAffinity {
+  pingcoreSelectionAffinity = selectionAffinity;
+}
+
+- (UITextAutocapitalizationType)autocapitalizationType {
+  return pingcoreTextInput == nullptr ? UITextAutocapitalizationTypeNone
+                                     : pingcore::detail::Capitalization(pingcoreTextInput->Configuration());
+}
+
+- (UITextAutocorrectionType)autocorrectionType {
+  return pingcoreTextInput != nullptr && pingcoreTextInput->Configuration().autocorrect ? UITextAutocorrectionTypeYes
+                                                                                      : UITextAutocorrectionTypeNo;
+}
+
+- (UITextSpellCheckingType)spellCheckingType {
+  return [self autocorrectionType] == UITextAutocorrectionTypeYes ? UITextSpellCheckingTypeYes
+                                                                  : UITextSpellCheckingTypeNo;
+}
+
+- (UIKeyboardType)keyboardType {
+  return pingcoreTextInput == nullptr ? UIKeyboardTypeDefault
+                                     : pingcore::detail::KeyboardType(pingcoreTextInput->Configuration());
+}
+
+- (UIKeyboardAppearance)keyboardAppearance {
+  return UIKeyboardAppearanceDefault;
+}
+
+- (UIReturnKeyType)returnKeyType {
+  return pingcoreTextInput == nullptr ? UIReturnKeyDefault
+                                     : pingcore::detail::ReturnKeyType(pingcoreTextInput->Configuration());
+}
+
+- (BOOL)enablesReturnKeyAutomatically {
+  return NO;
+}
+
+- (BOOL)isSecureTextEntry {
+  return pingcoreTextInput != nullptr && pingcoreTextInput->Configuration().secure;
+}
+
+- (void)setAutocapitalizationType:(UITextAutocapitalizationType)value {}
+
+- (void)setAutocorrectionType:(UITextAutocorrectionType)value {}
+
+- (void)setSpellCheckingType:(UITextSpellCheckingType)value {}
+
+- (void)setKeyboardType:(UIKeyboardType)value {}
+
+- (void)setKeyboardAppearance:(UIKeyboardAppearance)value {}
+
+- (void)setReturnKeyType:(UIReturnKeyType)value {}
+
+- (void)setEnablesReturnKeyAutomatically:(BOOL)value {}
+
+- (void)setSecureTextEntry:(BOOL)value {}
+
+@end

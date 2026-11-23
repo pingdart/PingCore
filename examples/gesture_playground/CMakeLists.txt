@@ -1,4 +1,0 @@
-# examples/gesture_playground/CMakeLists.txt
-add_executable(example_gesture_playground main.cpp)
-target_include_directories(example_gesture_playground PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_compile_features(example_gesture_playground PRIVATE cxx_std_20)

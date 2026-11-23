@@ -1,0 +1,76 @@
+plugins {
+    alias(libs.plugins.android.library)
+}
+
+def pingcoreDefaults = new Properties()
+file("../gradle.properties").withInputStream { pingcoreDefaults.load(it) }
+def pingcoreProperty = { String name ->
+    providers.gradleProperty(name).orElse(pingcoreDefaults.getProperty(name)).get()
+}
+def pingcoreCompileSdk = pingcoreProperty("pingcoreCompileSdk").toInteger()
+def pingcoreMinCompileSdk = pingcoreProperty("pingcoreMinCompileSdk").toInteger()
+def pingcoreMinSdk = pingcoreProperty("pingcoreMinSdk").toInteger()
+def pingcoreNdkVersion = pingcoreProperty("pingcoreNdkVersion")
+def pingcoreAbis = pingcoreProperty("pingcoreAbis").split(",")
+def pingcoreStl = pingcoreProperty("pingcoreStl")
+def pingcoreBuildNative = pingcoreProperty("pingcoreBuildNative").toBoolean()
+
+android {
+    namespace = "org.pingcore"
+    compileSdk = pingcoreCompileSdk
+
+    defaultConfig {
+        minSdk = pingcoreMinSdk
+        consumerProguardFiles "consumer-rules.pro"
+        testInstrumentationRunner "org.pingcore.PingCoreRuntimeTest"
+
+        aarMetadata {
+            minCompileSdk = pingcoreMinCompileSdk
+        }
+
+        if (pingcoreBuildNative) {
+            externalNativeBuild {
+                cmake {
+                    targets "pingcore"
+                    arguments "-DANDROID_STL=${pingcoreStl}",
+                            "-DPINGCORE_BUILD_TESTING_LIBRARY=OFF",
+                            "-DPINGCORE_BUILD_TESTING_SMOKE_TESTS=OFF",
+                            "-DPINGCORE_ENABLE_PROFILING=OFF",
+                            "-DPINGCORE_BUILD_SHARED=ON",
+                            "-DPINGCORE_BUILD_STATIC=OFF",
+                            "-DPINGCORE_BUILD_TESTS=OFF",
+                            "-DPINGCORE_BUILD_EXAMPLES=OFF"
+                }
+            }
+
+            ndk {
+                abiFilters(*pingcoreAbis)
+            }
+        }
+    }
+
+    sourceSets {
+        androidTest.java.srcDir "../../../tests/platform/android/instrumentation"
+        androidTest.manifest.srcFile "../../../tests/platform/android/instrumentation/AndroidManifest.xml"
+    }
+
+    testOptions {
+        targetSdk = pingcoreProperty("pingcoreTargetSdk").toInteger()
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_1_8
+        targetCompatibility = JavaVersion.VERSION_1_8
+    }
+
+    if (pingcoreBuildNative) {
+        ndkVersion = pingcoreNdkVersion
+
+        externalNativeBuild {
+            cmake {
+                path = file("../../../CMakeLists.txt")
+            }
+        }
+
+    }
+}

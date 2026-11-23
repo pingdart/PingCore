@@ -1,0 +1,334 @@
+foreach (required_variable IN ITEMS SOURCE_DIRECTORY WORK_DIRECTORY HOST_GENERATOR)
+    if (NOT DEFINED ${required_variable})
+        message(FATAL_ERROR "${required_variable} is required")
+    endif ()
+endforeach ()
+
+string(RANDOM LENGTH 12 ALPHABET 0123456789abcdef TEST_NONCE)
+set(TEST_ROOT "${WORK_DIRECTORY}/pingcore-library-validation-${TEST_NONCE}")
+
+function(expect_library_configure_failure case_name invocation expected_error)
+    set(PROJECT_ROOT "${TEST_ROOT}/${case_name}-source")
+    set(BUILD_ROOT "${TEST_ROOT}/${case_name}-build")
+    file(MAKE_DIRECTORY "${PROJECT_ROOT}")
+    file(WRITE "${PROJECT_ROOT}/main.cpp" "int main() { return 0; }\n")
+    file(WRITE "${PROJECT_ROOT}/CMakeLists.txt"
+            "cmake_minimum_required(VERSION 3.20)\n"
+            "project(${case_name} LANGUAGES CXX)\n"
+            "include(\"${SOURCE_DIRECTORY}/cmake/PingCoreLibraries.cmake\")\n"
+            "add_executable(library_app main.cpp)\n"
+            "${invocation}\n"
+    )
+    execute_process(
+            COMMAND "${CMAKE_COMMAND}"
+                    -S "${PROJECT_ROOT}"
+                    -B "${BUILD_ROOT}"
+                    -G "${HOST_GENERATOR}"
+            RESULT_VARIABLE CONFIGURE_RESULT
+            OUTPUT_VARIABLE CONFIGURE_OUTPUT
+            ERROR_VARIABLE CONFIGURE_ERROR
+    )
+    if (CONFIGURE_RESULT EQUAL 0)
+        message(FATAL_ERROR "${case_name} unexpectedly configured")
+    endif ()
+    if (NOT "${CONFIGURE_OUTPUT}${CONFIGURE_ERROR}" MATCHES "${expected_error}")
+        message(FATAL_ERROR
+                "${case_name} failed for an unexpected reason:\n${CONFIGURE_OUTPUT}${CONFIGURE_ERROR}"
+        )
+    endif ()
+endfunction()
+
+expect_library_configure_failure(
+        library_path_and_url
+        "pingcore_use_library(library_app TARGET CameraKit::CameraKit PATH camera URL https://example.com/camera.git)"
+        "PATH and URL are mutually exclusive"
+)
+expect_library_configure_failure(
+        library_insecure_url
+        "pingcore_use_library(library_app TARGET CameraKit::CameraKit URL http://example.com/camera.git COMMIT 0123456789abcdef0123456789abcdef01234567)"
+        "URL must use HTTPS"
+)
+expect_library_configure_failure(
+        library_missing_checkout
+        "pingcore_use_library(library_app TARGET CameraKit::CameraKit URL https://example.com/camera.git)"
+        "URL requires COMMIT or TAG"
+)
+expect_library_configure_failure(
+        library_short_commit
+        "pingcore_use_library(library_app TARGET CameraKit::CameraKit URL https://example.com/camera.git COMMIT 0123456789abcdef)"
+        "COMMIT must be a full commit SHA"
+)
+expect_library_configure_failure(
+        library_commit_and_tag
+        "pingcore_use_library(library_app TARGET CameraKit::CameraKit URL https://example.com/camera.git COMMIT 0123456789abcdef0123456789abcdef01234567 TAG v1.2.3)"
+        "COMMIT and TAG are mutually exclusive"
+)
+expect_library_configure_failure(
+        library_commit_without_url
+        "pingcore_use_library(library_app TARGET CameraKit::CameraKit COMMIT 0123456789abcdef0123456789abcdef01234567)"
+        "COMMIT requires URL"
+)
+expect_library_configure_failure(
+        library_tag_without_url
+        "pingcore_use_library(library_app TARGET CameraKit::CameraKit TAG v1.2.3)"
+        "TAG requires URL"
+)
+expect_library_configure_failure(
+        library_qualified_tag
+        "pingcore_use_library(library_app TARGET CameraKit::CameraKit URL https://example.com/camera.git TAG refs/tags/v1.2.3)"
+        "TAG must not include the refs/tags/ prefix"
+)
+expect_library_configure_failure(
+        android_missing_framework
+        "set(ANDROID TRUE)\n_pingcore_select_framework_target(framework_target)"
+        "PingCore Android integration requires the static component"
+)
+
+set(ANDROID_STATIC_PROJECT_ROOT "${TEST_ROOT}/android-static-source")
+set(ANDROID_STATIC_BUILD_ROOT "${TEST_ROOT}/android-static-build")
+file(MAKE_DIRECTORY "${ANDROID_STATIC_PROJECT_ROOT}")
+file(WRITE "${ANDROID_STATIC_PROJECT_ROOT}/CMakeLists.txt"
+        "cmake_minimum_required(VERSION 3.20)\n"
+        "project(android_static_framework LANGUAGES NONE)\n"
+        "set(ANDROID TRUE)\n"
+        "include(\"${SOURCE_DIRECTORY}/cmake/PingCoreLibraries.cmake\")\n"
+        "add_library(PingCore::pingcore INTERFACE IMPORTED)\n"
+        "add_library(PingCore::pingcore_static INTERFACE IMPORTED)\n"
+        "_pingcore_select_framework_target(framework_target)\n"
+        "if (NOT framework_target STREQUAL \"PingCore::pingcore_static\")\n"
+        "    message(FATAL_ERROR \"Android static framework target was not selected\")\n"
+        "endif ()\n"
+)
+execute_process(
+        COMMAND "${CMAKE_COMMAND}"
+                -S "${ANDROID_STATIC_PROJECT_ROOT}"
+                -B "${ANDROID_STATIC_BUILD_ROOT}"
+                -G "${HOST_GENERATOR}"
+        RESULT_VARIABLE ANDROID_STATIC_CONFIGURE_RESULT
+        OUTPUT_VARIABLE ANDROID_STATIC_CONFIGURE_OUTPUT
+        ERROR_VARIABLE ANDROID_STATIC_CONFIGURE_ERROR
+)
+if (NOT ANDROID_STATIC_CONFIGURE_RESULT EQUAL 0)
+    message(FATAL_ERROR
+            "Android static framework target configure failed:\n${ANDROID_STATIC_CONFIGURE_OUTPUT}${ANDROID_STATIC_CONFIGURE_ERROR}"
+    )
+endif ()
+
+set(PREEXISTING_LIBRARY_ROOT "${TEST_ROOT}/preexisting-library")
+file(MAKE_DIRECTORY "${PREEXISTING_LIBRARY_ROOT}")
+file(WRITE "${PREEXISTING_LIBRARY_ROOT}/CMakeLists.txt" "add_library(unused INTERFACE)\n")
+expect_library_configure_failure(
+        library_ambiguous_existing_target
+        "add_library(existing_library INTERFACE)\nset_property(TARGET existing_library PROPERTY PINGCORE_LIBRARY TRUE)\npingcore_use_library(library_app TARGET existing_library PATH \"${PREEXISTING_LIBRARY_ROOT}\")"
+        "TARGET already exists without a matching acquisition"
+)
+
+set(REMOTE_LIBRARY_URL "https://github.com/example/pingcore-test-library.git")
+set(REMOTE_LIBRARY_COMMIT "0123456789abcdef0123456789abcdef01234567")
+set(REMOTE_LIBRARY_ROOT "${TEST_ROOT}/remote-library")
+set(TAGGED_LIBRARY_URL "https://github.com/example/pingcore-tagged-library.git")
+set(TAGGED_LIBRARY_TAG "0")
+set(TAGGED_LIBRARY_ROOT "${TEST_ROOT}/tagged-library")
+set(REMOTE_PROJECT_ROOT "${TEST_ROOT}/remote-source")
+set(REMOTE_BUILD_ROOT "${TEST_ROOT}/remote-build")
+file(MAKE_DIRECTORY
+        "${REMOTE_LIBRARY_ROOT}"
+        "${TAGGED_LIBRARY_ROOT}"
+        "${REMOTE_PROJECT_ROOT}"
+)
+file(WRITE "${REMOTE_LIBRARY_ROOT}/CMakeLists.txt"
+        "add_library(pingcore_remote_library INTERFACE)\n"
+        "set_property(TARGET pingcore_remote_library PROPERTY PINGCORE_LIBRARY TRUE)\n"
+        "add_library(RemoteLibrary::RemoteLibrary ALIAS pingcore_remote_library)\n"
+)
+file(WRITE "${TAGGED_LIBRARY_ROOT}/CMakeLists.txt"
+        "add_library(pingcore_tagged_library INTERFACE)\n"
+        "set_property(TARGET pingcore_tagged_library PROPERTY PINGCORE_LIBRARY TRUE)\n"
+        "add_library(TaggedLibrary::TaggedLibrary ALIAS pingcore_tagged_library)\n"
+)
+file(WRITE "${REMOTE_PROJECT_ROOT}/main.cpp" "int main() { return 0; }\n")
+string(SHA256 REMOTE_LIBRARY_HASH
+        "URL:${REMOTE_LIBRARY_URL}@COMMIT:${REMOTE_LIBRARY_COMMIT}"
+)
+string(SUBSTRING "${REMOTE_LIBRARY_HASH}" 0 16 REMOTE_LIBRARY_HASH)
+string(TOUPPER
+        "pingcore_library_${REMOTE_LIBRARY_HASH}"
+        REMOTE_LIBRARY_FETCH_NAME
+)
+string(SHA256 TAGGED_LIBRARY_HASH
+        "URL:${TAGGED_LIBRARY_URL}@TAG:${TAGGED_LIBRARY_TAG}"
+)
+string(SUBSTRING "${TAGGED_LIBRARY_HASH}" 0 16 TAGGED_LIBRARY_HASH)
+string(TOUPPER
+        "pingcore_library_${TAGGED_LIBRARY_HASH}"
+        TAGGED_LIBRARY_FETCH_NAME
+)
+file(WRITE "${REMOTE_PROJECT_ROOT}/CMakeLists.txt"
+        "cmake_minimum_required(VERSION 3.20)\n"
+        "project(remote_library LANGUAGES CXX)\n"
+        "set(CMAKE_DISABLE_FIND_PACKAGE_Git TRUE)\n"
+        "set(FETCHCONTENT_SOURCE_DIR_${REMOTE_LIBRARY_FETCH_NAME} \"${REMOTE_LIBRARY_ROOT}\" CACHE PATH \"\" FORCE)\n"
+        "set(FETCHCONTENT_SOURCE_DIR_${TAGGED_LIBRARY_FETCH_NAME} \"${TAGGED_LIBRARY_ROOT}\" CACHE PATH \"\" FORCE)\n"
+        "include(\"${SOURCE_DIRECTORY}/cmake/PingCoreLibraries.cmake\")\n"
+        "add_executable(library_app main.cpp)\n"
+        "pingcore_use_library(library_app\n"
+        "        TARGET RemoteLibrary::RemoteLibrary\n"
+        "        URL \"${REMOTE_LIBRARY_URL}\"\n"
+        "        COMMIT \"${REMOTE_LIBRARY_COMMIT}\"\n"
+        ")\n"
+        "pingcore_use_library(library_app\n"
+        "        TARGET TaggedLibrary::TaggedLibrary\n"
+        "        URL \"${TAGGED_LIBRARY_URL}\"\n"
+        "        TAG \"${TAGGED_LIBRARY_TAG}\"\n"
+        ")\n"
+)
+execute_process(
+        COMMAND "${CMAKE_COMMAND}"
+                -S "${REMOTE_PROJECT_ROOT}"
+                -B "${REMOTE_BUILD_ROOT}"
+                -G "${HOST_GENERATOR}"
+        RESULT_VARIABLE REMOTE_CONFIGURE_RESULT
+        OUTPUT_VARIABLE REMOTE_CONFIGURE_OUTPUT
+        ERROR_VARIABLE REMOTE_CONFIGURE_ERROR
+)
+if (NOT REMOTE_CONFIGURE_RESULT EQUAL 0)
+    message(FATAL_ERROR
+            "HTTPS library target configure failed:\n${REMOTE_CONFIGURE_OUTPUT}${REMOTE_CONFIGURE_ERROR}"
+    )
+endif ()
+
+set(PREDECLARED_PROJECT_ROOT "${TEST_ROOT}/predeclared-source")
+set(PREDECLARED_BUILD_ROOT "${TEST_ROOT}/predeclared-build")
+file(MAKE_DIRECTORY "${PREDECLARED_PROJECT_ROOT}/consumer")
+file(WRITE "${PREDECLARED_PROJECT_ROOT}/main.cpp" "int main() { return 0; }\n")
+file(WRITE "${PREDECLARED_PROJECT_ROOT}/consumer/CMakeLists.txt"
+        "add_library(library_consumer STATIC ../main.cpp)\n"
+)
+file(WRITE "${PREDECLARED_PROJECT_ROOT}/CMakeLists.txt"
+        "cmake_minimum_required(VERSION 3.20)\n"
+        "project(predeclared_library LANGUAGES CXX)\n"
+        "include(\"${SOURCE_DIRECTORY}/cmake/PingCoreLibraries.cmake\")\n"
+        "add_executable(library_app main.cpp)\n"
+        "add_library(PredeclaredLibrary::PredeclaredLibrary INTERFACE IMPORTED)\n"
+        "set_property(TARGET PredeclaredLibrary::PredeclaredLibrary PROPERTY PINGCORE_LIBRARY TRUE)\n"
+        "pingcore_use_library(library_app TARGET PredeclaredLibrary::PredeclaredLibrary)\n"
+        "add_subdirectory(consumer)\n"
+        "pingcore_use_library(library_consumer TARGET PredeclaredLibrary::PredeclaredLibrary)\n"
+)
+execute_process(
+        COMMAND "${CMAKE_COMMAND}"
+                -S "${PREDECLARED_PROJECT_ROOT}"
+                -B "${PREDECLARED_BUILD_ROOT}"
+                -G "${HOST_GENERATOR}"
+        RESULT_VARIABLE PREDECLARED_CONFIGURE_RESULT
+        OUTPUT_VARIABLE PREDECLARED_CONFIGURE_OUTPUT
+        ERROR_VARIABLE PREDECLARED_CONFIGURE_ERROR
+)
+if (NOT PREDECLARED_CONFIGURE_RESULT EQUAL 0)
+    message(FATAL_ERROR
+            "Predeclared library target configure failed:\n${PREDECLARED_CONFIGURE_OUTPUT}${PREDECLARED_CONFIGURE_ERROR}"
+    )
+endif ()
+
+set(LIBRARY_GRAPH_PROJECT_ROOT "${TEST_ROOT}/library-graph-source")
+set(LIBRARY_GRAPH_BUILD_ROOT "${TEST_ROOT}/library-graph-build")
+set(LIBRARY_GRAPH_FIRST_ROOT "${TEST_ROOT}/library-graph-first")
+set(LIBRARY_GRAPH_SECOND_ROOT "${TEST_ROOT}/library-graph-second")
+set(LIBRARY_GRAPH_THIRD_ROOT "${TEST_ROOT}/library-graph-third")
+set(LIBRARY_GRAPH_OUTPUT "${TEST_ROOT}/library-graph.json")
+file(MAKE_DIRECTORY
+        "${LIBRARY_GRAPH_PROJECT_ROOT}"
+        "${LIBRARY_GRAPH_FIRST_ROOT}"
+        "${LIBRARY_GRAPH_SECOND_ROOT}"
+        "${LIBRARY_GRAPH_THIRD_ROOT}"
+)
+file(WRITE "${LIBRARY_GRAPH_PROJECT_ROOT}/main.cpp" "int main() { return 0; }\n")
+file(WRITE "${LIBRARY_GRAPH_FIRST_ROOT}/CMakeLists.txt"
+        "pingcore_add_library(first_library SOURCES first.cpp)\n"
+        "add_library(FirstLibrary::FirstLibrary ALIAS first_library)\n"
+        "pingcore_use_library(first_library PUBLIC TARGET ThirdLibrary::ThirdLibrary PATH \"${LIBRARY_GRAPH_THIRD_ROOT}\")\n"
+)
+file(WRITE "${LIBRARY_GRAPH_SECOND_ROOT}/CMakeLists.txt"
+        "pingcore_add_library(second_library SOURCES second.cpp)\n"
+        "add_library(SecondLibrary::SecondLibrary ALIAS second_library)\n"
+        "pingcore_use_library(second_library TARGET FirstLibrary::FirstLibrary PATH \"${LIBRARY_GRAPH_FIRST_ROOT}\")\n"
+)
+file(WRITE "${LIBRARY_GRAPH_THIRD_ROOT}/CMakeLists.txt"
+        "pingcore_add_library(third_library SOURCES third.cpp)\n"
+        "add_library(ThirdLibrary::ThirdLibrary ALIAS third_library)\n"
+        "if (LIBRARY_GRAPH_CYCLE)\n"
+        "    pingcore_use_library(third_library TARGET SecondLibrary::SecondLibrary)\n"
+        "endif ()\n"
+)
+file(WRITE "${LIBRARY_GRAPH_PROJECT_ROOT}/CMakeLists.txt"
+        "cmake_minimum_required(VERSION 3.20)\n"
+        "project(library_graph LANGUAGES NONE)\n"
+        "include(\"${SOURCE_DIRECTORY}/cmake/PingCoreLibraries.cmake\")\n"
+        "include(\"${SOURCE_DIRECTORY}/cmake/PingCoreApp.cmake\")\n"
+        "set(PINGCORE_LIBRARY_GRAPH_ONLY ON)\n"
+        "set(PINGCORE_LIBRARY_GRAPH_OUTPUT \"${LIBRARY_GRAPH_OUTPUT}\")\n"
+        "pingcore_add_app(library_app SOURCES main.cpp)\n"
+        "add_library(predeclared_library INTERFACE)\n"
+        "set_property(TARGET predeclared_library PROPERTY PINGCORE_LIBRARY TRUE)\n"
+        "pingcore_use_library(library_app TARGET SecondLibrary::SecondLibrary PATH \"${LIBRARY_GRAPH_SECOND_ROOT}\")\n"
+        "pingcore_use_library(library_app TARGET predeclared_library)\n"
+        "pingcore_use_library(library_app TARGET first_library)\n"
+        "foreach (library IN ITEMS first_library second_library third_library)\n"
+        "    get_target_property(binary_dir \${library} BINARY_DIR)\n"
+        "    get_filename_component(parent_dir \"\${binary_dir}\" DIRECTORY)\n"
+        "    if (NOT parent_dir STREQUAL \"\${CMAKE_BINARY_DIR}/pingcore-libs\")\n"
+        "        message(FATAL_ERROR \"Unexpected library build directory: \${binary_dir}\")\n"
+        "    endif ()\n"
+        "endforeach ()\n"
+)
+execute_process(
+        COMMAND "${CMAKE_COMMAND}"
+                -S "${LIBRARY_GRAPH_PROJECT_ROOT}"
+                -B "${LIBRARY_GRAPH_BUILD_ROOT}"
+                -G "${HOST_GENERATOR}"
+        RESULT_VARIABLE LIBRARY_GRAPH_CONFIGURE_RESULT
+        OUTPUT_VARIABLE LIBRARY_GRAPH_CONFIGURE_OUTPUT
+        ERROR_VARIABLE LIBRARY_GRAPH_CONFIGURE_ERROR
+)
+if (NOT LIBRARY_GRAPH_CONFIGURE_RESULT EQUAL 0)
+    message(FATAL_ERROR
+            "Library graph configure failed:\n${LIBRARY_GRAPH_CONFIGURE_OUTPUT}${LIBRARY_GRAPH_CONFIGURE_ERROR}"
+    )
+endif ()
+file(REAL_PATH "${LIBRARY_GRAPH_FIRST_ROOT}" LIBRARY_GRAPH_FIRST_ROOT)
+file(REAL_PATH "${LIBRARY_GRAPH_SECOND_ROOT}" LIBRARY_GRAPH_SECOND_ROOT)
+file(REAL_PATH "${LIBRARY_GRAPH_THIRD_ROOT}" LIBRARY_GRAPH_THIRD_ROOT)
+file(READ "${LIBRARY_GRAPH_OUTPUT}" LIBRARY_GRAPH_JSON)
+string(JSON LIBRARY_GRAPH_COUNT LENGTH "${LIBRARY_GRAPH_JSON}" libraries)
+string(JSON LIBRARY_GRAPH_FIRST_TARGET GET "${LIBRARY_GRAPH_JSON}" libraries 0 target)
+string(JSON LIBRARY_GRAPH_FIRST_SOURCE_ROOT GET "${LIBRARY_GRAPH_JSON}" libraries 0 sourceRoot)
+string(JSON LIBRARY_GRAPH_SECOND_TARGET GET "${LIBRARY_GRAPH_JSON}" libraries 1 target)
+string(JSON LIBRARY_GRAPH_SECOND_SOURCE_ROOT GET "${LIBRARY_GRAPH_JSON}" libraries 1 sourceRoot)
+string(JSON LIBRARY_GRAPH_THIRD_TARGET GET "${LIBRARY_GRAPH_JSON}" libraries 2 target)
+string(JSON LIBRARY_GRAPH_THIRD_SOURCE_ROOT GET "${LIBRARY_GRAPH_JSON}" libraries 2 sourceRoot)
+if (NOT LIBRARY_GRAPH_COUNT EQUAL 3
+        OR NOT LIBRARY_GRAPH_FIRST_TARGET STREQUAL "SecondLibrary::SecondLibrary"
+        OR NOT LIBRARY_GRAPH_FIRST_SOURCE_ROOT STREQUAL "${LIBRARY_GRAPH_SECOND_ROOT}"
+        OR NOT LIBRARY_GRAPH_SECOND_TARGET STREQUAL "FirstLibrary::FirstLibrary"
+        OR NOT LIBRARY_GRAPH_SECOND_SOURCE_ROOT STREQUAL "${LIBRARY_GRAPH_FIRST_ROOT}"
+        OR NOT LIBRARY_GRAPH_THIRD_TARGET STREQUAL "ThirdLibrary::ThirdLibrary"
+        OR NOT LIBRARY_GRAPH_THIRD_SOURCE_ROOT STREQUAL "${LIBRARY_GRAPH_THIRD_ROOT}")
+    message(FATAL_ERROR "Library graph does not preserve library order and source roots")
+endif ()
+
+execute_process(
+        COMMAND "${CMAKE_COMMAND}"
+                -S "${LIBRARY_GRAPH_PROJECT_ROOT}"
+                -B "${LIBRARY_GRAPH_BUILD_ROOT}"
+                -DLIBRARY_GRAPH_CYCLE=ON
+        RESULT_VARIABLE LIBRARY_GRAPH_CYCLE_RESULT
+        OUTPUT_VARIABLE LIBRARY_GRAPH_CYCLE_OUTPUT
+        ERROR_VARIABLE LIBRARY_GRAPH_CYCLE_ERROR
+)
+if (LIBRARY_GRAPH_CYCLE_RESULT EQUAL 0 OR NOT LIBRARY_GRAPH_CYCLE_ERROR MATCHES "PingCore library dependency cycle")
+    message(FATAL_ERROR
+            "Library graph cycle did not produce the expected diagnostic:\n${LIBRARY_GRAPH_CYCLE_OUTPUT}${LIBRARY_GRAPH_CYCLE_ERROR}"
+    )
+endif ()
+
+file(REMOVE_RECURSE "${TEST_ROOT}")

@@ -1,0 +1,668 @@
+#include <pingcore/window.h>
+
+#include <algorithm>
+#include <cmath>
+#include <memory>
+#include <stdexcept>
+
+#include <pingcore/modifier.h>
+
+#include "pingcore_builtin_resources.h"
+#include "runtime/ui_window_internal.h"
+#include "window_internal.h"
+#include "application_internal.h"
+#include "internal_access.h"
+
+namespace pingcore {
+
+namespace detail {
+
+class WindowControlsLayout final : public pingcore::Layout<WindowControlsLayout> {
+public:
+  using Layout::Layout;
+
+  static LayoutResult Measure(LayoutContext& context, pingcore::ViewNode& node, Constraints constraints) {
+    const WindowTitleBarMetrics* metrics = context.TitleBarMetrics();
+    if (metrics == nullptr || metrics->right_inset <= 0.0F || metrics->height <= 0.0F) {
+      LayoutResult result;
+      for (pingcore::ViewNode& child : node.Children()) {
+        context.Measure(child, {0.0F, 0.0F, 0.0F, 0.0F});
+        result.Place(child, {});
+      }
+      return result.SetSize(constraints.Constrain({constraints.max_width, constraints.max_height}));
+    }
+    if (node.ChildCount() != 3) {
+      throw std::logic_error("PingCore window controls require minimize, maximize, and close children");
+    }
+
+    const float width = std::min(metrics->right_inset, constraints.max_width);
+    const float height = std::min(metrics->height, constraints.max_height);
+    const float button_width = width / 3.0F;
+    const float left = std::max(0.0F, constraints.max_width - width);
+    LayoutResult result;
+    for (std::size_t index = 0; index < node.ChildCount(); ++index) {
+      pingcore::ViewNode& child = node.ChildAt(index);
+      context.Measure(child, {button_width, button_width, height, height});
+      result.Place(child, {left + button_width * static_cast<float>(index), 0.0F});
+    }
+    return result.SetSize(constraints.Constrain({constraints.max_width, constraints.max_height}));
+  }
+};
+
+namespace {
+
+auto ShortcutKey(Key key, KeyModifiers modifiers) {
+  return std::tuple{key, modifiers.shift, modifiers.control, modifiers.alt, modifiers.meta};
+}
+
+StringVariant WindowCommandLabel(const WindowCaptionLabels& labels, WindowCommand command, bool maximized) {
+  switch (command) {
+  case WindowCommand::Minimize:
+    return detail::IsEmptyStringVariantLiteral(labels.minimize) ? StringVariant(strings::window_minimize)
+                                                                : labels.minimize;
+  case WindowCommand::Maximize:
+    return strings::window_maximize;
+  case WindowCommand::Restore:
+    return strings::window_restore;
+  case WindowCommand::ToggleMaximize:
+    if (!detail::IsEmptyStringVariantLiteral(labels.toggle_maximize)) {
+      return labels.toggle_maximize;
+    }
+    return maximized ? StringVariant(strings::window_restore) : StringVariant(strings::window_maximize);
+  case WindowCommand::Close:
+    return detail::IsEmptyStringVariantLiteral(labels.close) ? StringVariant(strings::window_close) : labels.close;
+  case WindowCommand::Show:
+  case WindowCommand::Hide:
+  case WindowCommand::Activate:
+    break;
+  }
+  return {};
+}
+
+View WindowControl(
+    WindowCommand command,
+    const std::shared_ptr<WindowService>& service,
+    const std::shared_ptr<WindowState>& window,
+    const WindowCaptionLabels& labels
+) {
+  const bool maximized = window->metrics.title_bar.has_value() && window->metrics.title_bar->maximized;
+  View glyph = Canvas([command, window](PaintContext& context, Size size) {
+    if (size.width <= 0.0F || size.height <= 0.0F) {
+      return;
+    }
+    const Point center{size.width * 0.5F, size.height * 0.5F};
+    Path path;
+    switch (command) {
+    case WindowCommand::Minimize:
+      path.MoveTo({center.x - 5.0F, center.y + 3.0F}).LineTo({center.x + 5.0F, center.y + 3.0F});
+      break;
+    case WindowCommand::Maximize:
+    case WindowCommand::Restore:
+    case WindowCommand::ToggleMaximize: {
+      const bool maximized = window->metrics.title_bar.has_value() && window->metrics.title_bar->maximized;
+      if (command == WindowCommand::Restore || (command == WindowCommand::ToggleMaximize && maximized)) {
+        path.MoveTo({center.x - 3.0F, center.y - 5.0F})
+            .LineTo({center.x + 5.0F, center.y - 5.0F})
+            .LineTo({center.x + 5.0F, center.y + 3.0F})
+            .MoveTo({center.x - 5.0F, center.y - 3.0F})
+            .LineTo({center.x + 3.0F, center.y - 3.0F})
+            .LineTo({center.x + 3.0F, center.y + 5.0F})
+            .LineTo({center.x - 5.0F, center.y + 5.0F})
+            .Close();
+      } else {
+        path.MoveTo({center.x - 5.0F, center.y - 5.0F})
+            .LineTo({center.x + 5.0F, center.y - 5.0F})
+            .LineTo({center.x + 5.0F, center.y + 5.0F})
+            .LineTo({center.x - 5.0F, center.y + 5.0F})
+            .Close();
+      }
+      break;
+    }
+    case WindowCommand::Close:
+      path.MoveTo({center.x - 5.0F, center.y - 5.0F})
+          .LineTo({center.x + 5.0F, center.y + 5.0F})
+          .MoveTo({center.x + 5.0F, center.y - 5.0F})
+          .LineTo({center.x - 5.0F, center.y + 5.0F});
+      break;
+    case WindowCommand::Show:
+    case WindowCommand::Hide:
+    case WindowCommand::Activate:
+      break;
+    }
+    context.StrokePath(std::move(path), window->caption_foreground, StrokeStyle{.width = 1.0F});
+  });
+  const bool close = command == WindowCommand::Close;
+  const Color hover = close ? Color::Rgb(196, 43, 28, 0.9F) : Color::Rgb(0, 0, 0, 0.08F);
+  const Color press = close ? Color::Rgb(196, 43, 28, 0.9F) : Color::Rgb(0, 0, 0, 0.16F);
+  View interaction_surface = Stack {}.With(
+      Indication{
+          .hover = IndicationLayer{.fill = hover},
+          .press = IndicationLayer{.fill = press},
+      },
+      Semantics{.role = SemanticRole::Button, .label = WindowCommandLabel(labels, command, maximized)}
+  );
+  interaction_surface = std::move(interaction_surface).OnClick([service, command] { service->Request(command); });
+  return Stack {
+    std::move(interaction_surface),
+    std::move(glyph),
+  }.With(Align(HorizontalAlignment::Stretch, VerticalAlignment::Stretch));
+}
+
+} // namespace
+
+View MakeWindowControls(
+    const std::shared_ptr<WindowService>& service,
+    const std::shared_ptr<WindowState>& window,
+    std::shared_ptr<const Environment> environment,
+    bool visible
+) {
+  Composer composer(nullptr, std::move(environment));
+  Composer::Guard guard(composer);
+  return WindowControlsLayout {
+    WindowControl(WindowCommand::Minimize, service, window, window->caption_labels),
+    WindowControl(WindowCommand::ToggleMaximize, service, window, window->caption_labels)
+        .With(Enabled(window->resizable)),
+    WindowControl(WindowCommand::Close, service, window, window->caption_labels),
+  }.With(Enabled(visible), Semantics{.hidden = !visible});
+}
+
+bool IsWindowControlsNode(const MountedNode& node) noexcept {
+  return node.layout_descriptor != nullptr && node.layout_descriptor->type == typeid(WindowControlsLayout);
+}
+
+bool IsValidSystemBarsAppearance(const SystemBarsAppearance& appearance) noexcept {
+  const auto finite = [](const Color& color) {
+    return std::isfinite(color.red) && std::isfinite(color.green) && std::isfinite(color.blue) &&
+           std::isfinite(color.alpha);
+  };
+  const auto valid_brightness = [](SystemBarContentBrightness brightness) {
+    return brightness == SystemBarContentBrightness::Automatic || brightness == SystemBarContentBrightness::Light ||
+           brightness == SystemBarContentBrightness::Dark;
+  };
+  return finite(appearance.status_bar_background) && finite(appearance.navigation_bar_background) &&
+         valid_brightness(appearance.status_bar_content) && valid_brightness(appearance.navigation_bar_content);
+}
+
+void ValidateWindowOptions(const WindowOptions& window_options) {
+  if (!std::isfinite(window_options.initial_size.width) || window_options.initial_size.width <= 0.0F ||
+      !std::isfinite(window_options.initial_size.height) || window_options.initial_size.height <= 0.0F) {
+    throw std::invalid_argument("PingCore initial window size must be finite and positive");
+  }
+  if (window_options.minimum_size.has_value() &&
+      (!std::isfinite(window_options.minimum_size->width) || window_options.minimum_size->width <= 0.0F ||
+       !std::isfinite(window_options.minimum_size->height) || window_options.minimum_size->height <= 0.0F)) {
+    throw std::invalid_argument("PingCore minimum window size must be finite and positive");
+  }
+  if (window_options.content_mode != WindowContentMode::SafeArea &&
+      window_options.content_mode != WindowContentMode::EdgeToEdge) {
+    throw std::invalid_argument("PingCore window content mode is invalid");
+  }
+  if (window_options.chrome_mode != WindowChromeMode::System &&
+      window_options.chrome_mode != WindowChromeMode::Custom && window_options.chrome_mode != WindowChromeMode::None) {
+    throw std::invalid_argument("PingCore window chrome mode is invalid");
+  }
+  if (!std::isfinite(window_options.title_bar_height) || window_options.title_bar_height <= 0.0F) {
+    throw std::invalid_argument("PingCore window title-bar height must be finite and positive");
+  }
+}
+
+void ValidateWindowSupport(const WindowOptions& options, const WindowCapabilities& support) {
+  if (options.transparent_background && !support.transparent_background) {
+    throw std::runtime_error("PingCore host does not support transparent window backgrounds");
+  }
+  if (options.always_on_top && !support.always_on_top) {
+    throw std::runtime_error("PingCore host does not support always-on-top windows");
+  }
+  if (!options.activatable && !support.non_activating) {
+    throw std::runtime_error("PingCore host does not support non-activating windows");
+  }
+  if (options.pointer_pass_through && !support.pointer_pass_through) {
+    throw std::runtime_error("PingCore host does not support window pointer pass-through");
+  }
+}
+
+WindowService::WindowService(UiWindow& ui_window)
+    : ui_window_(&ui_window), application_(CurrentApplicationRuntime()) {}
+
+WindowService::WindowService(std::function<void(WindowCommand)> session_command)
+    : application_(CurrentApplicationRuntime()), session_command_(std::move(session_command)) {}
+
+WindowHandle WindowService::Handle() {
+  return WindowHandle{shared_from_this()};
+}
+
+void WindowService::Attach(UiWindow& ui_window) {
+  if (ui_window_ || !session_command_) {
+    throw std::logic_error("PingCore window requires a live session without a UI attachment");
+  }
+  ui_window_ = &ui_window;
+}
+
+void WindowService::Disconnect() noexcept {
+  if (!ui_window_) return;
+  if (session_command_) {
+    lifecycle_state_ = WindowLifecycleState::Background;
+  } else {
+    BeginClose();
+  }
+  ui_window_ = nullptr;
+  ClearHandlers();
+}
+
+void WindowService::EndSession() noexcept {
+  if (ui_window_) ui_window_->state_->closing_ = true;
+  session_command_ = {};
+  BeginClose();
+}
+
+UiWindow* WindowService::AttachedWindow(const WindowHandle& window) {
+  const auto& service = window.service_;
+  const auto application = service ? service->application_.lock() : nullptr;
+  if (!application) return nullptr;
+  application->RequireThread();
+  if (application->phase != ApplicationRuntimeState::Phase::Running) return nullptr;
+  auto* attachment = service->ui_window_;
+  return attachment && attachment->IsInitialized() ? attachment : nullptr;
+}
+
+bool WindowService::IsOpen() const {
+  const auto application = application_.lock();
+  if (!application || application->phase == ApplicationRuntimeState::Phase::Stopped) return false;
+  application->RequireThread();
+  return open_.Get();
+}
+
+bool WindowService::IsFullscreen() const {
+  return IsOpen() && fullscreen_.Get();
+}
+
+void WindowService::Open() {
+  open_ = true;
+}
+
+void WindowService::BeginClose() {
+  open_ = false;
+}
+
+WindowLifecycleState WindowService::LifecycleState() const {
+  return lifecycle_state_.Get();
+}
+
+void WindowService::UpdateLifecycleState(WindowLifecycleState state) {
+  if (state != WindowLifecycleState::Active && state != WindowLifecycleState::Inactive &&
+      state != WindowLifecycleState::Background) {
+    throw std::invalid_argument("PingCore window lifecycle state is invalid");
+  }
+  if (!ui_window_ || lifecycle_state_.Get() == state) return;
+  lifecycle_state_ = state;
+  if (lifecycle_handlers_.empty()) return;
+  std::vector<std::uint64_t> recipients;
+  for (const auto& [identity, handler] : lifecycle_handlers_) {
+    recipients.push_back(identity);
+  }
+  const std::weak_ptr<WindowService> weak = weak_from_this();
+  if (const auto application = application_.lock()) {
+    application->Post([weak, state, recipients = std::move(recipients)] {
+      if (const auto service = weak.lock(); service && service->ui_window_) {
+        for (const auto identity : recipients) {
+          if (const auto found = service->lifecycle_handlers_.find(identity);
+              found != service->lifecycle_handlers_.end()) {
+            auto handler = found->second;
+            handler(state);
+          }
+        }
+      }
+    });
+  }
+}
+
+std::function<void()> WindowService::ConnectLifecycle(std::function<void(WindowLifecycleState)> handler) {
+  if (!handler) throw std::invalid_argument("PingCore window lifecycle handler must not be empty");
+  if (!ui_window_) throw std::logic_error("PingCore window is disconnected");
+  const auto identity = next_connection_++;
+  lifecycle_handlers_.emplace(identity,
+      [source = CurrentExecutionContext(), handler = std::move(handler)](WindowLifecycleState state) {
+        ExecutionGuard guard(source);
+        handler(state);
+      });
+  const std::weak_ptr<WindowService> weak = weak_from_this();
+  return [weak, identity] {
+    if (const auto service = weak.lock()) service->lifecycle_handlers_.erase(identity);
+  };
+}
+
+void WindowService::Request(WindowCommand command) {
+  if (!ui_window_ && !session_command_) return;
+  const auto application = application_.lock();
+  if (!application) return;
+  application->RequireThread();
+  if (application->window_installations) {
+    throw std::logic_error("PingCore window commands are unavailable during window installation");
+  }
+  if (!IsOpen()) return;
+  ExecutionGuard guard(ui_window_ ? InternalAccess::WindowExecution(*ui_window_) : application->execution);
+  if ((command == WindowCommand::Minimize || command == WindowCommand::Close) && HandleRequest(command)) return;
+  if (!IsOpen()) return;
+  if (session_command_ && (command == WindowCommand::Close || command == WindowCommand::Activate)) {
+    auto request = session_command_;
+    request(command);
+    return;
+  }
+  if (!ui_window_) return;
+  if (command == WindowCommand::Activate && !ui_window_->state_->window_->activatable) command = WindowCommand::Show;
+  ui_window_->RequestWindowCommand(command);
+}
+
+bool WindowService::SetAlwaysOnTop(bool enabled) {
+  if (!ui_window_ || !IsOpen()) return false;
+  ExecutionGuard guard(InternalAccess::WindowExecution(*ui_window_));
+  return ui_window_->SetWindowAlwaysOnTop(enabled);
+}
+
+bool WindowService::SetPointerPassThrough(bool enabled) {
+  if (!ui_window_ || !IsOpen()) return false;
+  ExecutionGuard guard(InternalAccess::WindowExecution(*ui_window_));
+  return ui_window_->SetWindowPointerPassThrough(enabled);
+}
+
+void WindowService::RequestKeyboard(bool show) {
+  if (!ui_window_) return;
+  const auto application = application_.lock();
+  if (!application) return;
+  application->RequireThread();
+  if (!IsOpen()) return;
+  ExecutionGuard guard(InternalAccess::WindowExecution(*ui_window_));
+  ui_window_->RequestKeyboard(show);
+}
+
+void WindowService::RequestFullscreen(bool fullscreen) {
+  if (!ui_window_ || !IsOpen()) return;
+  ExecutionGuard guard(InternalAccess::WindowExecution(*ui_window_));
+  ui_window_->RequestFullscreen(fullscreen);
+}
+
+void WindowService::UpdateFullscreen(bool fullscreen) {
+  fullscreen_ = fullscreen;
+}
+
+bool WindowService::HandleShortcut(const KeyEvent& event) {
+  if (event.type != KeyEventType::Down || event.repeat || shortcuts_.empty()) return false;
+  const auto found = shortcuts_.find(ShortcutKey(event.key, event.modifiers));
+  if (found == shortcuts_.end()) return false;
+  // The callback can unmount its own binding during dispatch.
+  const auto handler = found->second;
+  return (*handler)();
+}
+
+std::function<void()> WindowService::ConnectShortcut(Key key, KeyModifiers modifiers, std::function<bool()> handler) {
+  if (!ui_window_ || !IsOpen() || CurrentUiWindow() != ui_window_) {
+    throw std::logic_error("PingCore window shortcuts require a composition in the target window");
+  }
+  const auto shortcut = ShortcutKey(key, modifiers);
+  auto binding = std::make_shared<std::function<bool()>>(
+      [source = CurrentExecutionContext(), handler = std::move(handler)] {
+        ExecutionGuard guard(source);
+        return handler();
+      }
+  );
+  std::function<void()> disconnect = [weak = weak_from_this(), shortcut, original = std::weak_ptr{binding}] {
+    if (const auto service = weak.lock()) {
+      const auto found = service->shortcuts_.find(shortcut);
+      if (found != service->shortcuts_.end() && found->second == original.lock()) {
+        service->shortcuts_.erase(found);
+      }
+    }
+  };
+  if (!shortcuts_.try_emplace(shortcut, std::move(binding)).second) {
+    throw std::logic_error("PingCore window shortcut is already bound");
+  }
+  return disconnect;
+}
+
+bool WindowService::HandleRequest(WindowCommand command) {
+  if (!IsOpen()) return true;
+  RequestHandler& request = Handler(command);
+  bool& handling_request = command == WindowCommand::Minimize ? handling_minimize_request_ : handling_close_request_;
+  if (handling_request) return true;
+  auto handler = request.handler;
+  if (!handler) return false;
+  handling_request = true;
+  try {
+    const bool handled = handler();
+    handling_request = false;
+    return handled || !IsOpen();
+  } catch (...) {
+    handling_request = false;
+    throw;
+  }
+}
+
+std::function<void()>
+WindowService::ConnectRequest(WindowCommand command, std::function<bool()> handler) {
+  if (!handler) {
+    throw std::invalid_argument("PingCore window request handler must not be empty");
+  }
+  RequestHandler& request = Handler(command);
+  if (request.handler) {
+    throw std::logic_error("PingCore window request handler is already connected");
+  }
+  request.connection = next_connection_++;
+  request.handler = [source = CurrentExecutionContext(), handler = std::move(handler)] {
+    ExecutionGuard guard(source);
+    return handler();
+  };
+  const std::uint64_t connection = request.connection;
+  std::weak_ptr<WindowService> service = weak_from_this();
+  return [service, command, connection] {
+    if (const auto active = service.lock()) {
+      active->DisconnectRequest(command, connection);
+    }
+  };
+}
+
+WindowService::RequestHandler& WindowService::Handler(WindowCommand command) {
+  switch (command) {
+  case WindowCommand::Minimize:
+    return minimize_handler_;
+  case WindowCommand::Close:
+    return close_handler_;
+  default:
+    throw std::invalid_argument("PingCore window request command is not interceptable");
+  }
+}
+
+void WindowService::DisconnectRequest(WindowCommand command, std::uint64_t connection) noexcept {
+  RequestHandler* request = nullptr;
+  if (command == WindowCommand::Minimize) {
+    request = &minimize_handler_;
+  } else if (command == WindowCommand::Close) {
+    request = &close_handler_;
+  }
+  if (request == nullptr || request->connection != connection) {
+    return;
+  }
+  request->handler = {};
+  request->connection = 0;
+}
+
+void WindowService::ClearHandlers() noexcept {
+  minimize_handler_ = {};
+  close_handler_ = {};
+  shortcuts_.clear();
+  lifecycle_handlers_.clear();
+}
+
+} // namespace detail
+
+namespace {
+
+void ApplySystemBarsAppearance(detail::ViewSpec& spec, const SystemBarsAppearance& appearance) {
+  if (!detail::IsValidSystemBarsAppearance(appearance)) {
+    throw std::invalid_argument("PingCore system bars appearance is invalid");
+  }
+  spec.properties.system_bars_appearance = appearance;
+}
+
+void ApplySafeAreaPadding(detail::ViewSpec& spec, const SafeAreaPadding& padding) {
+  spec.properties.safe_area_padding = padding;
+}
+
+void ApplyWindowDragRegion(detail::ViewSpec& spec, const WindowDragRegion&) {
+  spec.properties.window_drag_region = true;
+}
+
+template <class Modifier, void (*Apply)(detail::ViewSpec&, const Modifier&)>
+const detail::ModifierDescriptor& ApplyOnlyModifierDescriptor() {
+  static const detail::ModifierDescriptor descriptor{
+      [](detail::ViewSpec& spec,
+         detail::ModifierSpec& modifier,
+         const std::shared_ptr<const Environment>&,
+         detail::AppResources&) {
+        Apply(spec, *static_cast<const Modifier*>(modifier.value.get()));
+      },
+      nullptr,
+      nullptr,
+      false,
+      detail::ErasedEqualsFor<Modifier>(),
+      nullptr,
+  };
+  return descriptor;
+}
+
+} // namespace
+
+SystemBarsAppearance SystemBarsAppearance::Default() {
+  return {};
+}
+
+const detail::ModifierDescriptor& SystemBarsAppearance::Descriptor() {
+  return ApplyOnlyModifierDescriptor<SystemBarsAppearance, ApplySystemBarsAppearance>();
+}
+
+const detail::ModifierDescriptor& SafeAreaPadding::Descriptor() {
+  return ApplyOnlyModifierDescriptor<SafeAreaPadding, ApplySafeAreaPadding>();
+}
+
+const detail::ModifierDescriptor& WindowDragRegion::Descriptor() {
+  return ApplyOnlyModifierDescriptor<WindowDragRegion, ApplyWindowDragRegion>();
+}
+
+LayoutResult WindowTitleBar::Measure(LayoutContext& context, ViewNode& node, Constraints constraints) {
+  const WindowTitleBarMetrics* metrics = context.TitleBarMetrics();
+  const auto& internal_node = static_cast<const detail::MountedNode&>(node);
+  const float requested_left = metrics == nullptr ? 0.0F : metrics->left_inset;
+  const float requested_right = metrics == nullptr ? 0.0F : metrics->right_inset;
+  const float maximum_width = constraints.max_width;
+  const float left = std::isfinite(maximum_width) ? std::min(requested_left, maximum_width) : requested_left;
+  const float right =
+      std::isfinite(maximum_width) ? std::min(requested_right, std::max(0.0F, maximum_width - left)) : requested_right;
+  const float reserved_width = left + right;
+
+  Constraints content_constraints{
+      std::max(0.0F, constraints.min_width - reserved_width),
+      std::isfinite(maximum_width) ? std::max(0.0F, maximum_width - reserved_width) : maximum_width,
+      std::max(
+          constraints.min_height,
+          metrics == nullptr ? 0.0F : std::max(0.0F, metrics->height - internal_node.resolved_padding.Vertical())
+      ),
+      constraints.max_height,
+  };
+  if (content_constraints.min_height > content_constraints.max_height) {
+    content_constraints.min_height = content_constraints.max_height;
+  }
+  if (std::isfinite(content_constraints.max_width)) {
+    content_constraints.min_width = content_constraints.max_width;
+  }
+
+  const LayoutResult content = Row::Measure(context, node, content_constraints);
+  LayoutResult result;
+  for (const LayoutResult::Placement& placement : content.Placements()) {
+    result.Place(*placement.child, {placement.offset.x + left, placement.offset.y});
+  }
+  result.SetSize(constraints.Constrain({content.MeasuredSize().width + reserved_width, content.MeasuredSize().height}));
+  return result;
+}
+
+bool WindowHandle::IsOpen() const {
+  return service_->IsOpen();
+}
+
+bool WindowHandle::IsFullscreen() const {
+  return service_->IsFullscreen();
+}
+
+WindowLifecycleState WindowHandle::LifecycleState() const {
+  return service_->LifecycleState();
+}
+
+void WindowHandle::Show() const {
+  service_->Request(WindowCommand::Show);
+}
+
+void WindowHandle::Hide() const {
+  service_->Request(WindowCommand::Hide);
+}
+
+void WindowHandle::ShowKeyboard() const {
+  service_->RequestKeyboard(true);
+}
+
+void WindowHandle::HideKeyboard() const {
+  service_->RequestKeyboard(false);
+}
+
+void WindowHandle::Activate() const {
+  service_->Request(WindowCommand::Activate);
+}
+
+bool WindowHandle::SetAlwaysOnTop(bool enabled) const {
+  return service_->SetAlwaysOnTop(enabled);
+}
+
+bool WindowHandle::SetPointerPassThrough(bool enabled) const {
+  return service_->SetPointerPassThrough(enabled);
+}
+
+void WindowHandle::Minimize() const {
+  service_->Request(WindowCommand::Minimize);
+}
+
+void WindowHandle::Maximize() const {
+  service_->Request(WindowCommand::Maximize);
+}
+
+void WindowHandle::Restore() const {
+  service_->Request(WindowCommand::Restore);
+}
+
+void WindowHandle::ToggleMaximize() const {
+  service_->Request(WindowCommand::ToggleMaximize);
+}
+
+void WindowHandle::SetFullscreen(bool fullscreen) const {
+  service_->RequestFullscreen(fullscreen);
+}
+
+void WindowHandle::Close() const {
+  service_->Request(WindowCommand::Close);
+}
+
+std::function<void()>
+WindowHandle::ConnectRequest(WindowCommand command, std::function<bool()> handler) const {
+  return service_->ConnectRequest(command, std::move(handler));
+}
+
+std::function<void()> WindowHandle::ConnectLifecycle(std::function<void(WindowLifecycleState)> handler) const {
+  return service_->ConnectLifecycle(std::move(handler));
+}
+
+std::function<void()>
+WindowHandle::ConnectShortcut(Key key, KeyModifiers modifiers, std::function<bool()> handler) const {
+  return service_->ConnectShortcut(key, modifiers, std::move(handler));
+}
+
+WindowHandle UseWindow() {
+  return UseService<detail::WindowService>()->Handle();
+}
+
+} // namespace pingcore

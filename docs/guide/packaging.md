@@ -1,0 +1,363 @@
+# Packaging Applications
+
+`pingcore package` builds an enabled platform and publishes its distributable output under `dist/<platform>`.
+Packaging uses the `release` configuration by default. Choose a target supported by the current build host.
+
+```bash
+pingcore package windows
+pingcore package macos
+pingcore package linux
+```
+
+Packaging uses the same application target and platform shell as `build`. Intermediate files stay under `.pingcore/package`. The CLI replaces a platform's published directory only after the new artifacts are complete.
+
+## Artifacts and prerequisites
+
+| Target | Published output |
+| --- | --- |
+| Windows | Burn setup executable containing the application MSI and the PingCore installer interface |
+| macOS | DMG containing the application bundle and an Applications link |
+| Linux | AppImage, DEB, or RPM |
+| Android | APK |
+| iOS | Built application bundle |
+| Web | Deployment files |
+
+Check packaging prerequisites with `pingcore doctor <platform> --operation package`. Windows builds an x64 installer and restores verified WiX v5 dependencies during `package`. WiX needs `Microsoft.NETCore.App` 6.0 or newer on that build host. macOS uses the system `otool`, `install_name_tool`, `lipo`, `codesign`, and `hdiutil`.
+
+## mcpp projects
+
+For a project built with mcpp, `pingcore package <platform>` runs `mcpp pack` with the platform's format and publishes the result under `dist/<platform>` the same way.
+The official `mcpp:plugins` members write the packages, and mcpp installs each member's tool only when a package asks for it, so no packaging tool is needed on the machine.
+
+| Platform | Default | Other formats with `mcpp pack --pkg-format` |
+| --- | --- | --- |
+| Linux | AppImage (`--format deb` and `--format rpm` select the others) | `deb`, `rpm` |
+| Windows | Burn setup executable chaining the application MSI | `msi` |
+| macOS | DMG containing the application bundle | `app` |
+| Web | the page with the module, its WebAssembly, and the preloaded resources | |
+| Android | APK signed with the debug key | `aab` |
+| iOS | application bundle for the simulator | |
+
+The application states its identity in `mcpp.toml`, which `pingcore create` writes:
+
+```toml
+[package.metadata.pingcore]
+name = "My App"
+id   = "com.example.myapp"
+```
+
+Android, iOS, and macOS packages need `id`; the Windows upgrade code is derived from it as the CMake path derives it.
+DEB and RPM take their maintainer from the first `[package] authors` entry; set `.package.maintainer` and `.package.depends` in `pingcore::rules::configure()` to state them explicitly.
+
+The mcpp packages differ from the CMake packages in these ways:
+
+- The Windows setup uses WiX's standard bootstrapper interface rather than the PingCore installer interface.
+- DEB and RPM install the staged application under `/opt/<name>` with the GTK libraries mcpp resolved, rather than depending on the distribution's GTK.
+- Android packages need no Gradle project: the build rules generate the application and activity classes, and the framework's Java host and manifest entries come from its own manifest.
+
+## Linux package formats
+
+```bash
+pingcore package linux
+pingcore package linux --format deb
+pingcore package linux -f rpm
+```
+
+Use `--format` or `-f` with Linux as the sole packaging platform. The supported values are `appimage` (default), `deb`, and `rpm`. The selected format is published under `dist/linux` and replaces the previous Linux output on success.
+
+All three formats use the same CMake installation component and require `patchelf` 0.19.0 or newer and binutils on the build machine. AppImage needs `appimagetool`, DEB needs CPack and `dpkg-shlibdeps` from `dpkg-dev`, and RPM needs CPack and `rpmbuild` from `rpm-build`. Build DEB and RPM natively on the intended distribution family so its tools can resolve the system library dependencies.
+
+DEB and RPM use the project ID as the package name and the CMake project version as the package version. APT and DNF install the distribution libraries needed by the package, including GTK 4.14 or newer. The package installs the desktop entry and icon in the system application and icon directories. The application, its resource sidecar, and its private libraries live together under `/usr/lib/<project-id>/`.
+
+## Target ABIs
+
+`build`, `run`, and `package` accept `--abi <abi-list>` when targeting one platform. Omit it to use the platform and project defaults. Separate multiple ABIs with commas. The CLI normalizes aliases and removes duplicates before building.
+
+| Platform | Canonical ABIs | Output |
+| --- | --- | --- |
+| Android | `arm64-v8a`, `x86_64` | One APK with the selected ABIs. Termux supports only `arm64-v8a`. |
+| Windows | `x86_64` | One application or installer. |
+| Linux | `aarch64`, `x86_64` | A separate build and AppImage per ABI, under `dist/linux/<abi>` when packaging both. DEB and RPM use the host ABI. Use one ABI with `run`. |
+| macOS | `arm64`, `x86_64` | One app bundle and DMG. Building both architectures requires a PingCore source checkout selected with `--sdk` and universal dependencies. |
+| iOS | `arm64` for devices, `arm64` or `x86_64` for simulators | One bundle for the selected destination. Simulator builds can contain both slices when supported by Xcode. |
+| Web | `wasm32` | One Web deployment. |
+
+`x64` and `amd64` both resolve to `x86_64`. `arm64` and `aarch64` resolve to the selected platform's 64-bit ARM spelling, including `arm64-v8a` on Android. The canonical values in the table are also accepted.
+
+```bash
+pingcore package android --abi arm64
+pingcore build android --abi arm64-v8a,x64
+pingcore package macos --abi arm64,x86_64 --sdk ../PingCore
+```
+
+For an explicit Linux cross-build, select a PingCore source checkout with `--sdk` and set `CMAKE_TOOLCHAIN_FILE` to a CMake toolchain for the non-host ABI. The toolchain must supply the target compiler and dependency paths. An explicit host ABI uses the native toolchain, so a two-ABI invocation can build both the native and cross targets.
+
+## Android signing
+
+Generated Android applications and the repository example runner use the local debug signing configuration for Release APKs by default, so optimized builds can be installed directly for development and testing.
+This signing choice preserves the Release build configuration and its optimization settings.
+Before publishing an application, replace `signingConfig = signingConfigs.debug` with your own release signing configuration in `platform/android/app/build.gradle`; app stores such as Google Play do not accept debug certificates for publication.
+
+## Size optimization
+
+Applications link the static framework by default, including Android, where the shell loads the application's single shared library using its actual CMake artifact name.
+Third-party libraries that are distributed only as shared libraries remain separate APK dependencies.
+Release configurations enable supported section removal, safe identical-code folding, and Android API 23+ packed relocations automatically.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `PINGCORE_OPTIMIZATION` | `default` | Retain the toolchain's optimization level; `size` selects `-Os` or MSVC `/O1`, and `minsize` requires `-Oz`. |
+| `PINGCORE_ENABLE_LTO` | `OFF` | Enable link-time optimization for source targets; Android uses ThinLTO and other toolchains use CMake IPO. |
+
+These settings apply to Release, RelWithDebInfo, and MinSizeRel configurations of the framework, applications, and libraries created through PingCore helpers.
+They do not change Debug optimization, exceptions, RTTI, or application semantics.
+Unsupported explicit settings fail configuration with a diagnostic.
+The CLI forwards the same choices for `build`, `run`, and `package`:
+
+```bash
+pingcore package android --optimization size --lto on
+pingcore build web --config release --optimization minsize --lto on
+```
+
+Direct CMake builds use `-DPINGCORE_OPTIMIZATION=size -DPINGCORE_ENABLE_LTO=ON`.
+Android Studio builds use Gradle properties `pingcoreOptimization` and `pingcoreLto`; iOS shells use the corresponding `PINGCORE_OPTIMIZATION` and `PINGCORE_ENABLE_LTO` build settings.
+Prebuilt SDK archives retain their published optimization level. Select a source checkout with `--sdk` to rebuild PingCore with different settings.
+Measure the final APK or platform package with the same ABIs and resources when choosing an optimization level.
+
+## Windows URL scheme registration
+
+For a custom scheme owned by your Win32 application, call `windows::RegisterUrlScheme(scheme, display_name)` from `<pingcore/system.h>` explicitly in entry code before `RunApplication()`. It registers the current executable for the current user without administrator privileges, an installer, or CMake registration metadata. This also works in the Windows 7 compatibility backend.
+
+```cpp
+#if defined(_WIN32)
+windows::RegisterUrlScheme("myapp", "My Application");
+#endif
+```
+
+The bare scheme is case-insensitive ASCII: a letter followed by letters, digits, '+', '-', or '.', with 2 to 255 characters and no colon. Single-letter schemes are reserved for Windows drive interpretation. The display name is non-empty UTF-8 without nulls or line breaks. Invalid parameters throw `std::invalid_argument`; native failures or ownership conflicts throw `std::runtime_error`. Catch and report startup failures rather than continuing as if registration succeeded.
+
+Registration stores `"<current executable>" "%1"` under `HKCU\Software\Classes\<scheme>\shell\open\command`. Repeating it for the same executable may change the display name. A scheme owned by another executable, a non-protocol class, or a machine-wide registration is rejected rather than replaced. Use a separate development scheme when development and installed copies need to coexist. Registration does not override a user's default-app choice or guarantee that every URL opens this executable; it is not an API for taking over standard browser schemes, file associations, or all-user installation.
+
+External URLs still use `ApplicationHandle::StartupActivation()` and `OnActivation()` with `UrlActivation`. Treat route contents as untrusted input and apply application authorization before opening files or performing other actions. Registration does not add route callbacks or change the existing cold-start and running-window activation flow.
+
+Registration persists after exit. Call `windows::UnregisterUrlScheme(scheme)` explicitly before removing or relocating the owning executable, not on ordinary shutdown. No preceding registration in that process is required. Cleanup removes only matching current-user registration, does nothing when absent, and rejects ownership conflicts without modifying them. It does not clear user default-app choices or registrations belonging to other users. All-user installer cleanup is not implied.
+
+`example_application` registers `pingcore-example` in the [shared example entry point](../../examples/main.cpp), not during static initialization. After closing the example, clean up its protocol before moving or deleting the executable:
+
+```powershell
+& <build-directory>/bin/example_application.exe --unregister-url-scheme
+```
+
+## Windows notification registration
+
+Ordinary Win32 applications can use native local notifications without MSIX, the Windows App SDK, or CMake-generated notification metadata. The application opts in by passing its stable AppUserModelID, UTF-8 display name, and fixed COM activator CLSID to `windows::RegisterLocalNotifications()` from `<pingcore/system.h>` on its entry thread before `RunApplication()`:
+
+```cpp
+#include <pingcore/app.h>
+#include <pingcore/system.h>
+
+int main() {
+  pingcore::windows::RegisterLocalNotifications(
+      "com.example.app", "Example App", "{7451F115-EB29-4BDB-8467-BF2DDDE97980}");
+  return pingcore::RunApplication();
+}
+```
+
+Choose your own App ID and CLSID rather than copying the example identity, and keep both stable across launches and releases. The App ID starts with an ASCII letter or digit, contains only ASCII letters, digits, '.', '_', or '-', and is at most 128 characters. The CLSID is a non-null GUID in braced form. Registration validates and copies its arguments; caller-owned strings need not outlive the call. Each process supports one configured notification identity. Call registration on every launch, including notification-triggered cold launches: the host uses the successful registration's in-process configuration for both sending and COM activation.
+
+Registration writes the current user's COM launch command and app identity/display metadata. It manages only the current-user Start menu shortcut named `<app_id>.lnk`, preserving it if the executable, App ID, and CLSID already match. It neither searches other shortcut locations nor modifies them; ordinary installer shortcuts may coexist with this notification shortcut. The generated installer creates ordinary application shortcuts and does not supply notification metadata or register COM. Repeated registration is allowed only for the same executable. Conflicting registrations and machine-owned identities are rejected, not overwritten. Invalid arguments throw `std::invalid_argument`, switching an already configured process to another identity throws `std::logic_error`, and native failures throw `std::runtime_error`; applications should report errors at their entry boundary. Ordinary host construction and authorization queries never register an application implicitly.
+
+The Windows `example_local_notification` enables a notification-specific branch in the [shared example entry point](../../examples/main.cpp), passing an isolated `.development` App ID and a fixed development CLSID. Build and run it directly without installation, administrator privileges, or a registration script. Other applications choose their own separate development and installed identities in code; CMake does not derive or override notification identity from bundle metadata.
+
+Persistent registration survives ordinary process exit so scheduled notifications and later clicks can still launch the application. This is distinct from the live COM class factory, which the host registers for each process and revokes on exit. For explicit cleanup, call `windows::UnregisterLocalNotifications(app_id, activator_clsid)` before `RunApplication()` or after it returns, never while the notification host is running. No preceding registration call is required. It cancels schedules, clears history, and removes matching current-user registration and the framework-created shortcut path; it also clears a matching in-process identity. Installer-owned shortcuts, other executables, other users, application files, and application data are preserved. Cleanup is not transactional; report errors rather than assuming every native operation completed. The current machine-wide installer does not clean these per-user registrations for all users; applications own explicit per-user cleanup before removal or relocation. Automatic all-user uninstall cleanup is not implemented.
+
+Close the notification example before moving or deleting its executable, then run:
+
+```powershell
+& <build-directory>/bin/example_local_notification.exe --unregister-notifications
+```
+
+The cleanup argument bypasses registration and application startup. It does not affect a formal installation or silently redirect a registration to another build path.
+
+`RequestAuthorizationAsync()` reports the current Windows notification setting; it does not display a permission prompt. Default notifications and configured XML templates support immediate presentation, system-owned one-shot scheduling, cancellation, and identifier/data round-trip. Windows limits the complete UTF-8 notification XML to 5 KiB, including Base64 data and text, so keep data small even though the shared encoded-data limit is 64 KiB. An oversized request returns `Failed` without replacing existing content. Treat returned activation data as untrusted routing input, not proof of file access or authorization.
+
+Before an application's first native notification, authorization may be `NotDetermined`; this does not prevent submission on Windows. Authorization queries never initialize notification state. The first immediate request sends its real content. A first scheduled request performs framework-owned initialization using a silent, non-popup notification that is immediately removed and expires after fifteen seconds if cleanup fails; a brief notification-center entry is possible, but no banner is requested. Applications must not send their own initialization notifications or interpret `NotDetermined` as an unconditional denial across platforms.
+
+### Windows notification templates
+
+Pass an optional `windows::LocalNotificationTemplateProvider` as the fourth argument to `RegisterLocalNotifications()`. The callback receives `(template_identifier, title, body, data)` as borrowed `std::string_view` values and `const PlatformPayload&`; title and body are already localized UTF-8. It returns `std::optional<std::string>` containing a complete UTF-8 `<toast>` document, or `std::nullopt` for an unknown template. Submit the matching identifier through the ordinary `TemplateNotificationPresentation`; keep XML out of shared application notification data.
+
+```cpp
+windows::RegisterLocalNotifications(app_id, display_name, activator_clsid, BuildNotificationTemplate);
+```
+
+An empty provider disables `can_use_templates`; a non-empty provider enables the mechanism without promising every identifier. Default presentation bypasses it. Successful registration replaces the previous provider, including clearing it when omitted; failed registration preserves the old configuration. Configure it before host startup, never while the host is running. The process retains the callback and each host takes a copy, so capture durable application-shell values rather than Runtime, View, composition state, or borrowed references. Explicit unregistration also clears the matching process provider.
+
+The provider runs synchronously on the host UI thread at submission time, including for `ScheduleAsync()`. Do not block on I/O or retain parameter references. The completed XML is submitted to Windows immediately; scheduled delivery and later clicks do not call the provider. Images referenced by the XML must remain accessible through native delivery, even after the submitting process exits.
+
+Return one `<visual>` containing one `<binding template="ToastGeneric">` under `<toast>`. Native text, images, groups, and progress elements remain application-owned; use an XML DOM or properly escape all dynamic text and attribute values. PingCore rejects DTDs, external entities, `launch`, `activationType`, and `protocolActivationTargetApplicationPfn` on the root, and any `actions`, `input`, or `header` elements. These routes need separate activation contracts, not just XML support. PingCore injects its own `launch` envelope and retains native tag/group, primary-click data, scheduling, replacement, and cancellation. It checks the final encoded size before touching existing notifications; empty or malformed XML, forbidden routing, provider exceptions, and excessive size return `Failed`, while unknown templates return `Unavailable` without fallback. Windows remains responsible for its full XML schema, feature availability, and final presentation; successful parsing does not guarantee visibility.
+
+The [Windows download template](../../examples/local_notification/windows/notification_template.cpp) demonstrates DOM-based text escaping and locale-independent progress formatting. Progress bars require Windows 10 version 1703 or later. The example's detailed-layout switch adds text and byte counts rather than controlling system expansion. Repeated `ShowAsync()` calls replace notifications and can show another popup even with silent audio; they do not use Windows data-binding updates. Native in-place updates and custom action/input handling are outside the current API.
+
+## Application payloads
+
+CMake install rules are the only source of application files placed into desktop packages.
+The generated platform shell installs the application executable or bundle and its final PingCore resource package, then collects non-system dynamic dependencies recursively during `cmake --install`.
+Deployment scans the original binaries, copies dependencies, fixes loading paths in the staged copies, and verifies that the staged application no longer resolves non-system dependencies outside the package.
+Each package operation uses a fresh staging directory.
+
+Libraries loaded through `LoadLibrary`, `dlopen`, or an equivalent runtime mechanism may not appear in the binary dependency graph.
+Declare those additional roots with `pingcore_add_runtime_dependencies`; the helper installs them and collects their dependencies:
+
+```cmake
+pingcore_add_runtime_dependencies(my_app
+        TARGETS image_codec
+        FILES "${vendor_runtime_file}"
+        SEARCH_DIRECTORIES "${vendor_runtime_directory}"
+)
+```
+
+`TARGETS` accepts shared-library and module targets, including imported targets; application builds also build any declared local targets.
+`FILES` accepts prebuilt dynamic libraries and, on macOS, complete `.framework` or `.bundle` directories.
+Relative file and search paths are resolved against the declaring source directory, and generator expressions select the active build configuration.
+Conditional file and search expressions that evaluate to an empty value are skipped, and imported targets retain the visibility of their declaring directory.
+Search hints include the application directory, declared targets, and directly discoverable linked CMake targets; provide `SEARCH_DIRECTORIES` for other locations, including target paths hidden behind conditional link expressions.
+Search directories are packaging inputs, not paths retained by the installed application.
+
+The optional `DESTINATION` selects a subdirectory relative to the Windows application directory, macOS bundle's `Contents`, or Linux AppDir's `usr` directory.
+Without it, Windows libraries go beside the executable, macOS libraries and frameworks go into `Frameworks` (bundles into `PlugIns`), and Linux libraries go into `lib`.
+Dependencies of explicitly placed modules still use the platform's default library directory.
+The application remains responsible for locating and loading its explicitly declared modules.
+
+Install data and configuration with the existing application component:
+
+```cmake
+get_target_property(app_install_component my_app PINGCORE_APPLICATION_INSTALL_COMPONENT)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/vendor/codec-settings.json"
+        DESTINATION config
+        COMPONENT "${app_install_component}"
+)
+```
+
+Use an appropriate destination and platform condition for each target system.
+Missing required dependencies, conflicting payloads, architecture mismatches, broken links, loading-path errors, and invalid final signatures fail packaging before `dist` is replaced.
+Native binaries installed with application-owned rules also participate in the final dependency validation.
+System runtimes cannot be explicitly bundled through the helper or application-owned installation rules.
+The CLI wraps the validated installation tree; CMake owns dependency deployment.
+
+## Application icons
+
+Application icons belong to the generated platform shell and use each platform's native format.
+New applications start with the PingCore brand mark as an editable placeholder.
+Replace the generated file in place; no CMake option or PingCore resource registration is required:
+
+- Windows uses `platform/windows/app.ico` for the application executable, installer executable, Burn setup, Start menu and desktop shortcuts, and the installed-app entry.
+- macOS uses `platform/macos/AppIcon.icns` for the application bundle displayed by Finder, Dock, and the application switcher.
+- Linux uses `platform/linux/package/<target>.svg` for the desktop entry in all three Linux package formats.
+- Android uses the legacy density icons and adaptive icon resources under `platform/android/app/src/main/res`.
+- iOS uses the complete `platform/ios/App/Assets.xcassets/AppIcon.appiconset` catalog.
+- Web uses `platform/web/favicon.svg` for browser tabs and `apple-touch-icon.png` for home-screen bookmarks.
+
+The Windows installer reuses the application icon, and the macOS DMG retains its standard volume icon.
+PingCore does not convert a common source image into platform icon formats during application builds.
+
+## Desktop system requirements
+
+Windows deployment targets the default Windows 10 version 1607 or later platform and keeps Windows system DLLs, API sets, and UCRT system-owned.
+System DLLs are identified by the deployment module's explicit Windows library list; a third-party DLL is not excluded merely because it resides in `System32` or `SysWOW64`.
+The optional Windows 7 backend configuration does not have a packaging redistribution policy and is rejected by `package`.
+Required Release VC++ runtime DLLs are deployed beside both the application and the independently staged installer interface, so target machines do not need a separate VC++ Redistributable installation.
+The runtime files must come from the matching toolchain's redistributable directories; missing files, older runtime versions, and Debug CRT dependencies fail packaging.
+PingCore uses CMake's detected `MSVC_REDIST_DIR` and falls back to the active Visual Studio compiler or developer environment when CMake does not yet recognize a newer toolset.
+Set `MSVC_REDIST_DIR` explicitly when the toolchain stores its redistributables in a separate location; an explicit directory remains authoritative and an invalid one fails packaging.
+Application publishers own updates to these app-local runtime files.
+WiX and its .NET runtime are build-machine tools, not installed-application prerequisites.
+
+macOS keeps Apple system frameworks and `/usr/lib` libraries system-owned, including libraries supplied through the dyld shared cache.
+Non-system dylibs and frameworks are copied into the application bundle with their runtime resources and symbolic links.
+Deployment rewrites load commands and runpaths to use bundle-relative locations, checks required architectures and declared minimum macOS versions, and applies ad-hoc signatures from nested code outward after modification.
+Developer ID signing and notarization belong to the application's release pipeline and must follow dependency deployment; the default ad-hoc signature does not provide Gatekeeper distribution approval.
+
+Linux keeps glibc, the ELF loader, the system C++ runtime, graphics drivers, and the distribution-provided GTK 4.14+, libepoxy, Pango, Cairo, GIO, and libsoup 3 runtime stack system-owned.
+The desktop stack's resolved distribution-library dependency closure is excluded; other application libraries are bundled even when installed in a system search directory.
+Custom desktop-stack builds outside distribution library directories are rejected.
+The target machine needs the corresponding runtime packages, not their development packages or the PingCore SDK.
+Bundled ELF files use `$ORIGIN`-relative RUNPATH entries, and versioned library link chains are preserved.
+Deployment prints the packaged binaries' `GLIBC`, `GLIBCXX`, and `CXXABI` requirements; build and test release packages on the intended minimum environment.
+The official SDK's glibc 2.38 requirement alone does not establish an application's minimum system requirements or provide GTK through the AppImage.
+
+## Custom Windows installer interface
+
+New Windows application shells contain an editable installer application under `platform/windows/package`:
+
+```text
+platform/windows/package/
+  Bundle.wxs.in
+  Package.wxs.in
+  resources/
+    strings/
+      default.properties
+  src/
+    app.cpp
+    main.cpp
+```
+
+Edit `src/app.cpp` and `resources` with ordinary PingCore components and assets.
+The generated interface resolves its text through the ordinary PingCore resource system: `default.properties` is the required fallback, and locale catalogs such as `zh.properties`, `ja.properties`, or `pt-BR.properties` follow the same language-tag selection and fallback rules as application resources.
+Windows supplies localized text for the native folder picker, while messages returned by the installation engine remain engine-owned text.
+Edit the WiX sources for product metadata or MSI behavior that belongs to the Windows package.
+Keep installation mechanics in Burn instead of reimplementing file copying, elevation, rollback, repair, or uninstall in the interface.
+The generated interface displays the expanded default installation directory, accepts an absolute path, opens the Windows folder picker from its Browse button, and lets the user choose whether to create a desktop shortcut.
+The Start menu shortcut is always installed so the application remains discoverable through the normal Windows application surface.
+Taskbar pinning does not belong to setup: an application that supports it must request the operation from its foreground interface and let Windows obtain user confirmation.
+
+The Windows-only `<pingcore/windows/installer.h>` API exposes one root-owned session:
+
+```cpp
+#include <pingcore/pingcore.h>
+#include <pingcore/windows/installer.h>
+
+using namespace pingcore;
+using namespace pingcore::windows;
+
+View InstallerPage() {
+  const InstallerHandle installer = UseInstaller();
+  const TaskScope tasks = UseTaskScope();
+  const InstallerStatus status = installer.Status();
+  if (status.phase == InstallerPhase::Ready && status.product == InstallerProductState::Absent) {
+    return Button("Choose destination and install").OnClick([installer, status, tasks] {
+      tasks.Launch([installer, status]() -> Task<void> {
+        const std::optional<std::filesystem::path> selected =
+            co_await installer.ChooseDestinationAsync(status.default_destination);
+        if (selected) {
+          installer.Install({
+              .destination = *selected,
+              .create_desktop_shortcut = status.default_create_desktop_shortcut,
+          });
+        }
+      });
+    });
+  }
+  return ProgressBar(status.progress);
+}
+
+const Application application{
+    InstallerPage,
+    {.window_hooks = {InstallInstallerSession}},
+};
+```
+
+`InstallerHandle` starts install, repair, and uninstall operations, requests cooperative cancellation, and answers the current identified prompt.
+`InstallerStatus::product` distinguishes a fresh install (`Absent`), an older installed release (`Present`), this exact installed release (`SameVersion`), and a newer installed release (`NewerVersion`). The generated installer uses the install page for a fresh install or upgrade and offers repair and uninstall for the same version. It shows the newer-version message even when only the newer bundle registration remains.
+Both installed states support repair and uninstall; a surviving bundle registration also remains removable when its MSI is absent.
+`InstallerInstallOptions` overrides the authored destination or desktop-shortcut choice for one install request; leaving either field unset preserves the matching Burn variable.
+`ChooseDestinationAsync()` opens the Windows folder picker from a Task launched by the component's `TaskScope` and returns no value when the user dismisses it.
+`InstallerStatus` is the single observable status value for phase, detected product state, expanded defaults, action, progress, current package, prompt, failure, and restart requirement.
+Full-display launches wait for confirmation, including launches with `/uninstall` or `/repair`.
+A `/quiet` or `/passive` launch performs the requested install, repair, or uninstall automatically and exits after completion. An older bundle called by a newer bundle during an upgrade also runs automatically, including when Burn restores it after a failed upgrade. An automatic launch with an unsupported action exits with an error. A successful install that still requires a system restart returns Windows exit code 3010. Automatic runs leave restarting to the caller.
+When a full-display operation completes and needs a restart, the generated installer asks whether to restart now or later. Later is the default, including when the installer is closed. With `/norestart`, the completion page displays the restart requirement.
+Burn or the parent bundle answers engine questions during automatic runs. Quiet and embedded runs keep a hidden owner window for Burn, while passive runs can show progress.
+Interactive launches keep the full page flow, including the newer-version gate that blocks downgrade attempts.
+Do not use this API in the ordinary application executable or introduce another installer state store beside it.
+
+Signing, notarization, store submission, and platform-specific release credentials remain application and release-pipeline responsibilities.

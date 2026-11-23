@@ -1,0 +1,313 @@
+# Web Platform Design
+
+This document defines the PingCore Web backend contract, including application startup, Emscripten integration, Canvas-session ownership, rendering, text layout, input, resources, application storage, accessibility, and delivery boundaries.
+
+## Goals
+
+- Reuse the shared Runtime and UiWindow behavior, View model, layout, input state machines, animation, text editing protocol, RenderScene, and PaintCommand types through Web-derived Runtime and UiWindow classes.
+- Keep the static `Application` declaration and shared application source unchanged across Web and other supported targets.
+- Produce an ES module and WebAssembly application that can be mounted into a browser-owned host element.
+- Preserve logical coordinates, retained PaintSequences, Runtime damage, controlled text editing, typed resources, and platform-owned services.
+- Support mouse, touch, pen, wheel, keyboard, browser IME, high-density displays, resizing, and asynchronous image decoding.
+- Leave room for worker rendering and alternative renderers without exposing a second public UI surface.
+
+## Non-goals
+
+The original Canvas backend does not render ordinary Views directly as DOM or provide a semantic DOM accessibility bridge. CSS layout, WebGPU, pthreads, OffscreenCanvas workers, and PWA packaging remain separate capabilities. The opt-in `<pingcore/web/seo.h>` module provides semantic HTML serialization, SSR/SSG document generation, hydration shells, metadata, structured data, routing, sitemap, and robots support without replacing the Canvas renderer.
+
+The Web backend targets a composition-root-owned application surface. Keyboard and wheel events return Runtime's explicit consumption result to the browser. Embedding PingCore inside a page that must conditionally return touch gestures to surrounding DOM content remains deferred until that path exposes equivalent ownership results.
+
+Canvas output does not expose the shared semantic tree to browser accessibility, and a semantic DOM bridge is not planned.
+
+## Current implementation
+
+The current implementation includes Emscripten platform selection, automatic `Application` registration, ES module mounting and disposal, composition-root and Canvas sizing, frame scheduling, asynchronous PlatformModule result and event dispatch, DOM PlatformView hosting with exact RenderComposition ordering, WebCodecs ExternalTexture production, Canvas 2D replay for every current PaintCommand variant, Pointer Events, wheel and keyboard conversion, synchronous Canvas-backed text layout, controlled browser text input and composition events, typed URL routing through Browser History, preloaded resources, IndexedDB-backed application storage, and asynchronous ImageBitmap decoding.
+
+Repository examples generate directly runnable HTML, ES module, WebAssembly, and optional resource data artifacts.
+The backend has been exercised with stateful pointer interaction, wheel scrolling, secure single-line input, multiline input, packaged localized resources, and asynchronous image repaint in a Chromium-based browser.
+
+The current text layout is intentionally conservative and still requires broader complex-script, bidirectional, grapheme, and browser-consistency validation.
+Exact offscreen group-opacity compositing, embedded-page gesture arbitration, multi-browser automation, and real mobile-browser IME validation remain deferred.
+
+## Ownership
+
+The Web backend follows the same Runtime and UiWindow boundary as other platform backends:
+
+| Layer | Responsibility |
+|---|---|
+| WebRuntime | One application service and factory catalog, application dispatch, timers, resources, and browser service capabilities |
+| WebUiWindow | One mounted host element's composition, reconciliation, layout, focus, interaction, frame requests, text input, RenderScene, and damage |
+| JavaScript session | DOM observers and event listeners for one mounted host element, addressed by a validated session ID |
+| WebRenderer | RenderScene traversal, Canvas state, damage replay, path conversion, image decode entries, and renderer caches |
+| Web `VideoFrameTexture` | Main-thread WebCodecs `VideoFrame` validation, cloning, latest-frame ownership, and finish state |
+| WebPlatformViews | DOM factory lifecycle, retained Canvas slices, placement, ordering, hit arbitration, and focus synchronization |
+| WebTextLayout | Browser font resolution, measurements, line records, UTF-16 caret movement, hit testing, and range geometry |
+| WebTextInput | DOM input-element lifecycle and conversion of browser editing events into TextInputCommandBatch values |
+| BrowserNavigationStack | Application route-codec binding, canonical URL synchronization, browser History operations, and Back or Forward feedback suppression |
+| WebResources | Synchronous reads from resources loaded before Runtime creation and current locale and display scale |
+| Web file storage | IDBFS restoration, stable application identity, serial asynchronous operations, explicit persistence completion, and MEMFS temporary data |
+| ES module integration | Storage initialization, host lookup, composition-root creation, asynchronous startup, resize observation, browser events, DOM objects, and exported mount and disposal operations |
+
+The WebAssembly module owns one WebRuntime for the registered Application and one WebUiWindow per mounted host element. Mounted windows share application services and the factory catalog while retaining separate composition, focus, layout, renderer caches, and input sessions.
+Browser History is document-global, so at most one mounted `BrowserNavigationStack` owns URL synchronization.
+Mounting another session whose root also declares `BrowserNavigationStack` is rejected; additional sessions in that document use ordinary routed stacks.
+
+Browser objects never enter shared headers, ViewSpec, MountedNode, PaintCommand, or application state. JavaScript identifies sessions with validated numeric IDs rather than retaining raw C++ object pointers as application-visible values.
+
+## Application startup
+
+Web compilation constructs the same static `Application` used by the other targets. Its constructor registers the immutable root and `AppOptions`; Web does not create or require a desktop `main()`.
+
+The generated ES module exposes a synchronous mount operation that accepts a selector for an `HTMLElement` with no child nodes after module, application storage, and font loading have completed. The adapter creates and owns one isolated composition root and its base Canvas inside that host. Broader startup configuration such as a resource base URL and page-integration policy remains deferred and does not belong in `AppOptions`.
+
+The shell passes one stable Web storage identity to the module factory:
+
+```js
+const module = await createPingCoreApp({
+  pingcoreStorageKey: "com.example.app",
+});
+```
+
+Generated shells derive it from the project or example identifier.
+It remains host configuration rather than entering `AppOptions`.
+
+Startup occurs in this order:
+
+- Instantiate the Emscripten module, mount its application-specific IDBFS subtree, restore IndexedDB contents, create data, cache, and temporary directories, and complete packaged-resource preload into the virtual filesystem.
+- Await `document.fonts.ready` in the JavaScript entry point.
+- Initialize WebRuntime for the uniquely registered Application if needed, then resolve the target host, create its composition root and base Canvas, and attach a WebUiWindow.
+- Create the JavaScript session record and install browser observers and event listeners.
+- Apply the initial CSS-pixel viewport and ResourceConfiguration.
+- Request the initial frame.
+
+The returned session ID owns explicit disposal. Disposal cancels that window's animation-frame callbacks, removes DOM listeners, PlatformViews, Canvas slices, the composition root, and hidden input elements, releases renderer caches, ends active text input, retires its UiWindow, and invalidates the session ID. The shared WebRuntime remains until application shutdown.
+
+The initial distribution contains an HTML entry point when requested by SDK tooling, an ES module, a WebAssembly module, and optional preloaded resource data. The framework library remains a static or object dependency of the final WebAssembly application; ordinary Emscripten shared-library and dynamic-module modes are not part of the backend contract.
+
+## CMake and SDK integration
+
+Emscripten is selected through `EMSCRIPTEN` before other platform branches and configures `cmake/platform/Web.cmake`.
+
+The Web platform configuration supplies Web sources, platform-owned application registration, IDBFS initialization, required Emscripten link settings, JavaScript bridge code, and exported lifecycle operations. Web targets do not build the ordinary PingCore shared library by default.
+
+Direct consumers continue to create an executable, link the canonical `PingCore::pingcore` target, enable composable code generation, and attach resources. Tool resolution continues to use the development host, so a Windows, macOS, or Linux prebuilt code generator runs while the C++ target is WebAssembly.
+
+The CLI wraps the same CMake path for project creation, diagnostics, incremental builds, and packaging.
+Desktop hosts serve generated output through `emrun`, while Termux uses Python's standard-library HTTP server on loopback and opens the bound URL through `termux-open`.
+The project-owned Web shell keeps its HTML and host-element mount code under `platform/web`, while the backend avoids a parallel JavaScript component build system.
+
+## Viewport and display scale
+
+UiWindow logical coordinates map to CSS pixels. The composition root's CSS size defines that UiWindow's viewport, while each Canvas backing bitmap width and height are the rounded CSS dimensions multiplied by `devicePixelRatio`.
+
+The renderer applies the display scale at the Canvas boundary, so layout, pointer positions, text geometry, PaintCommands, and damage remain in logical coordinates. `ResourceConfiguration::display_scale` uses the same value for image variant resolution.
+
+`ResizeObserver` detects host geometry changes. A resolution media query and window resize listener detect display-scale changes, rebuild every Canvas backing bitmap, update Runtime resource configuration, and request full repaint. Setting Canvas backing dimensions resets Canvas state, so the renderer restores its baseline transform and clip state before replay.
+
+## Frame scheduling
+
+`WebUiWindow::Now()` uses the browser monotonic performance clock expressed in seconds.
+
+`RequestFrameAt()` coalesces immediate requests into one `requestAnimationFrame` callback. A future absolute deadline arms one browser timer; when the deadline becomes eligible, the timer requests an animation frame rather than building and presenting outside the browser rendering phase.
+
+The animation-frame callback builds one `FrameCommit`, presents its `RenderFrame`, then schedules `next_frame_deadline`. Re-entry is prevented with the same pending-build and pending-paint invariants used by other UiWindow backends.
+
+When a document becomes visible after animation frames were suspended, the Web integration requests a new frame. UiWindow time remains monotonic, so retained animations advance to the current time rather than replaying every missed frame.
+
+## Canvas rendering
+
+Canvas 2D is the initial rendering backend because it directly represents the current rectangles, text, images, paths, transforms, clips, opacity, and shadows without adding a graphics dependency or a second public drawing model.
+
+WebRenderer traverses `RenderScene` in C++, maintains balanced Canvas save and restore operations, and translates every PaintCommand explicitly. Node offset, presentation transform, group opacity, child clip, children transform, content, descendants, and foreground preserve the ordering defined by the retained-rendering contract.
+
+The Canvas bitmap retains pixels between frames. For partial damage, WebRenderer rounds each region outward to device pixels, uses those same bounds for clearing, background fill, and one compound device-pixel clip, then traverses the committed scene once in logical coordinates. A full-damage frame clears and replays the complete surface. Runtime remains responsible for conservative transformed bounds and damage expansion.
+
+The renderer uses a narrow bridge without defining another serialized render model. Any batching representation remains private to WebRenderer and is justified only by profiling.
+
+Paths map to browser `Path2D` or direct Canvas path operations. Renderer-owned caches may retain converted paths by stable PaintSequence revision when profiling justifies it.
+
+Decoded images are asynchronous browser values. WebRenderer assigns an internal loading entry to an ImageAsset, copies encoded bytes before an asynchronous decoder can observe movable WebAssembly memory, and creates an ImageBitmap. A pending image is skipped for the current replay. Completion validates the session, stores the decoded value in a 64 MiB renderer-owned LRU cache, and requests another frame through WebUiWindow. Decode failure retries at bounded delays and becomes terminal after three attempts for that session, while the negative cache remains count-bounded.
+
+WebGPU, Skia, or another renderer may later implement the same RenderScene contract. None requires changes to View, Canvas, PaintCommand, Runtime, or application source.
+
+## ExternalTexture
+
+Web libraries include `<pingcore/web/external_texture.h>` and create a shared `web::VideoFrameTexture` with one immutable logical intrinsic size.
+The same object is passed to `Image` as `std::shared_ptr<ExternalTexture>`; `Publish()` accepts only an open WebCodecs `VideoFrame`, and `Finish()` idempotently rejects later publication while preserving the last image.
+No numeric identity, JavaScript registry, PlatformModule subtype, or additional payload kind is introduced.
+
+Publishing synchronously clones the supplied `VideoFrame`, so the caller retains ownership and may close its original as soon as `Publish()` returns.
+A newer publication closes and replaces the previous pending clone.
+The clone may share its underlying media resource according to WebCodecs lifetime rules, but Canvas import or browser color conversion may copy; the backend does not promise zero-copy.
+Because `emscripten::val` is thread-affine, texture construction, publication, finish, and destruction are browser-main-thread operations rather than worker-safe producer APIs.
+
+Canvas2D and WebGL2 producers use the same `VideoFrameTexture` contract; GPU production does not require a separate public texture type or additional DOM composition slices.
+A WebGL producer snapshots its Canvas into a `VideoFrame` in the same drawing callback, before the browser may discard the drawing buffer, without application-side `readPixels()`.
+Direct import of raw `WebGLTexture` or `GPUTexture` handles is unsupported; the producer first renders into a browser-supported Canvas image source.
+The `example_external_texture` Web producer keeps Canvas2D available independently of WebGL2, preserves published frames while paused, and stops its timer and releases its WebGL context on disposal.
+
+At the start of each browser animation-frame commit, WebRenderer advances one external-texture acquisition epoch and drops caches whose textures are no longer committed as active.
+The first draw of a texture during that epoch clones its latest mailbox frame, closes the replaced renderer-owned clone, and retains the new frame for later redraws.
+All Canvas slices in one `RenderComposition` share the same epoch, so content split around PlatformViews cannot display different producer frames in one physical presentation.
+Logical source rectangles map through `VideoFrame.displayWidth` and `displayHeight` before Canvas `drawImage`, while Image continues to own fit, alignment, clipping, transforms, sampling, and opacity.
+
+The Web `example_platform_module` creates an unattached Canvas, wraps its generated frames in `VideoFrame`, returns one ExternalTexture capability through the existing typed ColorStream service, and publishes later frames without per-frame PlatformModule callbacks.
+
+## Text layout and drawing
+
+WebTextLayout implements the private synchronous TextLayoutBackend contract and uses UTF-16 offsets, matching browser string and selection coordinates.
+
+Each WebRenderer owns one Canvas measurement context rather than a DOM element for every PingCore Text node. Canvas TextMetrics supplies font metrics, advances, baselines, and painted bounds.
+
+Creating a WebTextLayout materializes an immutable C++ snapshot containing measured size, baselines, line records, grapheme caret boundaries from `Intl.Segmenter`, and measured caret advances. Hit testing, caret lookup, and range geometry query that snapshot without returning to Canvas.
+
+Paragraph drawing uses a renderer-owned WebTextLayout cache bounded by 256 entries and an estimated eight-megabyte retention budget. Its geometry key contains the text body, effective font ranges, layout options, and logical width. Paint-only style and link changes reuse that geometry. The public layout cache belongs to the UiWindow, and secure editing constructs its geometry through the uncached platform hook.
+
+Drawing uses the same resolved CSS font description, direction, locale, alignment, wrapping decisions, and line records as measurement. When runtime custom fonts become ready, the window invalidates its text caches and recomputes composition-derived and mounted text geometry.
+
+Attributed paragraphs use one fallback layout with per-line mixed-font metrics, shared caret advances, range backgrounds, and text decorations. Styles do not create separate Views. The backend resolves paragraph direction from the first strong character and supports whole-paragraph left-to-right or right-to-left placement, links, and basic selection.
+
+Web intentionally does not promise native-equivalent mixed bidirectional layout, full Unicode line breaking, ligatures across style boundaries, or contextual shaping across separately drawn runs. No additional text-engine dependency is introduced. Applications requiring those typographic guarantees should use a native backend; the portable attributed and logical-selection APIs remain the same.
+
+## Pointer, wheel, and keyboard input
+
+The Web integration uses Pointer Events as the single mouse, touch, and pen input source. Pointer identifiers, type, position, changed button, and complete pressed-button state are converted at the Canvas boundary. Pressure, timestamp, and pointer modifiers are not represented by the current shared PointerEvent contract.
+
+The resolved `PointerCursorKind` maps to the composition root's CSS cursor.
+DOM PlatformView containers explicitly restore `cursor: auto`, so a PingCore ancestor declaration cannot leak into native browser content.
+
+An accepted PingCore pointer down captures that browser pointer to the composition root so move, up, and cancel remain ordered when contact leaves the element. Browser pointer cancellation maps to the shared Cancel path and must release pressed, drag, focus-candidate, and retained-extension state.
+
+Wheel deltas are normalized from pixel, line, or page units into logical pixels before producing a `ScrollInputEvent`. The composition root prevents page scrolling only when Runtime reports actual horizontal or vertical consumption and leaves unconsumed input available to its browser parent. Events owned by a PlatformView remain in its DOM subtree.
+
+The composition root is focusable and receives key down and key up events when PingCore owns browser focus. Browser `code`, repeat, modifiers, and platform conventions map to the shared KeyEvent model, including left/right modifiers and numeric-keypad positions. Runtime's boolean result controls `preventDefault()` and propagation, so an unhandled key remains available to the browser. An active hidden text control forwards every non-composing key down and key up through the same Runtime key path without inferred character text; an unhandled event remains available to browser editing. A PlatformView subtree owns ordinary key handling until Tab reaches its internal boundary, where traversal returns to Runtime. Text insertion is never inferred from printable key events while a browser text-input session is active.
+
+CSS `touch-action` belongs to browser integration policy. A full application surface initially owns direct-manipulation gestures and uses a restrictive value. A future embedded mode may expose an explicit page-gesture policy without adding a C++ View modifier.
+
+## Browser text input and IME
+
+WebTextInput creates one DOM `input` element and one `textarea` when the first editing session starts, then reuses them across single-line and multiline sessions. These elements are visually hidden from application rendering but remain focusable, editable browser controls.
+
+Input type, capitalization, action, multiline, secure entry, and autocorrection map to the closest browser attributes such as `type`, `inputmode`, `enterkeyhint`, `autocapitalize`, and `autocomplete`. Runtime does not start an editable platform session for a read-only TextField.
+
+The active element is positioned near Runtime's current caret geometry so browser IME candidate UI and mobile keyboard behavior have a meaningful anchor. Position and selection are refreshed after Runtime state or geometry changes.
+
+`input`, selection, and composition events are converted into ordered TextInputCommandBatch values. Browser mutations are observed, converted, and resynchronized against the shared controlled value without double-applying text.
+
+WebTextInput retains the active text-input session identifier and a restart token. Every asynchronous or deferred event reads the current token before calling Runtime, while disposal and configuration restart invalidate stale events.
+
+Touch scrolling over a TextField does not focus the hidden input merely because a pointer started over editable content. Runtime first resolves the gesture as a tap and starts or requests the platform session while still processing the trusted browser pointer event, allowing mobile keyboards to open without a second tap.
+
+## Clipboard
+
+`WebRuntime` supplies `PlatformClipboard` for asynchronous access. The adapter starts the browser request during the calling user action and returns a Task for its result. The browser governs focus, permissions, and supported representations. The adapter requires a secure context and reports unsupported access or a rejected request through the existing clipboard results.
+
+Synchronous clipboard service operations are unavailable on Web. Trusted copy, cut, and paste events on the hidden editing control provide synchronous event-scoped access for browser-managed text editing. See [clipboard usage](../guide/components.md#selection-and-clipboard) for calling asynchronous operations and choosing representations.
+
+## Resources and locale
+
+The ES module preloads the package before Runtime creation. See [Resource design](resources.md#runtime-resource-ownership) for payload and resolver ownership.
+
+The initial locale derives from `navigator.language`. The Web backend updates display scale through resource configuration. The browser language is sampled at startup.
+
+## PlatformModule
+
+Web uses the Runtime-owned internal `PlatformRegistry` and strongly typed library Module APIs without adding a JavaScript factory registry or a second registration entry point.
+Libraries may register a direct C++ factory or adapt one linked JavaScript factory object with `web::JavaScriptPlatformModuleFactory<Module, Options>` from an explicit application hook.
+The hook passes the actual `emscripten::val` factory object and constructs the exact C++ Module facade from the supplied `PlatformChannel`; `mountPingCoreApp()` does not perform registration.
+The public Module chooses its own synchronous, asynchronous, callback, stream, and error conventions; no proxy inheritance or dynamic call API appears in that public contract.
+Options, arguments, results, and events cross the JavaScript boundary as immutable `Module.PingCore.PlatformPayload` values using the shared HUXP envelope, while callbacks, promises, and DOM objects remain outside the payload and shared application code.
+Libraries that require JavaScript dependencies express those link inputs through their own Emscripten target configuration; the PingCore library graph does not parse or reproduce JavaScript package metadata.
+
+WebRuntime and WebUiWindow dispatch work through the browser event loop.
+Platform Result and Event endpoints may be invoked during a browser callback, but typed application callbacks always run asynchronously after the initiating stack has unwound.
+Closing an instance invalidates its pending calls and event routes before a queued task can observe application state, while the bridge or direct Module implementation owns any cancellation behavior exposed by its library API.
+
+The Web `example_platform_module` uses a JavaScript Timer factory to exercise typed calls, first-result completion, recurring events, cancellation, and disposal through the common adapter.
+Its ColorStream remains a direct C++ implementation because ExternalTexture payload transport is not part of the JavaScript bridge.
+
+## PlatformView composition
+
+DOM-backed PlatformView is implemented and follows final RenderScene paint order rather than one DOM overlay above the complete Canvas.
+`PlacePlatformViewCommand` divides the scene into nonempty PingCore Canvas slices and DOM PlatformView placements.
+WebUiWindow consumes the shared internal `RenderComposition` before drawing and retains compatible Canvas elements and DOM objects across frames.
+
+Web PlatformView libraries register either a direct strongly typed Emscripten C++ factory or `web::JavaScriptPlatformViewFactory<Properties, Controller>` under the same stable UTF-8 registration names as other platform backends.
+A direct C++ factory receives the concrete Properties and typed `PlatformEventEmitter` without payload encoding.
+A JavaScript factory receives the local immutable `PlatformPayload` representing the complete Properties and one framework-owned emitter, then returns an object containing its non-null detached `HTMLElement`, `dispose`, `update` when Properties are present, and `invoke` when a Controller is registered.
+The registered exact Controller remains a C++ facade connected to the instance's `PlatformChannel`, while JavaScript events use the supplied framework emitter rather than event-specific WebAssembly callbacks.
+The adapter owns attachment, absolute position, logical size, margin reset, and border-box sizing without putting DOM values in `PlatformPayload` or adding another registry.
+
+A PlatformView-capable session owns one isolated CSS stacking context inside the browser-supplied host element.
+The adapter-owned base Canvas serves as the first PingCore slice when applicable, while additional transparent Canvas elements and clipped PlatformView containers become absolutely positioned ordered siblings in the same composition root.
+DOM child order represents `RenderComposition` order; application z-index values do not participate in or escape that root.
+Every Canvas slice shares the logical viewport, backing-store scale, clipping root, and resize transaction, while its renderer replays only the retained scene content assigned to that slice.
+A scene without PlatformViews keeps one base Canvas and does not retain additional slice surfaces or allocate a wrapper per RenderNode.
+
+Composition-root and DOM hierarchy changes occur while applying a committed `RenderComposition`, never during Canvas command replay.
+Disposal removes adapter-owned slices and PlatformViews, invalidates queued event routes, releases browser listeners, and leaves no hidden interactive DOM objects behind.
+Moving or resizing a PlatformView updates its CSS geometry and old and new damage, while unchanged slices retain their Canvas and rendering caches.
+
+The composition root observes pointer events during capture and asks Runtime for the topmost committed PingCore or PlatformView hit target.
+When PingCore wins, the adapter prevents browser-default activation and routes the pointer sequence to Runtime.
+When a PlatformView wins, its DOM subtree receives ordinary browser pointer and wheel events and owns focus, selection, and editing until the sequence ends.
+Transparent Canvas slices never become full-viewport input blockers merely because they are visually above a PlatformView.
+The composition root currently uses `touch-action: none`, so the current contract does not promise browser-managed touch panning inside a scrollable PlatformView subtree.
+
+The first Web contract supports axis-aligned CSS bounds, translation, rectangular overflow clipping, visibility, and sibling ordering.
+CSS transforms, filters, blend modes, or stacking contexts created inside a PlatformView cannot alter ordering outside its assigned placement.
+Top-layer presentation and browsing contexts with policies that cannot remain inside the composition root are unsupported.
+Factories must keep their visual content within the returned subtree; the adapter does not detect or relocate content that later escapes through browser top-layer APIs.
+
+## Accessibility and semantics
+
+Canvas pixels alone do not provide a browser accessibility tree.
+UiWindow publishes the platform-neutral `SemanticFrame` defined by [Semantics and Accessibility Design](semantics.md), but the Web backend does not expose that frame through semantic DOM.
+PlatformView elements retain their built-in DOM accessibility, while PingCore-rendered content has no browser accessibility bridge.
+
+## Future work
+
+- Add PWA activation and lifecycle integration without moving application navigation policy into Runtime or UiWindow.
+- Consider workers and OffscreenCanvas only after profiling demonstrates a material main-thread bottleneck and ownership across threads is defined.
+
+## Threading
+
+The Web backend is single-threaded on the browser main thread. Runtime, Canvas, DOM input, text measurement, resource access, and frame scheduling therefore preserve ordinary synchronous ownership.
+
+Emscripten pthreads, SharedArrayBuffer deployment headers, worker proxies, and OffscreenCanvas introduce synchronization and hosting requirements without evidence that the retained renderer needs them. They are considered only after browser profiling demonstrates a material main-thread problem and after text input and semantics ownership across threads is defined.
+
+## Browser lifecycle and failures
+
+The integration observes document visibility, composition-root connection at scheduling time, browser focus, geometry, display scale, and disposal. A disconnected root does not destroy application state automatically, but it stops presenting. Replacing a host requires disposing the old session and mounting a new one.
+
+Exceptions do not cross the JavaScript and C++ boundary. Exported operations catch C++ failures and preserve PingCore diagnostics. Mount failures are rejected, fatal session-dispatch failures dispose the failed session, and text-input dispatch failures remain contained at the input boundary. Invalid or stale session IDs are ignored without dereferencing destroyed state.
+
+`QueryProcessMetrics()` returns no value because browser process CPU and memory figures do not have the same reliable per-application semantics as desktop backends.
+
+## Validation
+
+Web platform work requires:
+
+- A clean Emscripten configure and build in addition to an incremental build.
+- Public header and shared Runtime tests on available platform hosts.
+- Web compile coverage for every PaintCommand variant and application entry registration.
+- Browser tests for initial mount, disposal, resize, display-scale changes, frame coalescing, damage replay, pointer capture, Cancel, hover, wheel, keyboard, focus, and visibility restoration.
+- Text tests for ASCII, surrogate pairs, grapheme clusters, multiline wrapping, bidirectional text, selection, composition, secure input, submission actions, and session mismatch.
+- Resource tests for preload completion, locale, density variants, missing payloads, asynchronous image readiness, cache lifetime, and repaint.
+- Focused rendering checks in Chromium, Firefox, and WebKit, with screenshot tests used as smoke coverage rather than the sole semantic assertion.
+- Manual mobile-browser validation for real keyboards and IMEs that automation cannot reproduce faithfully.
+
+Unavailable browsers, operating systems, and mobile IMEs are reported explicitly rather than treated as passing.
+
+## Invariants
+
+- Web derives one Runtime and one UiWindow type and uses the shared component implementation.
+- Ordinary Views render through RenderScene and Canvas rather than DOM.
+- DOM use is limited to browser services, text measurement, text input, and PlatformView.
+- PlatformViews and Canvas slices share one isolated composition root and follow RenderScene paint order.
+- Runtime logical coordinates remain CSS-pixel coordinates; display scale is applied at the platform boundary.
+- Resources are ready and synchronously readable before Runtime starts.
+- Browser text input emits shared TextInputCommandBatch values and never owns authoritative TextField state.
+- Asynchronous image completion requests a frame without introducing image state into Runtime.
+- Renderer batching and caching remain private optimizations driven by profiling.
+- The absence of a browser semantics bridge is an explicit platform limitation.

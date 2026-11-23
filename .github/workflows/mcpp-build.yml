@@ -1,0 +1,616 @@
+name: mcpp Build
+
+# Validate PingCore and its application templates with mcpp.
+#
+# The framework's own build, its unit suite, the examples, and the templates on
+# the desktop hosts; the Web, Android and iOS rows and every application's
+# distributable are checked by build-system-conformance.yml. The design is
+# docs/design/mcpp-build-system.md.
+#
+# `parity` is first and cheap on purpose: it builds two small programs and no
+# framework, so the failure it catches -- a source added to one build system
+# and not the other -- is reported before anyone waits on a compile.
+
+on:
+  # The paths only mcpp consumes, the C++ modules templates and the CLI that renders them, and the unit
+  # sources `mcpp test` builds. A change to the shared framework sources runs this workflow on a manual
+  # dispatch, as it runs build-system-conformance.yml.
+  pull_request:
+    paths:
+      - 'mcpp.toml'
+      - 'build.mcpp'
+      - 'modules/**'
+      - 'buildtools/mcpp/**'
+      - 'templates/**'
+      - 'tools/pingcore_cli/**'
+      - 'tests/unit/**'
+      - '.github/workflows/mcpp-build.yml'
+      # Last, because the later pattern wins.
+      - '!**.[mM][dD]'
+  workflow_dispatch:
+
+concurrency:
+  group: mcpp-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Pin mcpp and the Linux Clang toolchain for reproducible validation.
+  MCPP_VERSION: '2026.11.20.1'
+  MCPP_LLVM: 'llvm@22.1.8'
+  XLINGS_NON_INTERACTIVE: '1'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    name: Select mcpp checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      framework: ${{ steps.select.outputs.framework }}
+    steps:
+      - uses: actions/checkout@v5
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 2
+      - name: Check for changes beyond the CLI
+        id: select
+        run: |
+          framework=true
+          if [ "$GITHUB_EVENT_NAME" = pull_request ] &&
+             git diff --quiet --no-renames HEAD^1 HEAD -- . \
+               ':(exclude)tools/pingcore_cli/**' ':(exclude)tests/cli/**' ':(exclude,icase)*.md'; then
+            framework=false
+          fi
+          echo "framework=$framework" >> "$GITHUB_OUTPUT"
+
+  parity:
+    name: mcpp/CMake parity
+    needs: plan
+    if: needs.plan.outputs.framework == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Cache xlings and mcpp
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.xlings
+            ~/.mcpp
+          key: mcpp-${{ runner.os }}-${{ runner.arch }}-v2-${{ env.MCPP_VERSION }}-${{ hashFiles('mcpp.toml') }}
+          restore-keys: |
+            mcpp-${{ runner.os }}-${{ runner.arch }}-v2-${{ env.MCPP_VERSION }}-
+
+      - name: Install the pinned mcpp
+        uses: mcpp-community/setup-mcpp@5c65c7d7258af3182188eda8aa070269475e3f32 # v1.0.1
+        with:
+          version: ${{ env.MCPP_VERSION }}
+
+      # The tooling is built by mcpp rather than written in Python: a
+      # repository that offers mcpp as a first-class build system should not
+      # need a second language to check its own build. It builds only the two
+      # small programs and their dependencies, not the framework.
+      - name: Unit-test the scanning the tools and the rules share
+        working-directory: buildtools/mcpp/pingcore-source-select
+        run: mcpp test
+
+      - name: Check that both build systems describe the same project
+        working-directory: buildtools/mcpp/pingcore-tools
+        run: mcpp run pingcore-build-check
+
+      # The module shell and the scope prelude are generated from the public
+      # headers; a public name added to a header and not to the shell is a name
+      # `import pingcore;` cannot see.
+      - name: Check that the module shell is up to date
+        working-directory: buildtools/mcpp/pingcore-tools
+        run: mcpp run pingcore-module-gen -- --check
+
+  linux:
+    name: mcpp build (linux x86_64)
+    needs: plan
+    if: needs.plan.outputs.framework == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      # NOTE: no apt-get. The GTK stack comes from the xlings payloads declared
+      # in [target.'cfg(linux)'.xlings.workspace], because mcpp compiles with
+      # its own toolchain and its own glibc -- see the comment there for what
+      # mixing the host's glibc in actually produces. CMake keeps using the
+      # distribution's packages; the two build systems answer "where does GTK
+      # come from" differently on purpose.
+      - name: Cache xlings and mcpp
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.xlings
+            ~/.mcpp
+          # The payload store holds the whole GTK closure (36 packages), so
+          # the key names the manifest that selects them.
+          key: mcpp-${{ runner.os }}-${{ runner.arch }}-v2-${{ env.MCPP_VERSION }}-${{ hashFiles('mcpp.toml') }}
+          restore-keys: |
+            mcpp-${{ runner.os }}-${{ runner.arch }}-v2-${{ env.MCPP_VERSION }}-
+
+      - name: Install the pinned mcpp
+        uses: mcpp-community/setup-mcpp@5c65c7d7258af3182188eda8aa070269475e3f32 # v1.0.1
+        with:
+          version: ${{ env.MCPP_VERSION }}
+
+      # The framework: 67 core sources, platform/linux, the builtin resource
+      # header (hrc) and the C++20 module shell. mcpp provisions the GTK
+      # payloads itself; this step is separate only so a provisioning failure
+      # is attributed to provisioning rather than to the compile.
+      - name: Build the framework
+        run: mcpp build
+
+      # Four applications on top of it. Each build.mcpp is one call; everything
+      # else -- GTK on the link line, the composable transform, the resource
+      # packages, a library's generated module interface -- arrives through the
+      # dependency edges.
+      - name: Build the examples
+        run: |
+          for example in buildtools/mcpp/examples/0*/; do
+            echo "--- $example"
+            ( cd "$example" && mcpp build )
+          done
+      # The suite that says the LIBRARY works, not just that it links. Same
+      # sources tests/unit/CMakeLists.txt compiles and the same vendored
+      # Catch2, against the framework mcpp built.
+      - name: Run the unit test suite
+        working-directory: buildtools/mcpp/pingcore-tests
+        run: mcpp test
+
+      - name: Pack the library and check its shape
+        shell: bash
+        run: |
+          mcpp pack
+          archive=$(find target/dist -name 'pingcore-*.tar.gz' -o -name 'pingcore-*.zip' | head -1)
+          test -n "$archive" || { echo "mcpp pack produced no archive"; exit 1; }
+          echo "packed $archive"
+          list=$(tar tzf "$archive" 2>/dev/null || unzip -Z1 "$archive")
+          for expected in 'include/pingcore/pingcore.h' 'interface/pingcore.cppm' 'mcpp.toml'; do
+            echo "$list" | grep -q "$expected" \
+              || { echo "the package omits $expected"; exit 1; }
+          done
+          # Both consumption paths belong in the package: a consumer writing
+          # `#include <pingcore/pingcore.h>` and one writing `import pingcore;`
+          # are looking at the same library.
+          echo "$list" | grep -qE 'lib/.+/(libpingcore\.a|pingcore\.lib)' \
+            || { echo "the package carries no library"; exit 1; }
+          echo "package carries headers, the module interface and a library"
+      - name: Assert the composable transform ran and is macro-free
+        working-directory: buildtools/mcpp/examples/02-module-units
+        run: |
+          # Name the unit rather than taking the first match. hcg's output
+          # directory ACCUMULATES -- renaming a source leaves its old
+          # transformed copy behind -- so `find ... | head -1` asserts on
+          # whichever file the directory happens to yield first. That is green
+          # on a fresh runner and wrong in any tree that has been built before.
+          generated=$(find target -path '*hcg*' -name '*counter.cppm' | head -1)
+          test -n "$generated" || { echo "hcg did not transform src/counter.cppm"; exit 1; }
+          grep -q 'return ::pingcore::Scope(' "$generated" \
+            || { echo "transformed source lacks the composable scope"; exit 1; }
+          # A generated module interface must still declare itself, or the
+          # importer compiles first and dies on "failed to read compiled module".
+          grep -q '^export module ' "$generated" \
+            || { echo "the transform dropped the module declaration"; exit 1; }
+          # Macros do not cross a module boundary, so generated code that named
+          # PINGCORE_SCOPE_BEGIN would not compile under `import pingcore;`.
+          ! grep -q 'PINGCORE_SCOPE_BEGIN' "$generated" \
+            || { echo "transform still injects the macro name"; exit 1; }
+          echo "composable transform verified in $generated"
+
+      # A scope written by hand needs no macro and therefore no header.
+      # PINGCORE_SCOPE expands to `return Scope([=]() -> View {...})`, and
+      # `import pingcore;` carries Scope and View even though it cannot carry the
+      # macro -- so the module-native spelling is the expansion, which is also
+      # what hcg injects. The prelude header remains for a NON-module
+      # translation unit in an mcpp project, which the rule force-includes; it
+      # is asserted here because no example needs it any more.
+      - name: Assert a hand-written scope needs no macro
+        working-directory: buildtools/mcpp/examples/02-module-units
+        run: |
+          grep -q 'return Scope(\[=\]() -> View' src/banner.cppm \
+            || { echo "02 no longer spells a scope out by hand"; exit 1; }
+          # Comment lines excluded: the file explains what the macro is, which
+          # an unanchored pattern would read as using it.
+          ! grep -vE '^[[:space:]]*//' src/banner.cppm | grep -q 'PINGCORE_SCOPE' \
+            || { echo "02 went back to the macro; the module path does not need it"; exit 1; }
+          grep -rq -- 'pingcore-build-rules[/\\]include' target/*/*/build.ninja \
+            || { echo "the prelude directory never reached the include path"; exit 1; }
+          echo "hand-written scope compiles with no macro and no header"
+
+      - name: Assert the examples consume PingCore as a module
+        working-directory: buildtools/mcpp/examples/01-import
+        run: |
+          grep -q '^import pingcore;' src/main.cpp \
+            || { echo "01 no longer imports the module"; exit 1; }
+          # No PingCore or standard-library header in any example's units:
+          # `import std;` covers std::type_info and `import pingcore;` covers
+          # everything else. A library's own header stays legitimate where a
+          # unit needs its macros, as 04's version test with `#if` does.
+          ! grep -rnE '^[[:space:]]*#include[[:space:]]*<(pingcore/|[A-Za-z_]+>)' ../0*/src ../0*/widgets/src \
+            || { echo "an example gained a PingCore or standard-library header"; exit 1; }
+          # Anchored: the file's own comment explains what `import` replaces,
+          # and an unanchored pattern matches that sentence.
+          echo "01 builds against import pingcore;, with no PingCore or standard-library header"
+
+      # The umbrella header is the CMake build's contract, and this PR must not
+      # touch it. Compile it standalone with the SYSTEM compiler -- the one
+      # CMake uses -- rather than mcpp's payload g++, which needs the sysroot
+      # flags mcpp passes and fails on `features.h` without them.
+      - name: Assert the header path still compiles
+        run: |
+          printf '#include <pingcore/pingcore.h>\nint main() { return 0; }\n' \
+            > /tmp/header_only.cpp
+          g++ --version | head -1
+          g++ -std=c++20 -fsyntax-only -Iinclude /tmp/header_only.cpp
+          echo "#include <pingcore/pingcore.h> still compiles"
+
+  linux-llvm:
+    name: mcpp build (linux x86_64, clang)
+    needs: plan
+    if: needs.plan.outputs.framework == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Cache xlings and mcpp
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.xlings
+            ~/.mcpp
+          key: mcpp-llvm-${{ runner.os }}-${{ runner.arch }}-v2-${{ env.MCPP_VERSION }}-${{ env.MCPP_LLVM }}-${{ hashFiles('mcpp.toml') }}
+          restore-keys: |
+            mcpp-llvm-${{ runner.os }}-${{ runner.arch }}-v2-${{ env.MCPP_VERSION }}-${{ env.MCPP_LLVM }}-
+
+      - name: Install the pinned mcpp and clang
+        uses: mcpp-community/setup-mcpp@5c65c7d7258af3182188eda8aa070269475e3f32 # v1.0.1
+        with:
+          version: ${{ env.MCPP_VERSION }}
+          toolchains: ${{ env.MCPP_LLVM }}
+
+      # `mcpp toolchain default` once, rather than --toolchain on each command.
+      # Only `mcpp build` takes that flag: `mcpp test` and `mcpp pack` reject it
+      # with `unknown option: --toolchain`, so a per-command flag would have to
+      # be a per-command environment variable for two of the three.
+      - name: Make clang the default toolchain
+        run: |
+          mcpp toolchain default "${MCPP_LLVM}"
+          mcpp toolchain list
+
+      - name: Build the framework
+        run: mcpp build
+
+      # THIS is the step the job exists for. A library builds under either
+      # compiler; consuming it as a MODULE is where they diverge, because clang
+      # records the thread model and target-feature set in the BMI and refuses
+      # one that disagrees with the importing translation unit. When that
+      # happens `import pingcore;` yields nothing and every name in the demo is
+      # undefined -- 19 errors that name the demo and never mention the BMI.
+      #
+      # The grep runs over THIS build's output, not a second one: a repeat
+      # `mcpp build` is fully cached, emits no compile lines, and would make
+      # the assertion pass by having nothing to read.
+      - name: Build the example application, and check the BMI was loaded
+        working-directory: buildtools/mcpp/examples/02-module-units
+        run: |
+          set -o pipefail
+          mcpp build 2>&1 | tee build.log
+          # A configuration mismatch is a warning before it is an error, so a
+          # build can pass while the module was quietly not in effect.
+          ! grep -q 'module-file-config-mismatch' build.log \
+            || { echo "clang rejected the BMI; import pingcore; is not in effect"; exit 1; }
+          ! grep -q 'was compiled with the target feature' build.log \
+            || { echo "BMI and consumer disagree about target features"; exit 1; }
+          echo "clang loaded pingcore.pcm"
+
+      # The suite that says the LIBRARY works, not just that it links. Same
+      # sources tests/unit/CMakeLists.txt compiles and the same vendored
+      # Catch2, against the framework mcpp built.
+      - name: Run the unit test suite
+        working-directory: buildtools/mcpp/pingcore-tests
+        run: mcpp test
+
+      - name: Pack the library and check its shape
+        run: |
+          mcpp pack
+          archive=$(find target/dist -name 'pingcore-*.tar.gz' | head -1)
+          test -n "$archive" || { echo "mcpp pack produced no archive"; exit 1; }
+          echo "packed $archive"
+
+  macos:
+    name: mcpp build (macos arm64)
+    needs: plan
+    if: needs.plan.outputs.framework == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      # No payload closure here: AppKit and the twelve other frameworks come
+      # from the machine's SDK, which is what `aarch64-macos` means in mcpp's
+      # target table. Only Linux declares [xlings.workspace] entries.
+      - name: Cache xlings and mcpp
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.xlings
+            ~/.mcpp
+          key: mcpp-${{ runner.os }}-${{ runner.arch }}-v2-${{ env.MCPP_VERSION }}-${{ hashFiles('mcpp.toml') }}
+          restore-keys: |
+            mcpp-${{ runner.os }}-${{ runner.arch }}-v2-${{ env.MCPP_VERSION }}-
+
+      - name: Install the pinned mcpp
+        uses: mcpp-community/setup-mcpp@5c65c7d7258af3182188eda8aa070269475e3f32 # v1.0.1
+        with:
+          version: ${{ env.MCPP_VERSION }}
+
+      # 25 Objective-C++ sources compiled with -fobjc-arc, and the frameworks
+      # from the top-level [runtime] table -- which the engine renders only for
+      # Mach-O, so the manifest states them once and unconditionally.
+      - name: Build the framework
+        run: mcpp build
+
+      - name: Build the examples
+        run: |
+          for example in buildtools/mcpp/examples/0*/; do
+            echo "--- $example"
+            ( cd "$example" && mcpp build )
+          done
+      # The suite that says the LIBRARY works, not just that it links. Same
+      # sources tests/unit/CMakeLists.txt compiles and the same vendored
+      # Catch2, against the framework mcpp built.
+      - name: Run the unit test suite
+        working-directory: buildtools/mcpp/pingcore-tests
+        run: mcpp test
+
+      - name: Pack the library and check its shape
+        shell: bash
+        run: |
+          mcpp pack
+          archive=$(find target/dist -name 'pingcore-*.tar.gz' -o -name 'pingcore-*.zip' | head -1)
+          test -n "$archive" || { echo "mcpp pack produced no archive"; exit 1; }
+          echo "packed $archive"
+          list=$(tar tzf "$archive" 2>/dev/null || unzip -Z1 "$archive")
+          for expected in 'include/pingcore/pingcore.h' 'interface/pingcore.cppm' 'mcpp.toml'; do
+            echo "$list" | grep -q "$expected" \
+              || { echo "the package omits $expected"; exit 1; }
+          done
+          # Both consumption paths belong in the package: a consumer writing
+          # `#include <pingcore/pingcore.h>` and one writing `import pingcore;`
+          # are looking at the same library.
+          echo "$list" | grep -qE 'lib/.+/(libpingcore\.a|pingcore\.lib)' \
+            || { echo "the package carries no library"; exit 1; }
+          echo "package carries headers, the module interface and a library"
+  windows:
+    name: mcpp build (windows x86_64)
+    needs: plan
+    if: needs.plan.outputs.framework == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      # mcpp locates MSVC on the machine for x86_64-windows-msvc; the
+      # developer environment is what makes the Windows SDK headers and the
+      # eighteen system import libraries reachable.
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+
+      - name: Cache xlings and mcpp
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.xlings
+            ~/.mcpp
+          key: mcpp-${{ runner.os }}-${{ runner.arch }}-v2-${{ env.MCPP_VERSION }}-${{ hashFiles('mcpp.toml') }}
+          restore-keys: |
+            mcpp-${{ runner.os }}-${{ runner.arch }}-v2-${{ env.MCPP_VERSION }}-
+
+      - name: Install the pinned mcpp
+        uses: mcpp-community/setup-mcpp@5c65c7d7258af3182188eda8aa070269475e3f32 # v1.0.1
+        with:
+          version: ${{ env.MCPP_VERSION }}
+
+      - name: Build the framework
+        shell: pwsh
+        run: mcpp build
+
+      # All three, as the other jobs do. This job had built only 02 because its
+      # step is written in pwsh and the loop that replaced the others did not
+      # match it.
+      - name: Build the examples
+        shell: pwsh
+        run: |
+          Get-ChildItem -Directory buildtools/mcpp/examples -Filter '0*' | ForEach-Object {
+            Write-Host "--- $($_.Name)"
+            Push-Location $_.FullName
+            mcpp build
+            if ($LASTEXITCODE -ne 0) { Pop-Location; throw "$($_.Name) failed" }
+            Pop-Location
+          }
+
+      - name: Assert the Windows executable carries its version resource
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: buildtools/mcpp/examples/02-module-units
+        run: |
+          $exe = Get-ChildItem -Recurse -Filter 'pingcore_example_module_units.exe' target | Select-Object -First 1
+          if (-not $exe) { throw 'the demo produced no executable' }
+          $info = $exe.VersionInfo
+          Write-Host "FileVersion=$($info.FileVersion) ProductName=$($info.ProductName)"
+          if (-not $info.FileVersion) { throw 'the executable carries no version resource' }
+
+      # The installer, written by mcpp-plugins' dist-wix through `mcpp pack`, which
+      # pingcore.rules configures; xim:wix is installed only when the pack asks for it.
+      - name: Assert the MSI is packed
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: buildtools/mcpp/examples/02-module-units
+        run: |
+          mcpp pack --pkg-format msi
+          if ($LASTEXITCODE -ne 0) { throw 'mcpp pack --pkg-format msi failed' }
+          $msi = Get-ChildItem -Recurse -Filter '*.msi' target | Select-Object -First 1
+          if (-not $msi) { throw 'mcpp pack produced no installer' }
+          Write-Host "packed $($msi.FullName) ($([math]::Round($msi.Length/1KB)) KB)"
+
+          # Read the File table rather than judging by size. A size threshold is
+          # a proxy for "carries the application", and a poor one: an installer
+          # whose source path resolved to nothing is a valid 52 KB MSI, and one
+          # that carries the wrong file is any size at all.
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $db = $installer.GetType().InvokeMember(
+              'OpenDatabase', 'InvokeMethod', $null, $installer, @($msi.FullName, 0))
+          $view = $db.GetType().InvokeMember(
+              'OpenView', 'InvokeMethod', $null, $db, @('SELECT FileName, FileSize FROM File'))
+          $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null)
+          $files = @()
+          while ($true) {
+            $row = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+            if (-not $row) { break }
+            $name = $row.GetType().InvokeMember('StringData', 'GetProperty', $null, $row, @(1))
+            $size = $row.GetType().InvokeMember('IntegerData', 'GetProperty', $null, $row, @(2))
+            $files += [pscustomobject]@{ Name = $name; Size = $size }
+          }
+          $files | ForEach-Object { Write-Host "  $($_.Name)  $($_.Size) bytes" }
+          if ($files.Count -eq 0) { throw 'the MSI carries no files' }
+          $exe = $files | Where-Object { $_.Name -like '*pingcore_example_module_units.exe*' }
+          if (-not $exe) { throw 'the MSI does not carry the application executable' }
+          if ($exe.Size -lt 1MB) { throw "the installed executable is $($exe.Size) bytes, which is not the application" }
+          if (-not ($files | Where-Object { $_.Name -like '*resources.bin*' })) {
+            throw 'the MSI does not carry the resource package'
+          }
+
+      # The suite that says the LIBRARY works, not just that it links. Same
+      # sources tests/unit/CMakeLists.txt compiles and the same vendored
+      # Catch2, against the framework mcpp built.
+      - name: Run the unit test suite
+        working-directory: buildtools/mcpp/pingcore-tests
+        run: mcpp test
+
+      - name: Pack the library and check its shape
+        shell: bash
+        run: |
+          mcpp pack
+          archive=$(find target/dist -name 'pingcore-*.tar.gz' -o -name 'pingcore-*.zip' | head -1)
+          test -n "$archive" || { echo "mcpp pack produced no archive"; exit 1; }
+          echo "packed $archive"
+          list=$(tar tzf "$archive" 2>/dev/null || unzip -Z1 "$archive")
+          for expected in 'include/pingcore/pingcore.h' 'interface/pingcore.cppm' 'mcpp.toml'; do
+            echo "$list" | grep -q "$expected" \
+              || { echo "the package omits $expected"; exit 1; }
+          done
+          # Both consumption paths belong in the package: a consumer writing
+          # `#include <pingcore/pingcore.h>` and one writing `import pingcore;`
+          # are looking at the same library.
+          echo "$list" | grep -qE 'lib/.+/(libpingcore\.a|pingcore\.lib)' \
+            || { echo "the package carries no library"; exit 1; }
+          echo "package carries headers, the module interface and a library"
+
+  generated-app:
+    name: every template, created then built
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Cache xlings and mcpp
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.xlings
+            ~/.mcpp
+          key: mcpp-${{ runner.os }}-${{ runner.arch }}-v2-${{ env.MCPP_VERSION }}-${{ hashFiles('mcpp.toml') }}
+          restore-keys: |
+            mcpp-${{ runner.os }}-${{ runner.arch }}-v2-${{ env.MCPP_VERSION }}-
+
+      - name: Install the pinned mcpp
+        uses: mcpp-community/setup-mcpp@5c65c7d7258af3182188eda8aa070269475e3f32 # v1.0.1
+        with:
+          version: ${{ env.MCPP_VERSION }}
+
+      # The CLI is a CMake artifact; only its dependencies are needed here, not
+      # the framework's.
+      - name: Build the pingcore CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev libepoxy-dev libsoup-3.0-dev pkg-config ninja-build
+          cmake -S . -B build-cli -G Ninja \
+            -DPINGCORE_BUILD_EXAMPLES=OFF \
+            -DPINGCORE_BUILD_SHARED=OFF \
+            -DPINGCORE_BUILD_CLI=ON \
+            -DPINGCORE_BUILD_TESTS=OFF
+          cmake --build build-cli --target pingcore_cli --parallel
+
+      # PINGCORE_HOME selects the SDK, and a source checkout is a valid one --
+      # the CLI already resolves the app-development Skill from either layout.
+      # Naming it here is what tells `create` that PingCore is this tree rather
+      # than a release, so it writes a path dependency instead of the published
+      # version, which is the only reason these projects can build before
+      # PingCore is in an mcpp index.
+      #
+      # EVERY TEMPLATE, not just the default one. `templates/` is what
+      # `mcpp new --template pingcore.pingcore:<name>` instantiates, and a
+      # template that renders but does not compile is a broken project handed
+      # to whoever runs that command.
+      - name: Create and build a project from every template
+        env:
+          PINGCORE_HOME: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          cli="$GITHUB_WORKSPACE/build-cli/bin/pingcore"
+          work="$RUNNER_TEMP/generated"
+          mkdir -p "$work"
+
+          run_one() {
+            local dir="$1"; shift
+            ( cd "$work" && "$cli" "$@" )
+            local project="$work/$dir"
+
+            grep -q '^pingcore = { path = ' "$project/mcpp.toml" \
+              || { echo "$dir: the CLI did not resolve a path dependency"; exit 1; }
+            grep -q '^#   pingcore\.pingcore = ' "$project/mcpp.toml" \
+              || { echo "$dir: the published identity is not recorded"; exit 1; }
+            # No headers anywhere: the entry instantiates nothing and the module
+            # unit reaches std::type_info through `import std;`.
+            ! grep -rn '^[[:space:]]*#include' "$project/src" \
+              || { echo "$dir: an mcpp project should carry no headers"; exit 1; }
+            test ! -e "$project/CMakeLists.txt" \
+              || { echo "$dir: an mcpp project should carry no CMakeLists.txt"; exit 1; }
+            echo "--- $dir"
+          }
+
+          run_one AppDemo create app AppDemo --build-system mcpp --agent none
+          run_one NavDemo create app NavDemo --build-system mcpp --template navigation --agent none
+          run_one my-widgets create library my-widgets --build-system mcpp --agent none
+
+          # The two applications build; the library is a lib, so its own test is
+          # what says it works -- and `mcpp test` proves the module it exports
+          # can actually be imported.
+          ( cd "$work/AppDemo" && mcpp build )
+          ( cd "$work/NavDemo" && mcpp build )
+          ( cd "$work/my-widgets" && mcpp test )
+          # The library's Preview is a C++ modules application that imports it.
+          ( cd "$work/my-widgets/examples/preview" && mcpp build )
+
+      - name: Assert the transform ran on a generated project
+        run: |
+          cd "$RUNNER_TEMP/generated/AppDemo"
+          generated=$(find target -path '*hcg*' -name '*app.cppm' | head -1)
+          test -n "$generated" || { echo "hcg did not transform src/app.cppm"; exit 1; }
+          grep -q 'return ::pingcore::Scope(' "$generated" \
+            || { echo "the composable was not wrapped"; exit 1; }
+          find target -type f -name AppDemo | head -1 | grep -q . \
+            || { echo "no executable was produced"; exit 1; }
+          echo "generated project builds and runs the transform"

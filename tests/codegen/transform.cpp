@@ -1,0 +1,317 @@
+#include "transform.h"
+
+#include <catch2/catch_amalgamated.hpp>
+
+#include <string>
+
+namespace {
+
+using pingcore::codegen::kScopeCloseText;
+using pingcore::codegen::kScopeOpenText;
+using pingcore::codegen::TransformError;
+using pingcore::codegen::TransformSource;
+
+TEST_CASE("Unmarked source is unchanged") {
+  const std::string source = "View Plain() {\n"
+                             "  return Text(\"plain\");\n"
+                             "}\n";
+  const auto result = TransformSource(source, "plain.cpp");
+
+  REQUIRE(result.composable_count == 0);
+  REQUIRE(result.source == source);
+}
+
+TEST_CASE("Composable marker generates scope boundaries") {
+  const std::string source = "[[pingcore::composable]]\n"
+                             "View Counter(int initial) {\n"
+                             "  auto count = UseState(initial);\n"
+                             "  return Text(count);\n"
+                             "}\n";
+  const auto result = TransformSource(source, "counter.cpp");
+
+  REQUIRE(result.composable_count == 1);
+  REQUIRE(result.source.find("[[pingcore::composable]]") == std::string::npos);
+  // The injected text is the macro's EXPANSION, not its name: generated code
+  // has to compile under `import pingcore;` too, and macros do not cross a
+  // module boundary.
+  REQUIRE(result.source.find(kScopeOpenText) != std::string::npos);
+  REQUIRE(result.source.find(kScopeCloseText) != std::string::npos);
+  REQUIRE(result.source.find("PINGCORE_SCOPE_BEGIN") == std::string::npos);
+  REQUIRE(result.source.find("#line 1 \"counter.cpp\"") != std::string::npos);
+}
+
+TEST_CASE("Nested syntax and literals are preserved") {
+  const std::string source = R"source(
+[[pingcore::composable]]
+View Complex(bool enabled) {
+  const std::string normal = "{ value }";
+  const std::string raw = R"raw({ raw })raw";
+  // }
+  /* { */
+  if (enabled) {
+    auto factory = [] {
+      return View{};
+    };
+    return factory();
+  }
+  return View{};
+}
+)source";
+  const auto result = TransformSource(source, "complex.cpp");
+
+  REQUIRE(result.composable_count == 1);
+  REQUIRE(result.source.find("return factory();") != std::string::npos);
+  REQUIRE(result.source.find("const std::string raw") != std::string::npos);
+}
+
+TEST_CASE("Profiling scope generation includes original definition metadata") {
+  const std::string source = "\n[[pingcore::composable]]\n"
+                             "View MessageRow() {\n"
+                             "  return Text(\"Message\");\n"
+                             "}\n";
+  const auto result = TransformSource(source, "/app/src/inbox.cpp", "src/inbox.cpp");
+
+  REQUIRE(result.composable_count == 1);
+  REQUIRE(result.source.find("Scope({__func__, \"src/inbox.cpp\", 3}, [=]()") != std::string::npos);
+  REQUIRE(result.source.find("#line 3 \"/app/src/inbox.cpp\"") != std::string::npos);
+}
+
+TEST_CASE("Multiple composables are transformed") {
+  const std::string source = "[[pingcore::composable]]\n"
+                             "View First() { return Text(\"first\"); }\n"
+                             "\n"
+                             "View Plain() { return Text(\"plain\"); }\n"
+                             "\n"
+                             "[[pingcore::composable]]\n"
+                             "View Second() { return Text(\"second\"); }\n";
+  const auto result = TransformSource(source, "multiple.cpp");
+
+  REQUIRE(result.composable_count == 2);
+  const std::size_t first = result.source.find(kScopeOpenText);
+  REQUIRE(first != std::string::npos);
+  REQUIRE(result.source.find(kScopeOpenText, first + 1) != std::string::npos);
+}
+
+TEST_CASE("Markers inside non-code text are ignored") {
+  const std::string source = "// [[pingcore::composable]]\n"
+                             "const char* marker = \"[[pingcore::composable]]\";\n";
+  const auto result = TransformSource(source, "ignored.cpp");
+
+  REQUIRE(result.composable_count == 0);
+  REQUIRE(result.source == source);
+}
+
+TEST_CASE("Composable declarations are rejected") {
+  REQUIRE_THROWS_AS(TransformSource("[[pingcore::composable]] View Counter();\n", "declaration.cpp"), TransformError);
+}
+
+TEST_CASE("Explicit scope boundaries are rejected") {
+  REQUIRE_THROWS_AS(TransformSource("[[pingcore::composable]]\n"
+                                    "View Counter() {\n"
+                                    "  PINGCORE_SCOPE_BEGIN\n"
+                                    "  return Text(\"counter\");\n"
+                                    "  PINGCORE_SCOPE_END\n"
+                                    "}\n",
+                                    "explicit.cpp"),
+                    TransformError);
+}
+
+TEST_CASE("Composable branches with balanced braces are preserved") {
+  const std::string branches = R"source(/* Optional counter */ #if defined(ENABLE_COUNTER) && \
+    ENABLE_COUNTER /* Debug counter
+} */
+# /* Visibility */ ifndef HIDE_COUNTER
+  return Column { Text(UseState(0)) };
+#else
+  return View{};
+#endif
+#elif defined(ENABLE_FALLBACK)
+  return Text("fallback");
+#else
+  return View{};
+#endif
+)source";
+  const auto result = TransformSource("[[pingcore::composable]] View Counter() {\n" + branches + "}\n",
+                                      "conditional.cpp");
+
+  REQUIRE(result.composable_count == 1);
+  const auto scope_open = result.source.find(kScopeOpenText);
+  const auto branches_begin = result.source.find(branches);
+  const auto scope_close = result.source.find(kScopeCloseText);
+  REQUIRE(scope_close != std::string::npos);
+  REQUIRE(scope_open < branches_begin);
+  REQUIRE(branches_begin < scope_close);
+}
+
+TEST_CASE("Composable branches cannot share braces") {
+  const std::string source = R"source([[pingcore::composable]] View Counter() {
+#if ENABLE_COUNTER
+  {
+#else
+  }
+#endif
+  return View{};
+}
+)source";
+  REQUIRE_THROWS_WITH(TransformSource(source, "conditional.cpp"),
+                      "each preprocessor branch in a composable function must balance its braces");
+}
+
+TEST_CASE("Composable branches cannot close braces from outside their conditional") {
+  const std::string source = R"source([[pingcore::composable]] View Counter() {
+  {
+#ifdef ENABLE_COUNTER
+  } {
+#endif
+    return View{};
+  }
+}
+)source";
+  REQUIRE_THROWS_WITH(TransformSource(source, "conditional.cpp"),
+                      "a preprocessor branch cannot close a brace opened before its conditional");
+}
+
+TEST_CASE("Unmarked composition calls are rejected") {
+  REQUIRE_THROWS_AS(TransformSource("View Counter() {\n"
+                                    "  auto count = UseState(0);\n"
+                                    "  return Text(count);\n"
+                                    "}\n",
+                                    "unmarked.cpp"),
+                    TransformError);
+}
+
+TEST_CASE("Qualified unmarked composition calls are rejected") {
+  REQUIRE_THROWS_AS(TransformSource("View Timer() {\n"
+                                    "  auto timer = example::UseTimer();\n"
+                                    "  return View{};\n"
+                                    "}\n",
+                                    "qualified.cpp"),
+                    TransformError);
+}
+
+TEST_CASE("Templated unmarked composition calls are rejected") {
+  REQUIRE_THROWS_AS(TransformSource("View Content() {\n"
+                                    "  const auto& value = UseEnvironment<Locale>();\n"
+                                    "  return Text(value.name);\n"
+                                    "}\n",
+                                    "templated.cpp"),
+                    TransformError);
+}
+
+TEST_CASE("Composition calls in control flow are not mistaken for hook definitions") {
+  REQUIRE_THROWS_AS(TransformSource("View Content() {\n"
+                                    "  if (UseState(false)) {\n"
+                                    "    return Text(\"active\");\n"
+                                    "  }\n"
+                                    "  return View{};\n"
+                                    "}\n",
+                                    "control_flow.cpp"),
+                    TransformError);
+}
+
+TEST_CASE("Qualified composition calls in control flow are not mistaken for hook definitions") {
+  REQUIRE_THROWS_AS(TransformSource("View Content() {\n"
+                                    "  if (pingcore::UseState(false)) {\n"
+                                    "    return Text(\"active\");\n"
+                                    "  }\n"
+                                    "  return View{};\n"
+                                    "}\n",
+                                    "qualified_control_flow.cpp"),
+                    TransformError);
+}
+
+TEST_CASE("Application roots use their implicit composition scope") {
+  const std::string source = "View App() {\n"
+                             "  auto count = UseState(0);\n"
+                             "  return Text(count);\n"
+                             "}\n"
+                             "const Application application{App};\n";
+  const auto result = TransformSource(source, "application.cpp");
+
+  REQUIRE(result.composable_count == 0);
+  REQUIRE(result.source == source);
+}
+
+TEST_CASE("Use-prefixed hooks share their caller composition context") {
+  const std::string source = "auto UseService() noexcept -> Service { return UseState(Service{}); }\n"
+                             "View Plain(Helper& helper) {\n"
+                             "  helper.UseValue();\n"
+                             "  return View{};\n"
+                             "}\n";
+  const auto result = TransformSource(source, "plain.cpp");
+
+  REQUIRE(result.composable_count == 0);
+  REQUIRE(result.source == source);
+}
+
+TEST_CASE("Use-prefixed function declarations are not composition calls") {
+  const std::string source = "Service UseService();\n"
+                             "View Plain() { return View{}; }\n";
+  const auto result = TransformSource(source, "hook_declaration.cpp");
+
+  REQUIRE(result.composable_count == 0);
+  REQUIRE(result.source == source);
+}
+
+TEST_CASE("Ambient application and window facilities do not require composition") {
+  const std::string source = "void Install(ApplicationContext& context) {\n"
+                             "  auto application = UseApplication();\n"
+                             "  auto tasks = UseApplicationTaskScope();\n"
+                             "  auto service = pingcore::UseService<Service>();\n"
+                             "}\n"
+                             "void Click() { auto window = UseWindow(); }\n";
+  REQUIRE(TransformSource(source, "application_start.cpp").source == source);
+  REQUIRE_THROWS_AS(TransformSource("void Click() { auto state = UseState(0); }", "event.cpp"), TransformError);
+}
+
+TEST_CASE("Explicit Scope lambdas provide a composition context") {
+  const std::string source = "View Counter() {\n"
+                             "  return Scope([] {\n"
+                             "    auto count = UseState(0);\n"
+                             "    return Text(count);\n"
+                             "  });\n"
+                             "}\n";
+  const auto result = TransformSource(source, "explicit_scope.cpp");
+
+  REQUIRE(result.composable_count == 0);
+  REQUIRE(result.source == source);
+}
+
+TEST_CASE("Explicit scope macros provide a composition context") {
+  const std::string source = "View Counter() {\n"
+                             "  PINGCORE_SCOPE_BEGIN\n"
+                             "  auto count = UseState(0);\n"
+                             "  return Text(count);\n"
+                             "  PINGCORE_SCOPE_END\n"
+                             "}\n";
+  const auto result = TransformSource(source, "explicit_scope_macro.cpp");
+
+  REQUIRE(result.composable_count == 0);
+  REQUIRE(result.source == source);
+}
+
+TEST_CASE("Explicit scope macro calls provide a composition context") {
+  const std::string source = "View Counter() {\n"
+                             "  PINGCORE_SCOPE({\n"
+                             "    auto count = UseState(0);\n"
+                             "    return Text(count);\n"
+                             "  });\n"
+                             "}\n";
+  const auto result = TransformSource(source, "explicit_scope_call.cpp");
+
+  REQUIRE(result.composable_count == 0);
+  REQUIRE(result.source == source);
+}
+
+TEST_CASE("Composition calls in preprocessor directives are outside lexical validation") {
+  const std::string source = R"source(#define PINGCORE_TEST_STATE() \
+  UseState(0)
+View Plain() { return View{}; }
+)source";
+  const auto result = TransformSource(source, "macro.cpp");
+
+  REQUIRE(result.composable_count == 0);
+  REQUIRE(result.source == source);
+}
+
+} // namespace

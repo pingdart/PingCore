@@ -1,0 +1,47 @@
+#pragma once
+
+#include <jni.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <optional>
+
+#include <pingcore/platform_registry.h>
+#include <pingcore/render_scene.h>
+
+namespace pingcore {
+class UiWindow;
+}
+
+namespace pingcore::detail {
+
+class AndroidRenderer;
+
+class AndroidPlatformViews final {
+public:
+  AndroidPlatformViews(JNIEnv* environment, jobject root, jobject context, AndroidRenderer& renderer,
+                       PlatformRegistry& registry, UiWindow& ui_window);
+  ~AndroidPlatformViews();
+
+  AndroidPlatformViews(const AndroidPlatformViews&) = delete;
+  AndroidPlatformViews& operator=(const AndroidPlatformViews&) = delete;
+
+  void Commit(JNIEnv* environment, const RenderFrame& frame);
+  void DrawBase(JNIEnv* environment, jobject canvas);
+  void DrawSlice(JNIEnv* environment, jobject canvas, std::size_t first_command, std::size_t command_count);
+  void SetTextureLayerSurface(
+      JNIEnv* environment, std::uint64_t identity, jobject surface, int pixel_width, int pixel_height
+  );
+  void ClearTextureLayerSurface(std::uint64_t identity) noexcept;
+  [[nodiscard]] std::optional<std::uint64_t> HitTest(Point point) const;
+  void SynchronizeFocus(std::optional<std::uint64_t> identity, bool focus_visible);
+  [[nodiscard]] bool MoveFocus(std::uint64_t identity, bool reverse);
+  void Shutdown(JNIEnv* environment);
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+} // namespace pingcore::detail

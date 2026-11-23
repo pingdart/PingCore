@@ -1,0 +1,77 @@
+#pragma once
+
+#include <CoreGraphics/CoreGraphics.h>
+
+#include <cstddef>
+#include <memory>
+#include <string_view>
+
+#include <pingcore/bitmap.h>
+#include <pingcore/geometry.h>
+#include <pingcore/render_scene.h>
+#include <pingcore/text.h>
+
+namespace pingcore::detail {
+
+Bitmap CopyCGImagePixels(CGImageRef image, float scale = 1.0F);
+
+class TextLayoutBackend;
+
+class UIKitRenderer final {
+public:
+  UIKitRenderer();
+  ~UIKitRenderer();
+
+  UIKitRenderer(const UIKitRenderer&) = delete;
+  UIKitRenderer& operator=(const UIKitRenderer&) = delete;
+
+  [[nodiscard]] FontMetrics Metrics(const Font& font);
+  [[nodiscard]] TextRunMetrics
+  MeasureRun(std::string_view text, const TextStyle& style, const TextShapingOptions& options = {});
+  [[nodiscard]] TextLayoutMetrics
+  MeasureText(std::string_view text, const TextStyle& style, float max_width, const TextLayoutOptions& options = {});
+  std::unique_ptr<TextLayoutBackend> CreatePlatformTextLayout(
+      std::string_view text, const TextStyle& style, float max_width, const TextLayoutOptions& options = {});
+  [[nodiscard]] TextLayoutMetrics MeasureText(const AttributedText& text, const TextStyle& style, float max_width,
+      const TextLayoutOptions& options = {});
+  std::unique_ptr<TextLayoutBackend> CreatePlatformTextLayout(
+      const AttributedText& text, const TextStyle& style, float max_width, const TextLayoutOptions& options = {});
+  void DrawSlice(
+      CGContextRef context,
+      CGRect dirty_rect,
+      const RenderFrame* frame,
+      std::size_t first_command,
+      std::size_t command_count,
+      bool draw_background
+  );
+
+private:
+  struct Impl;
+  struct CommandRange;
+
+  void RenderSequence(const PaintSequence& sequence, CGContextRef context, CommandRange* range);
+  void RenderSceneNode(const RenderNode& node, CGContextRef context, CommandRange* range);
+  void RenderCommand(CGContextRef context, const DrawRectCommand& command);
+  void RenderCommand(CGContextRef context, const DrawTextCommand& command, const TextLayoutBackend* prepared);
+  void RenderCommand(CGContextRef context, const DrawTextRunsCommand& command);
+  void RenderCommand(CGContextRef context, const DrawImageCommand& command);
+  void RenderCommand(CGContextRef context, const DrawExternalTextureCommand& command);
+  void RenderCommand(CGContextRef context, const DrawCircleCommand& command);
+  void RenderCommand(CGContextRef context, const DrawLineCommand& command);
+  void RenderCommand(CGContextRef context, const DrawArcCommand& command);
+  void RenderCommand(CGContextRef context, const DrawBorderCommand& command);
+  void RenderCommand(CGContextRef context, const DrawShadowCommand& command);
+  void RenderCommand(CGContextRef context, const FillPathCommand& command);
+  void RenderCommand(CGContextRef context, const StrokePathCommand& command);
+  void RenderCommand(CGContextRef context, const DrawPathShadowCommand& command);
+  void RenderCommand(CGContextRef context, const PushClipCommand& command);
+  void RenderCommand(CGContextRef context, const PushPathClipCommand& command);
+  void RenderCommand(CGContextRef context, const PopClipCommand& command);
+  void RenderCommand(CGContextRef context, const PushTransformCommand& command);
+  void RenderCommand(CGContextRef context, const PopTransformCommand& command);
+  void RenderCommand(CGContextRef context, const PlacePlatformViewCommand& command);
+
+  std::unique_ptr<Impl> impl_;
+};
+
+} // namespace pingcore::detail

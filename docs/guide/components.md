@@ -1,0 +1,800 @@
+# Components and Input
+
+Components are controlled declarations that emit typed events.
+Use application state for authoritative values and let mounted behavior retain transient interaction state.
+
+## Text, images, and drawing
+
+`Text` accepts literals, `StringResource`, formatted values, `AttributedText`, and `State<T>`.
+Use `TextRole` for theme typography or provide an explicit `TextStyle`.
+Use `Align(TextAlign::...)` for horizontal paragraph alignment and `VerticalAlign(TextVerticalAlign::...)` when a framed Text should place its paragraph within extra height.
+Vertical alignment does not change intrinsic text measurement.
+Text, built-in labels, and TextField use the inherited `Locale` for shaping when no locale is supplied.
+Use `Shaping(TextShapingOptions{...})` on Text or TextField for a local direction or locale override without changing localized resource lookup:
+
+```cpp
+return Text("مرحبا")
+    .Shaping({.direction = TextDirection::RightToLeft, .locale = "ar"});
+```
+
+Canvas `DrawText`, `DrawTextRun`, and `DrawTextRuns` calls inherit the Canvas node Locale only for entries whose shaping locale is empty.
+Recording a positioned text run rejects Unicode mandatory line breaks. Windows applies the same check to `MeasureRun()`.
+TextMeasurer has no implicit Environment lookup; pass a locale explicitly when custom composition measurement needs it.
+On Windows, paragraphs and positioned text runs use color glyphs when the font supplies them and all foreground colors for that paragraph or run are fully opaque.
+
+### Line limits and overflow
+
+Use `Text::LineLimit(maximum)` to cap the number of displayed lines. A limit of one disables automatic wrapping, and a larger limit caps the wrapped paragraph. The available content width comes from the parent layout or a width modifier. The visible lines determine the natural height.
+
+```cpp
+return Text(file_name)
+    .LineLimit(1)
+    .Overflow(TextOverflow::MiddleEllipsis)
+    .With(Frame{.width = 160.0F});
+```
+
+`TextOverflow::Clip` is the default. `TextOverflow::Ellipsis` marks omitted text at the end of the last visible line. `StartEllipsis` and `MiddleEllipsis` require `LineLimit(1)` and operate on the first source line. An ellipsis is drawn when it fits, and cuts occur at extended grapheme boundaries. Shaping and alignment retain the original paragraph direction. The accessible label uses the complete original text. Selection and visible links continue to address the original UTF-16 ranges. Tab traversal skips links that were fully omitted.
+
+### Attributed paragraphs and links
+
+Use one `Text` for a paragraph with mixed character styles. `AttributedText` is an immutable shared value, not a tree of span Views:
+
+```cpp
+const AttributedText paragraph{
+  TextSpan("Read "),
+  TextSpan("the guide").Style({.font_weight = FontWeight::Bold})
+                       .Link(Uri("https://example.com/guide")),
+  TextSpan(" before continuing."),
+};
+return Text(paragraph).On<TextEvents::LinkActivated>([](const TextLinkActivation& link) {
+  // Validate the scheme and request application navigation here.
+  OpenApplicationRoute(link.target);
+});
+```
+
+`TextSpanStyle` optionally overrides a complete Font, size, weight, slant, foreground, background, and decoration. Unspecified fields inherit the paragraph's final TextStyle; `TextDecoration::None` explicitly clears decoration. Alignment, wrapping, direction, and shaping locale remain paragraph-wide. Backgrounds follow visual fragments without adding padding.
+
+For already assembled content, `AttributedText::FromRanges(body, styles, links)` accepts independent ordered, non-overlapping style and link ranges. All offsets are UTF-16 code units, not UTF-8 byte offsets; invalid UTF-8, out-of-bounds ranges, and split surrogate pairs throw `std::invalid_argument`. `WithStyles(styles)` replaces visual ranges while sharing the existing body and retaining links. A link may cross several style ranges and remains one interaction and accessibility target.
+
+Links inherit Theme primary color and underlining unless a range explicitly overrides them. Pointer clicks, Tab/Shift-Tab and Enter, and supported platform accessibility actions emit the same `TextEvents::LinkActivated` event, containing the current target and range. PingCore never opens the URI automatically. Dragging, long press, scrolling, cancellation, and disabled input suppress activation. Focus indication uses the Theme's existing focus ring.
+
+Attributed text contains resolved direct text; translating sentence fragments independently is not a substitute for localizing the whole sentence. Existing StringResource-based plain Text declarations remain unchanged.
+
+### Custom fonts
+
+`FontFamily` is a reusable immutable family; `Font` adds size, weight, and slant.
+Existing system, monospace, and installed-name factories remain available.
+`Font::Size()` is the application's baseline logical size, independent of device pixels; platform text scaling can change measured geometry without changing the Font value.
+On Linux, every family (including custom fonts and attributed runs) follows GTK's effective text DPI; see [Linux](platforms.md#linux).
+Supply application fonts as ordinary raw resources, local files, or owned bytes:
+
+```cpp
+auto family = FontFamily::FromResources({app::raw::brand_regular_ttf, app::raw::brand_bold_ttf});
+auto title = Font::FromFamily(family, 24.0F).WithWeight(FontWeight::Bold);
+auto body = title.WithSize(16.0F).WithWeight(FontWeight::Regular);
+auto replacement = body.WithFamily(FontFamily::Monospace());
+
+auto disk_family = FontFamily::FromFiles({File("/absolute/path/Regular.ttf"), File("/absolute/path/Bold.ttf")});
+auto memory_family = FontFamily::FromBytes({std::move(regular_bytes), std::move(bold_bytes)});
+
+auto single_resource = Font::FromResource(app::raw::brand_regular_ttf, 16.0F);
+auto single_file = Font::FromFile(File("/absolute/path/Regular.ttf"), 16.0F);
+auto single_bytes = Font::FromBytes(std::move(font_bytes), 16.0F);
+return Text("Custom font").Style(TextStyle{title, Color::Black()});
+```
+
+The single-source Font factories are conveniences over FontFamily; use a family when supplying several weights/slants or sharing it through [theme typography](themes-and-presentation.md).
+Custom families accept static single-face TTF/OTF files of the same typographic family and width, with distinct weight/slant pairs.
+The framework prefers a matching slant and then the nearest weight according to CSS Fonts matching rules; it does not synthesize a missing custom bold or italic face.
+Missing glyphs retain native platform fallback. Collections, variable fonts, WOFF, and explicit fallback chains are not supported.
+
+`FromResources` uses the current Runtime's existing Resources service on the application thread; it works without a window or composition.
+File and byte factories do not require Runtime and can run on a worker thread.
+File loading is synchronous: use the existing `File::ReadBytesAsync()` followed by `FontFamily::FromBytes()` when blocking is inappropriate.
+Files are read once into owned snapshots; later changes or deletion do not alter existing fonts.
+Invalid/unsupported data or invalid combinations throw `std::invalid_argument`, file read failures throw `std::runtime_error`, and unavailable resource context or missing resources throw `std::logic_error`.
+Native decoding can still reject a structurally accepted font; that emits a diagnostic and uses system fallback.
+
+Web displays system fallback while the browser decodes the bytes, then updates text measurement, line wrapping, paint, selection, and TextField geometry automatically.
+Controlled text, selection, and focus survive that update.
+On Web and Linux, `UseTextMeasurer()` subscribes composition to font readiness and text DPI changes respectively; remeasure during recomposition to update geometry derived from its results.
+Previously returned measurements remain snapshots and do not update themselves.
+
+### Custom text layout
+
+Use `UseTextMeasurer().CreateTextLayout(text, style, width, options)` when drawing and interaction need the same paragraph geometry. Keep the resulting `TextLayout` on the UI thread and recreate it during composition or `NodeExtension::PrepareGeometry()` when its inputs change. Pass the effective shaping locale explicitly when the editor should inherit it.
+
+`Lines()`, `HitTest()`, `CaretRect()`, and `RangeRects()` use coordinates relative to the paragraph origin and UTF-16 text offsets. `LineIndex()` uses caret affinity at soft wraps, and `PreviousCaretOffset()` and `NextCaretOffset()` step through logical caret boundaries. Pass the layout to `PaintContext::DrawText(origin, layout)` and use the same origin to translate pointer and selection geometry.
+
+To reserve room for an inline formula or graphic, insert one U+FFFC into the paragraph and annotate its UTF-16 offset with `AttributedText::WithInlineObjects()`. Supply the object's width, ascent, and descent in logical units. The object takes part in line breaking and baseline alignment as one unit. `DrawText(origin, layout)` leaves its position blank. Draw the object using `layout.InlineObjectRect(offset)` translated by the same paragraph origin.
+
+```cpp
+const auto paragraph = AttributedText("中文👩‍💻\uFFFC继续").WithInlineObjects({{7, 36.0F, 24.0F, 12.0F}});
+const auto layout = measurer.CreateTextLayout(paragraph, style, width);
+```
+
+Here the emoji spans UTF-16 offsets 2 through 7 and the object spans 7 through 8. Use `HitTest()` for caret placement and test the object rectangle for object activation. Keep the formula content and editing state in the application. Create a new layout when the object's dimensions change.
+
+The [custom editor example](../../examples/custom_editor/main.cpp) lays out rich paragraphs around a drawn block using public APIs. Its scrollable toolbar includes character styles, a size menu, text color and highlight palettes, rounded inline code backgrounds, and a clear formatting action. It applies styles to selections across paragraphs, shares undo and redo across text and formatting edits, and uses a single `TextInputClient` session for the whole document.
+
+### Selection and virtualized text
+
+Wrap ordinary content in `SelectionArea` to select across descendant Text nodes. Nested areas are independent; copied paragraphs are separated by newlines. Static content supports Copy and Select All but never starts an IME session. Mouse dragging, double-click, Shift-click, touch long press, and selection handles use retained geometry.
+
+On touch devices, a completed tap outside the selection controls clears the existing read-only selection without consuming a button or link action. Scrolling preserves the range and temporarily hides its controls; an already-open menu returns when scrolling, including momentum, finishes and selected text is visible. Scrolling an offscreen selection back into view can restore that menu, but does not reopen a menu explicitly dismissed with Copy or Back.
+If a source update removes a selected endpoint block, both the logical selection and its pending menu presentation end; a later selection does not inherit the old menu.
+
+Virtualized documents provide a shared immutable `TextSelectionSource` snapshot, with `Count()`, `IdAt(index)`, `IndexOf(id)`, and `BlockAt(index)`. A block returns its attributed text and the separator to use when copying into the following block. Derive both the source and the visible Text values from the same snapshot:
+
+```cpp
+return SelectionArea(
+    VirtualList(snapshot->Count(), [snapshot](std::size_t index) {
+      const auto id = snapshot->IdAt(index);
+      return Text(snapshot->BlockAt(index).text).SelectionBlock(id).Key(id);
+    })
+).Source(snapshot);
+```
+
+`SelectionBlock(id)` identifies one complete logical paragraph; it is independent of the sibling-local View Key. Each bound block can have only one mounted Text within its area, and its plain body must match the source. Unbound decorative Text is excluded in explicit-source mode. Source methods must not create Views, perform I/O, parse markup, or depend on mounted nodes.
+
+Select All establishes endpoints without reading every block. Copy reads only the selected blocks, including unmounted content, and does not add a trailing separator. Offscreen endpoints lose geometry, not selection. Dragging near a scroll viewport edge advances through newly realized blocks.
+
+Publish replacement source snapshots through State. Stable block IDs preserve endpoints across reorder; removing an endpoint block clears selection. Style changes preserve selection, and appended text does not extend an existing selection. Replaced endpoint text uses a conservative common-prefix/suffix mapping, not editor transaction semantics.
+
+For streaming, keep generation outside virtual rows, share completed blocks, and observe the changing block in its own composable scope. Batch deltas and bound pending UI publication instead of queuing a callback per token. Do not split ordinary paragraphs at arbitrary character counts: an indefinitely growing paragraph can still require full reflow. The [streaming example](../../examples/streaming_text/main.cpp) demonstrates these ownership rules, latest-version highlighting, and conditional bottom following without a parser or document framework.
+
+Web keeps its Canvas renderer and supports styles, wrapping, links, and basic selection. It does not promise parity with non-Web backends for mixed bidirectional text, ligatures across style boundaries, or contextual shaping across separately drawn runs. Platform font engines may also differ in exact glyph metrics.
+
+### Images and custom drawing
+
+`Color::Rgb(red, green, blue, alpha)` accepts separate byte channels and a normalized alpha value.
+For packed 32-bit values, use `Color::Rgba32(0xRRGGBBAA)` or `Color::Argb32(0xAARRGGBB)` so the byte order remains explicit at the call site:
+
+```cpp
+const Color rgba_accent = Color::Rgba32(0x6750A4FFU);
+const Color argb_accent = Color::Argb32(0xFF6750A4U);
+```
+
+See [Resources and Images](resources.md#display-and-draw-images) for displaying and drawing resource images, encoded assets, bitmaps, and live textures.
+
+`Canvas` and `Path` provide custom platform-neutral drawing that is replayed by every renderer.
+Filled rectangles use `DrawRect()`, while lines, arcs, borders, and paths share `StrokeStyle` for width, caps, joins, miter limits, and optional dashes.
+`Path::ArcTo()` continues an active contour with an endpoint-based elliptical arc, using explicit radii, x-axis rotation in radians, arc size, direction, and endpoint.
+
+```cpp
+return Canvas([](PaintContext& paint, Size size) {
+  paint.DrawLine({0.0F, size.height * 0.5F}, {size.width, size.height * 0.5F}, Color::Black(),
+                 StrokeStyle{.width = 2.0F, .cap = StrokeCap::Round, .dash_pattern = {8.0F, 4.0F}});
+});
+```
+
+Connected arcs can participate in fills, strokes, shadows, and clips:
+
+```cpp
+Path sector;
+sector.MoveTo({24.0F, 24.0F})
+    .LineTo({44.0F, 24.0F})
+    .ArcTo({20.0F, 12.0F}, 0.0F, ArcSize::Large, ArcDirection::Clockwise, {8.0F, 36.0F})
+    .Close();
+paint.FillPath(sector, Color::Black());
+```
+
+`Brush` is the common Color, linear-gradient, or elliptical-radial-gradient source accepted by `DrawRect()`, `FillPath()`, and `StrokePath()`.
+Normalized gradient geometry uses exact Path bounds by default, or explicit Brush bounds when several Paths must share one gradient space.
+The identity-by-default affine transform is expressed in that normalized space and changes gradient sampling without moving or clipping the painted geometry:
+
+```cpp
+const LinearGradient highlight{
+    .start = {0.0F, 0.0F},
+    .end = {1.0F, 1.0F},
+    .stops = {{0.0F, Color::Rgb(103, 80, 164)}, {1.0F, Color::Rgb(208, 188, 255)}},
+    .transform = {0.0F, 1.0F, -1.0F, 0.0F, 1.0F, 0.0F},
+};
+paint.FillPath(sector, highlight);
+paint.StrokePath(sector, highlight, StrokeStyle{.width = 3.0F, .join = StrokeJoin::Round});
+```
+
+Use `Path::Contains(point, fill_rule)` when custom interaction must test the same local filled geometry.
+Pass the fill rule used to paint the path; open contours receive the same implicit closing edge, and points on the boundary are included.
+The query tests fill geometry rather than stroke width.
+
+Dash lengths and offsets use the local logical units of the painted geometry.
+An empty pattern is solid, entries alternate between painted and skipped lengths, and an odd-length pattern repeats to form an even cycle.
+Each Path contour restarts the pattern; `DrawLine`, `DrawArc`, and `DrawBorder` define stable starting points so changing `dash_offset` is deterministic.
+Use `DrawBorder()` to stroke rectangle geometry; `DrawRect()` intentionally remains a fill operation.
+
+## Buttons and selection controls
+
+- `Button` emits `OnClick`.
+- `IconButton` requires an icon and semantic label.
+- `Checkbox`, `RadioButton`, and `Switch` receive a controlled Boolean and emit `OnChanged`.
+- `Chip` supports an optional icon and controlled selected state.
+- `SegmentedButton` receives items and a controlled selected index.
+- `Select` receives a finite item range and a controlled selected index.
+- `ComboBox` receives a controlled editing value and an application-provided suggestion range.
+- `DatePicker` receives a controlled `std::chrono::year_month_day`.
+- `TimePicker` receives controlled minutes since midnight.
+- `Slider` receives a controlled value and can define range and step.
+- `ProgressCircle` and `ProgressBar` support determinate and indeterminate presentation.
+
+```cpp
+[[pingcore::composable]]
+View Controls() {
+  auto enabled = UseState(false);
+  auto volume = UseState(0.5F);
+
+  return Column {
+    Switch("Enabled", enabled).OnChanged([enabled](bool value) {
+      enabled = value;
+    }),
+    Slider(volume)
+        .Range(0.0F, 1.0F)
+        .Step(0.05F)
+        .OnChanged([volume](float value) {
+          volume = value;
+        }),
+  }.With(Spacing(12.0F));
+}
+```
+
+Disabled behavior is configured with the shared enabled modifier where supported.
+Disabled components remain visible but do not emit activation or value-change events.
+
+### Slider adjustment events
+
+`OnStarted(float)` reports the displayed, range-clamped controlled value before an adjustment.
+`OnChanged(float)` requests constrained, step-snapped values while the pointer moves.
+`OnCommitted(float)` reports the final proposal on pointer release, including a final position change; it does not acknowledge that the application accepted or persisted that value.
+A click at the unchanged value still emits Started and Committed, without Changed.
+Ordinary controlled-value writeback or theme recomposition neither starts another adjustment nor replaces the active pointer's last proposal.
+
+Each effective keyboard KeyDown, including long-press repeats, emits Started, Changed, and Committed independently; KeyUp and no-op input at a range boundary emit none of these events.
+Each effective accessibility adjustment follows the same atomic sequence.
+While a pointer adjustment is active, another pointer, keyboard adjustment, or accessibility adjustment cannot replace it.
+
+`OnCanceled()` ends an active pointer adjustment on pointer cancellation, capture loss, Escape, disabling, or a range/step change.
+Cancellation does not emit Committed or a rollback Changed; the application owns any preview rollback.
+For a media slider, capture the preview origin in OnStarted, update the preview in OnChanged, perform the seek in OnCommitted, and discard the preview in OnCanceled.
+Unmounting is not a guaranteed terminal notification; an owner removing the component must also clean up its preview or pending work.
+DatePicker and TimePicker remain controlled value editors; confirmation or cancellation of a surrounding dialog belongs to that dialog's application logic.
+
+## TreeView
+
+`TreeView<Node>(roots, factory, item_info)` accepts a vector snapshot of application-owned values or handles.
+It does not require a model base class, global ID map, or an eagerly initialized tree.
+The required item-info provider supplies each item's accessible label, enabled state, expansion state, and optional selection.
+
+```cpp
+return TreeView<Node>(roots, [](const Node& node) {
+  return FileRow(node).Key(node->key);
+}, [selected](const Node& node) {
+  const Node& current = selected;
+  return TreeItemInfo{
+      .label = node->name,
+      .expandable = node->is_directory,
+      .expanded = node->expanded,
+      .selected = current == node,
+  };
+}).Children([](const Node& node) -> std::vector<Node> {
+  return node->children;
+}).OnExpandedChanged([tasks](const Node& node, bool expanded) {
+  node->expanded = expanded;
+  if (expanded) {
+    EnsureChildrenLoaded(tasks, node);
+  }
+}).OnSelectionChanged([selected](const Node& node, bool value) {
+  if (value) {
+    selected = node;
+  } else if (const Node& current = selected; current == node) {
+    selected = Node{};
+  }
+}).OnActivated([](const Node& node) {
+  OpenFile(node);
+}).Label("Project files")
+    .ItemExtent(32.0F)
+    .CacheExtent(128.0F)
+    .Controller(scroll)
+    .With(Frame{.height = 320.0F});
+```
+
+Here `Node`, `FileRow`, `EnsureChildrenLoaded`, and `OpenFile` are application code.
+The [File Tree example](../../examples/tree_view/main.cpp) shows the complete pattern with handle-based nodes and
+simulated asynchronous child loading.
+`expanded` and `selected` are controlled: events request changes, and the next supplied values remain authoritative.
+Programmatic updates emit no events.
+An absent `selected` makes an item nonselectable; a bool enables single selection, with at most one selected expanded item.
+Selecting another item emits one request for that item rather than clearing the previous item through a second event.
+Collapsing a branch preserves application data and any selected descendant.
+
+`expandable` can be true while Children is empty, including before an asynchronous load finishes.
+Children returns the current synchronous snapshot and is read only for expanded items.
+Start loading from the expansion event or an application-owned lifecycle, and guard loading/loaded state in the application.
+Initial or programmatic expansion must start the same loading operation explicitly.
+Keep tasks above virtual rows because row eviction ends their lifecycle and TaskScope; copy an owning Node handle into asynchronous work because event references are borrowed.
+
+Put a key on the factory's returned root View; a key inside its deferred body cannot identify the logical item.
+Keys must be unique among siblings, while different parents may reuse the same local key.
+Unkeyed rows use sibling position, so changing their sibling order can change local state identity.
+The factory runs once per expanded logical item when the tree snapshot recomposes, while only viewport/cache rows and the focused row are mounted.
+Declare complex `FileRow` content as composable so its body runs only when realized.
+Scrolling does not rerun the factory or Children callbacks.
+
+TreeView requires a bounded vertical viewport and uses fixed-height rows, configured by ItemExtent or TreeViewStyle.
+Use `Style(...)` for one tree or `ThemeDefinition::Set(TreeViewStyle)` for inherited styling.
+Use `DisclosureIcon(...)` to replace the right-facing icon for expandable rows; TreeView animates the supplied image clockwise by 90 degrees when a row expands.
+Vector disclosure icons follow the enabled or disabled foreground color, while raster icons preserve their own colors.
+Row clicks select and the disclosure indicator changes expansion.
+Mouse or pen double-click toggles a branch and activates a leaf; a touch tap selects and toggles a branch.
+Enter activates the current row.
+Up/Down, Home/End, Left/Right, and Space provide tree navigation, expansion, and selection without changing the meaning of nested buttons or text inputs.
+Disabled input and canceled pointer sequences emit no changes.
+Expanded logical items remain accessible while offscreen, with stable hierarchy and separate focus, selection, activation, and expansion actions.
+
+## Keyboard events
+
+`KeyEvent::key` identifies a portable key independently of localized character text.
+It distinguishes main-row and numeric-keypad keys, left/right modifiers, punctuation, international keys, and named function keys.
+Use `text` only when the layout-resolved UTF-8 character matters; it may be empty, is not a replacement for TextField input, and is always empty on key release.
+
+Use `ViewEvents::KeyDown` and `ViewEvents::KeyUp` for focused-View behavior that should run after the component's built-in key handling.
+Return `true` when the event is handled so Runtime and the platform do not apply later defaults.
+Return `false` to allow defaults such as focus traversal, activation, context menus, or native host behavior.
+
+Use `ViewEvents::KeyIntercept` for a shortcut or parent policy that must run before a focused component.
+Runtime visits the active focus-scope route from its root to the focused View and stops at the first handler that returns `true`; it does not bubble the event back through ancestors.
+
+```cpp
+return page.On<ViewEvents::KeyIntercept>([](const KeyEvent& event) {
+  if (event.type == KeyEventType::Down && event.modifiers.control && event.key == Key::S) {
+    Save();
+    return true;
+  }
+  return false;
+});
+```
+
+Prefer `OnClick` for ordinary control activation because it already unifies pointer, keyboard, and accessibility input.
+Do not recreate Button, Select, Menu, or text-editing key behavior in an application handler.
+
+### Programmatic focus
+
+Create a stable `ViewHandle` with `UseViewHandle()` during composition and bind it with `.With(target)`. Binding the handle preserves the View's existing focus eligibility. Use a built-in focusable control or add `Focusable{}` to a custom View. Call `RequestFocus()` on the application thread from an event handler or a resumed Task. It synchronously returns `true` when the mounted target accepts logical focus, including when it already owns focus. Focus indication is hidden by default. Pass `true` to show it. Actual focus changes emit the existing `ViewEvents::FocusChanged` event.
+
+```cpp
+[[pingcore::composable]]
+View SearchForm(State<TextEditingValue> query) {
+  auto search = UseViewHandle();
+  auto window = UseWindow();
+  return Column {
+    TextField(query)
+        .Label("Search")
+        .InputConfiguration({.keyboard_policy = SoftwareKeyboardPolicy::Manual})
+        .With(search),
+    Button("Edit search").OnClick([search, window] {
+      if (search.RequestFocus()) window.ShowKeyboard();
+    }),
+  };
+}
+```
+
+A requester remains associated with its original window and may bind only one mounted View at a time. Compatible recomposition and keyed movement preserve the binding; unmounting disconnects it. Requests return `false` without changing focus when the target is unmounted, disabled, not focusable, outside the active modal scope, or its window has retired. An unrealized virtual item is unmounted for this purpose; requests do not realize, scroll to, or queue focus for a future target. Requests made from a focus-change notification also return `false` so they cannot redirect the transition in progress. Calling during composition, using another window's requester as a target, binding it twice, or calling from another thread is a `std::logic_error`. Logical input focus does not activate an operating-system window or move accessibility focus.
+
+Set `DialogOptions::initial_focus` to choose a Dialog's first target:
+
+```cpp
+[[pingcore::composable]]
+View EditName(State<TextEditingValue> name) {
+  auto field = UseViewHandle();
+  auto dialogs = UseDialog();
+  return Button("Edit name").OnClick([dialogs, field, name] {
+    dialogs.Show([field, name] {
+      return TextField(name).Label("Name").With(field);
+    }, {.initial_focus = field});
+  });
+}
+```
+
+The Dialog tries the supplied target once when it mounts, before focusing its first eligible control. An unavailable target falls back to that default without retrying when content later changes. Both targets use the window's current focus visibility. Content updates and closing a nested Dialog preserve or restore current focus instead of reapplying the initial target.
+
+## Select
+
+`Select` is a compact controlled choice component for a finite, non-empty data set.
+It receives an application-owned selected index and emits `OnChanged(std::size_t)` without changing that value internally.
+
+```cpp
+[[pingcore::composable]]
+View DensityPicker() {
+  auto selected = UseState<std::size_t>(1);
+  const std::vector<std::string> options{"Compact", "Comfortable", "Spacious"};
+
+  return Select(options, selected, [](const std::string& option) {
+    return Text(option).Key(option);
+  }).Label("Density")
+    .OnChanged([selected](std::size_t index) {
+      selected = index;
+    });
+}
+```
+
+The content factory supplies both the selected trigger content and each popup choice.
+Its root View must publish a non-empty semantic label; `Text` already does so, while composite content should use `Semantics{.label = ...}` on its root.
+Use `Label(...)` for the Select control's accessible name; the selected root label remains its read-only current value.
+Apply `Enabled{false}` to that root for an individually disabled choice.
+The root is one Select interaction target, so nested buttons or other independent controls are unsupported.
+
+Use `.Key(...)` on the factory result when data can insert, remove, or reorder while the popup is open.
+Without a key, item identity follows the current index, matching ordinary unkeyed sibling reconciliation.
+The item set must not be empty and the selected index must remain in range; invalid declarations throw `std::invalid_argument`.
+
+Up and Down move through enabled choices without wrapping, Home and End move to an enabled edge, and Enter or Space requests the active choice.
+Opening focuses the selected choice when enabled, otherwise the first enabled choice; a list with no enabled choices has no active item.
+Escape, Back, outside press, and selecting the already controlled value close the popup without emitting a duplicate change.
+Disabling the Select while it is open closes the popup without emitting a change.
+`OnExpandedChanged(bool)` observes successful opening (`true`) and the start of closing (`false`), not exit-animation completion.
+Selecting another option emits ExpandedChanged(false) before Changed(index); selecting the same option only emits ExpandedChanged(false).
+Closing may also follow Escape, Back, outside press, or disabling, so false alone does not mean cancellation.
+Initial mount, unchanged expansion state, and destruction do not emit ExpandedChanged.
+`Validation` presents application-owned validation state without changing selection rules.
+
+## ComboBox
+
+`ComboBox` combines the complete controlled editing model of `TextField` with an anchored suggestion popup.
+The application owns both `TextEditingValue` and the current suggestion range, so filtering, debouncing, remote loading, and caching remain application policy.
+
+```cpp
+struct CitySuggestion {
+  std::string name;
+  std::string region;
+};
+
+[[pingcore::composable]]
+View CityPicker(const std::vector<CitySuggestion>& suggestions) {
+  auto query = UseState(TextEditingValue::FromText(""));
+
+  return ComboBox(
+             query, suggestions, [](const CitySuggestion& city) { return city.name; },
+             [](const CitySuggestion& city) {
+               return Column {
+                 Text(city.name),
+                 Text(city.region, TextRole::Label),
+               }.Key(city.name);
+             }
+         )
+      .Label("City")
+      .Placeholder("Search cities")
+      .OnChanged([query](const TextEditingValue& value) mutable {
+        query = value;
+      })
+      .OnSelected([query](std::size_t, const TextEditingValue& value) mutable {
+        query = value;
+      });
+}
+```
+
+The simple constructor accepts a range of string-compatible values and uses each string as both accepted text and popup content.
+The projected constructor accepts one text projection and one View factory, avoiding a public item wrapper while supporting rich rows.
+Both forms copy the supplied range for the declaration, so temporary filtered vectors are safe.
+Apply a stable `.Key(...)` to the factory result when suggestions can insert, remove, or reorder; otherwise identity follows position.
+
+`OnChanged(const TextEditingValue&)` reports direct edits, including selection and IME composition updates.
+`OnSelected(std::size_t, const TextEditingValue&)` reports an accepted suggestion as a complete replacement proposal and does not also emit `OnChanged`.
+`OnSubmitted()` runs when Enter or the platform action submits without accepting an active suggestion.
+`OnExpandedChanged(bool)` observes actual popup opening and closing while expansion remains internally owned.
+Equal state is not reported twice, and selection or submission reports collapse first.
+
+Focus and the text-input session remain on the field while the popup is open.
+Up and Down move through enabled suggestions without wrapping, Enter accepts the active suggestion, and Escape closes the popup.
+Arrow navigation does not run while an IME composition is active, so the platform input method retains ownership of composition keys.
+Shift-, Control-, and Meta-modified keys remain text-editing input rather than suggestion navigation.
+Alt modifies only Up and Down for popup opening and closing; other Alt-modified keys remain text-editing or platform input.
+Use `Enabled{false}` on a suggestion root to skip it during navigation and prevent activation; suggestion and empty-state content cannot contain another independent pointer target or focusable control.
+
+An empty range does not open a popup by default.
+Use `EmptyContent(...)` for a non-interactive loading or no-results presentation in the same anchored surface.
+Explicit dismissal suppresses reopening for the current query, while a later edit or focus cycle can open current results again.
+
+`TextFieldStyle` continues to own the editor visuals, label, validation, icons, and input states.
+`ComboBoxStyle` owns only the popup surface, item geometry, active background, indication, and height limit.
+`TrailingIcon(...)` replaces the built-in dropdown indicator; either icon is decorative and does not introduce a second interaction target.
+
+## DatePicker and TimePicker
+
+`DatePicker` and `TimePicker` use standard chrono values rather than framework date or time value classes.
+Both controls are inline and controlled: interaction emits `OnChanged`, and the application writes the proposal back when it accepts the change.
+
+```cpp
+[[pingcore::composable]]
+View ScheduleFields() {
+  using namespace std::chrono;
+  auto date = UseState(year_month_day{year{2026}, September, day{4}});
+  auto time = UseState(minutes{13 * 60 + 30});
+
+  return Row {
+    DatePicker(date)
+        .Range(
+            year_month_day{year{2026}, January, day{1}},
+            year_month_day{year{2026}, December, day{31}}
+        )
+        .DisabledDates([](year_month_day value) {
+          const weekday day_of_week{sys_days{value}};
+          return day_of_week == Saturday || day_of_week == Sunday;
+        })
+        .Label("Travel date")
+        .OnChanged([date](year_month_day value) { date = value; }),
+    TimePicker(time)
+        .Step(minutes{5})
+        .DisabledTimes([](minutes value) { return value >= hours{12} && value < hours{13}; })
+        .Label("Departure time")
+        .OnChanged([time](minutes value) { time = value; }),
+  }.With(Spacing(16.0F));
+}
+```
+
+Date range endpoints are inclusive.
+`Minimum` and `Maximum` configure one endpoint, while `Range` configures both together.
+The controlled date must be valid and inside the configured range.
+Updating the range keeps browsing within its new boundaries without changing the controlled selection.
+`DisabledDates` prevents user proposals but may still describe the current controlled value; use `Validation` for application-owned domain feedback.
+
+Time values are `std::chrono::minutes` in the half-open interval from midnight through the minute before the next midnight.
+`Step` defaults to one minute, must be no greater than one hour, and must divide one hour exactly.
+The controlled value must align with the step.
+`DisabledTimes` is the availability policy.
+TimePicker deliberately has no `Range`, `Minimum`, or `Maximum`; a time-of-day window, split shift, or overnight rule is expressed by the predicate without creating ambiguous wraparound range semantics.
+
+The effective `Locale` selects calendar labels, first weekday, reading direction, and 12- or 24-hour presentation.
+Picker strings cover every built-in framework language and region, including Traditional Chinese and regional Portuguese; other locale tags use the ordinary resource fallback chain.
+DatePicker keeps a fixed six-week grid and allows adjacent-month cells to be selected when they pass the same range and disabled-date checks.
+Its title switches to a year grid without committing a new date.
+TimePicker uses a single ring in 12-hour presentation, inner and outer hour rings in 24-hour presentation, and a 60-position minute dial whose visible labels occur every five minutes.
+AM/PM preserves the twelve-hour position and selects the nearest available minute in the corresponding hour; a period is disabled when that hour has no selectable minute.
+
+DatePicker supports arrow, week-edge, month, year, Enter, Space, and Escape navigation.
+TimePicker supports arrows, direct digits, Enter, Space, Home, End, and Escape.
+Pointer, touch, keyboard, and accessibility actions all emit the same typed controlled-change events.
+Neither component owns a time zone, combines date and time, opens a platform-native picker, or stores an authoritative selected value.
+
+`DatePickerStyle` and `TimePickerStyle` control the inline surfaces independently of the selected values.
+TimePicker separates the active field (`selected_field_background` and `selected_field_foreground`), AM/PM selection (`selected_period_background` and `selected_period_foreground`), and dial handle (`selected_background` and `selected_foreground`).
+The inactive field uses `field_background` and `header_style`; the AM/PM group uses `period_style`, `period_border`, and `period_corner_radii`.
+The outer picker borders are optional `Border` values, while container, field, period, and dial backgrounds are `VisualFill` values and surface shapes use `CornerRadii`.
+Its preferred width fits both the dial and the complete header; 24-hour locales omit the period group and its spacing.
+
+See [Date and Time Pickers Design](../design/date-time-pickers.md) for retained browsing state, localization, clock geometry, and accessibility invariants.
+
+## Tabs and indexed pages
+
+`Tabs` is a controlled destination selector.
+It does not own page state or page content.
+
+```cpp
+Tabs({"Overview", "Activity", "Settings"}, selected).OnChanged([selected](std::size_t index) {
+  selected = index;
+});
+```
+
+Use the indexed-page API when peer pages must retain local state while selection changes.
+Use `NavigationStack` when destinations form a push and pop history.
+
+## Application navigation
+
+`NavigationBar` presents primary destinations horizontally.
+`NavigationPane` presents the same destination model vertically and accepts `expanded = true` when labels should remain visible.
+
+```cpp
+const std::vector<NavigationItem> destinations{
+    NavigationItem(home_icon, "Home"),
+    NavigationItem(search_icon, "Search"),
+};
+
+return NavigationPane(destinations, selected, true).OnChanged([selected](std::size_t index) {
+  selected = index;
+});
+```
+
+`DrawerLayout` combines application content with an optional `StartDrawer`, `EndDrawer`, or both.
+The application controls each drawer's open state.
+Responsive persistent or modal presentation is selected from viewport width while keeping one declarative drawer subtree.
+
+`TopAppBar` accepts a title, optional leading content, and action Views.
+Applications decide which action opens a drawer; `DrawerLayout` does not search for or mutate an arbitrary button.
+
+## NavigationStack
+
+The factory form stores page factories so covered pages retain mounted state.
+The typed-route form uses a controlled `NavigationPath<Route>` and a resolver that creates a page for each route value.
+
+Route values are application data.
+They may include typed parameters and can be encoded for Web URL history or application activation without introducing a separate screen registry.
+
+Nested stacks use their nearest controller.
+Capture or provide the intended root controller when an operation must replace a higher-level flow.
+
+Attach PageTransition to a page root to customize Push, Pop, and Replace effects; see [Page transitions](themes-and-presentation.md#page-transitions) for configuration and theme fallback.
+SharedElement and SharedBounds match participating page content using the page clock; the same markers support explicit local state changes through UseSharedTransition. See [Shared elements and local changes](themes-and-presentation.md#shared-elements-and-local-changes) for usage and [Navigation Design](../design/navigation.md) for controller, transition, Back, URL, and activation contracts.
+
+## Gestures
+
+Built-in controls and scrolling use the shared gesture arbitration system.
+Custom content can observe clicks, repeated taps, long press, drag, and multi-pointer transform through typed gesture modifiers.
+
+```cpp
+return Canvas(content)
+    .With(TransformGesture{})
+    .On<TransformEvents::Changed>([=](const TransformEvent& event) {
+      offset += event.pan;
+      scale *= event.scale;
+      rotation += event.rotation;
+    });
+```
+
+Transform events report incremental pan, scale, and clockwise rotation around the current centroid.
+The application retains the authoritative accumulated transform.
+Gesture callbacks receive stable logical coordinates and explicit cancellation.
+Do not combine raw pointer handling with a built-in recognizer to recreate the same state machine.
+
+`PointerEvent::changed_button` identifies the button added by `Down` or removed by `Up`, while `pressed_buttons` is a `PointerButton` flag mask describing the complete post-event state.
+Use `IsButtonPressed()` for chords and raw custom interaction; primary-button input alone participates in built-in click, selection, drag, and scrolling behavior.
+Use `ViewEvents::Pointer` only when an application needs the complete raw Down, Move, Up, and Cancel lifecycle for the deepest eligible target.
+It is a void notification; use `PointerIntercept` when custom recognition must take ownership of the sequence.
+Attach `ViewEvents::ContextMenuRequested` when a View owns context actions instead of reconstructing a right-click sequence from raw Down.
+The event reports a window-local position for secondary-button input and the focused View center for the Context Menu key or Shift+F10.
+`ViewEvents::PointerIntercept` may take exclusive ownership of any button stream by returning `true`; pending built-in recognizers and the raw target receive `Cancel` when another participant wins.
+
+Use `ViewEvents::Hover` for mouse or pen presence without joining pointer-sequence ownership:
+
+```cpp
+return content.On<ViewEvents::Hover>([hovered](const HoverEvent& event) {
+  switch (event.type) {
+  case HoverEventType::Enter:
+  case HoverEventType::Move:
+    hovered = true;
+    break;
+  case HoverEventType::Leave:
+    hovered = false;
+    break;
+  }
+});
+```
+
+`position` is local to the receiving View and `window_position` uses window logical coordinates.
+Nested Views with Hover handlers each receive their own containment lifecycle; this is direct delivery, not event bubbling.
+Disabled Views still receive Hover, while touch input does not create Hover events.
+An exact duplicate pointer position does not emit another Move, but recomposition, layout, and presentation changes still resolve Enter or Leave under a stationary pointer.
+A `PlatformView` owns hover over its native content.
+
+For content that remains visible while hovered, set `State` on Enter or Move and clear it on Leave.
+For content that appears only after departure, update that `State` on Leave instead.
+For a delayed tooltip-like affordance, restart a lifecycle-bound `TaskHandle` on Enter and Move, await `Delay(500ms)`, and cancel the task and hide the affordance on Move or Leave as appropriate.
+`Delay` resumes on the owning UI thread, so the task may update `State` directly without `Post`.
+Hover deliberately has no separate stopped-moving event or built-in delay policy.
+
+Use `PointerCursor` to declare a portable cursor without adding a pointer handler or retained extension:
+
+```cpp
+return Canvas(painter).With(PointerCursor(PointerCursorKind::Crosshair));
+```
+
+The deepest explicit declaration under a mouse or pen wins.
+`PointerCursorKind::Default` explicitly restores the platform default for that region instead of inheriting an ancestor declaration.
+Controls do not impose a cursor convention; apply the modifier where the application's interaction calls for one.
+A cursor kind may come from `State`, so custom content can compute the appropriate kind and let ordinary local recomposition update the declaration.
+Assigning the same state value does not recompose or resend the cursor.
+Platforms map portable kinds to the closest native cursor, while a `PlatformView` keeps ownership of the cursor over its native content.
+Platforms without a traditional pointer cursor may ignore the declaration.
+
+`DragSource` transfers an immutable application value to one exact typed `DropTarget` while preserving the ordinary DragGesture recognition rules.
+The application handles `DropEvents<T>::Dropped` to perform the authoritative data mutation.
+An optional preview is ordinary View content presented in a non-interactive Layer.
+The preview follows the pointer while preserving its original grab offset, including near and beyond window edges.
+
+```cpp
+return CardView(card)
+    .With(DragSource(CardTransfer{card.id}))
+    .On<DragSourceEvents::Ended>([](const DragDropResult& result) {
+      ReportDropResult(result.dropped);
+    });
+```
+
+Use a long-press DragGesture configuration for reorder behavior inside scrolling content.
+To drag between Windows, macOS, or Linux windows in the same application, call `Scope(DragDropScope::Application)` on both `DragSource` and `DropTarget`. This supports the primary mouse button. The default `Window` scope keeps transfers in their source window.
+
+For an application-scoped drag, `DragSourceEvents::Ended` can report `DragDropResult::released_outside_application` when the platform confirms a mouse release outside the application's windows. Windows provides that confirmation. Use `dropped` to check whether a target received the drop.
+Typed DragSource/DropTarget transfers are in-process; native files, URLs, and PlatformView targets are not inferred from an application payload.
+Use [FileDropTarget](files.md#receiving-dropped-files) to receive external ordinary files through the separate host-owned file-drop lifecycle.
+See [Typed Drag-and-Drop Design](../design/drag-drop.md) for ownership, target selection, preview, and auto-scroll behavior.
+
+## TextField
+
+`TextField` is controlled by a complete `TextEditingValue`, not only a string.
+The value preserves text, selection, affinity, and active composition across updates.
+
+```cpp
+[[pingcore::composable]]
+View NameField() {
+  auto value = UseState(TextEditingValue{""});
+
+  return TextField(value)
+      .Label("Name")
+      .Placeholder("Enter your name")
+      .Variant(TextFieldVariant::Outlined)
+      .OnChanged([value](TextEditingValue next) {
+        value = next;
+      });
+}
+```
+
+Available variants are `Standard`, `Filled`, and `Outlined`.
+The active theme decides whether the visual label is shown; its semantic label remains available to accessibility independently.
+
+Use `LeadingIcon`, `TrailingIcon`, `LineLimits`, `MaxLength`, `Secure`, `InputConfiguration`, and `Validation` for typed configuration.
+`TrailingIcon(icon)` is decorative.
+`TrailingIcon(icon, semantic_label)` reserves an independently accessible action target; bind its typed event with `OnTrailingIconClick`.
+`TextFieldLineLimits::SingleLine()` is the default; multiline fields can define a minimum and optional maximum line count.
+`Align(TextAlign::...)` applies horizontal alignment to editable text, placeholder, selection, caret, hit testing, and input-method geometry.
+`VerticalAlign(TextVerticalAlign::...)` places the editable region within the field; single-line fields default to `Center` and multiline fields default to `Top`.
+
+`OnChanged` reports the complete requested editing value.
+`OnSubmitted` reports the submitted text when the configured platform action is performed.
+
+### Software keyboard
+
+`TextField` and `ComboBox` request the software keyboard when an editable client starts a session and when the user taps the focused editor again. To choose when it appears, configure the editor with `.InputConfiguration({.keyboard_policy = SoftwareKeyboardPolicy::Manual})`. The editor still receives focus and can place the caret or select text on a tap.
+
+Get the window handle with `UseWindow()` and capture it in an event handler. Call `window.ShowKeyboard()` or `window.HideKeyboard()` on the application thread to request a change for that window's focused editor. Both methods work with either policy. Hiding preserves PingCore focus, the editing session, and the selection, subject to any final edits delivered by the input method. With no focused editable client the calls have no effect. Keyboard presentation is best effort, and Web browsers can require the show request to run during a user gesture.
+
+## Validation and secure input
+
+Validation communicates application-owned domain state.
+It does not reject edits or replace input filtering.
+
+Secure fields redact their text from semantics and platform accessibility while preserving editing behavior through the platform text-input bridge.
+
+```cpp
+[[pingcore::composable]]
+View PasswordField(State<TextEditingValue> password, ImageVariant visibility_icon) {
+  auto visible = UseState(false);
+
+  return TextField(password)
+      .Label("Password")
+      .TrailingIcon(visibility_icon, visible ? "Hide password" : "Show password")
+      .Secure(!visible)
+      .OnTrailingIconClick([visible] { visible = !visible; })
+      .OnChanged([password](TextEditingValue next) mutable { password = std::move(next); });
+}
+```
+
+## Selection and clipboard
+
+Static text selection, TextField selection, clipboard actions, and platform IME behavior share one Runtime editing model.
+The platform adapter translates UTF-16 offsets or toolkit-specific conventions at the boundary while application text remains UTF-8.
+
+Application code obtains the system clipboard through `UseApplication().Clipboard()` during composition and captures it in an event handler.
+
+```cpp
+const auto clipboard = UseApplication().Clipboard();
+
+return Button("Copy").OnClick([clipboard] {
+  clipboard->WriteText("PingCore");
+});
+```
+
+`SupportsSynchronousText()` reports support for `ReadText()` and `WriteText()`. `ReadText()` returns no value when text is absent or unavailable, and `WriteText()` reports whether the system accepted it. Each Runtime owns one Clipboard instance, which becomes unavailable when that Runtime retires.
+
+Publish an item in one call to `WriteItem()` or `WriteItemAsync()`. A `ClipboardItem` can hold plain text, an HTML fragment, an encoded image, and application-specific bytes keyed by MIME type. `ClipboardItem::FromAttributedText()` supplies both HTML and plain text. When supplying HTML directly, set `text` to offer a suitable plain-text alternative. A successful write means the platform accepted all supplied representations. A failed write can leave the clipboard empty.
+
+```cpp
+auto item = ClipboardItem::FromAttributedText(AttributedText("Selected text"));
+item.custom_formats.emplace("application/vnd.example.selection", serialized_selection);
+const bool copied = clipboard->WriteItem(std::move(item));
+```
+
+`ReadItemAsync()` reads plain text and HTML from one clipboard item by default. Request image data or custom MIME types with `ClipboardReadOptions`. Missing or unreadable representations are absent. The operation fails if no requested representation can be read, or if a clipboard change prevents the platform from finishing the original capture. Call `ToAttributedText()` for styled text derived from HTML or a plain-text fallback. `ReadTextAsync()` and `ReadImageAsync()` request a single kind of representation.
+
+Use `WriteFiles()` to publish a nonempty list of paths or file references. `ReadFilesAsync()` returns the complete ordered list of read-only references with their available access grants. Desktop platforms can copy local files and directories. Android copies ordinary local files and readable content URIs. iOS publishes ordinary local files and reads explicit file URLs or provider-backed copies. Use `ClipboardItem::image` to exchange the pixels of an image.
+
+On Web, start `WriteItemAsync()` or a supported asynchronous read directly in the user action and then schedule or await the returned Task. Clipboard access requires a secure context. Writing supports plain text, HTML, PNG, and custom formats on browsers that expose them. Custom formats use the browser's web clipboard namespace. Android requires a plain-text representation when publishing HTML. Web file lists are unsupported. Browser-managed TextField editing events still handle its default clipboard actions.
+
+Custom editors can override `TextSelectionClient::GetTextEditingActionStatus()` and `PerformTextEditingAction()` to handle shortcuts and touch selection menu actions together. Return `Handle` to claim an action, `Disabled` to block it, or `UseDefault` to allow the framework's default behavior. Start clipboard operations in the execution callback. Wait for a successful write before deleting text for Cut, and verify that delayed results still apply to the original editor and selection.
+
+For editing invariants and platform protocols, see [Text Input and TextField Design](../design/text-input.md).

@@ -1,0 +1,49 @@
+#pragma once
+
+#include <d3d11.h>
+#include <windows.h>
+#include <wrl/client.h>
+
+#include <cstddef>
+#include <span>
+#include <utility>
+#include <vector>
+
+#include <pingcore/windows/external_texture.h>
+
+namespace pingcore::detail {
+
+struct D3D11FrameAccess {
+  [[nodiscard]] static Microsoft::WRL::ComPtr<ID3D11Texture2D>
+  Open(const windows::D3D11Frame& frame, ID3D11Device& device);
+};
+
+class Win32PixelFrame final {
+public:
+  Win32PixelFrame() noexcept = default;
+  Win32PixelFrame(int pixel_width, int pixel_height, std::vector<std::byte> pixels)
+      : pixel_width_(pixel_width), pixel_height_(pixel_height), pixels_(std::move(pixels)) {}
+
+  [[nodiscard]] int PixelWidth() const noexcept {
+    return pixel_width_;
+  }
+
+  [[nodiscard]] int PixelHeight() const noexcept {
+    return pixel_height_;
+  }
+
+  [[nodiscard]] std::size_t BytesPerRow() const noexcept {
+    return static_cast<std::size_t>(pixel_width_) * 4U;
+  }
+
+  [[nodiscard]] std::span<const std::byte> Pixels() const noexcept {
+    return pixels_;
+  }
+
+private:
+  int pixel_width_ = 0;
+  int pixel_height_ = 0;
+  std::vector<std::byte> pixels_;
+};
+
+} // namespace pingcore::detail

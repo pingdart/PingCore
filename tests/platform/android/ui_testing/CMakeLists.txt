@@ -1,0 +1,28 @@
+cmake_minimum_required(VERSION 3.20)
+project(pingcore_android_ui_testing LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+if (NOT ANDROID)
+    message(FATAL_ERROR "PingCore Android UI testing requires the Android toolchain")
+endif ()
+
+if (PINGCORE_TESTING_SDK)
+    unset(PingCore_DIR CACHE)
+    find_package(PingCore CONFIG REQUIRED COMPONENTS testing static
+            PATHS "${PINGCORE_TESTING_SDK}" NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
+else ()
+    set(PINGCORE_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+    set(PINGCORE_BUILD_STATIC ON CACHE BOOL "" FORCE)
+    set(PINGCORE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(PINGCORE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(PINGCORE_BUILD_CLI OFF CACHE BOOL "" FORCE)
+    set(PINGCORE_BUILD_TESTING_LIBRARY ON CACHE BOOL "" FORCE)
+    set(PINGCORE_BUILD_TESTING_SMOKE_TESTS OFF CACHE BOOL "" FORCE)
+    set(PINGCORE_ENABLE_PROFILING OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../../../.." pingcore)
+endif ()
+
+get_target_property(PINGCORE_BUILTIN_RESOURCE_PACKAGE PingCore::pingcore PINGCORE_RESOURCE_PACKAGE)
+add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../../testing" smoke)

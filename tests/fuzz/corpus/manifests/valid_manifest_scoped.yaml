@@ -1,9 +1,0 @@
-name: "@company/auth"
-version: "3.0.0-beta.1+build.202611"
-description: "Scoped authentication service"
-dependencies:
-  crypto: "~2.4.0"
-  storage: "^1.5.0"
-security:
-  allow_os_sandbox: true
-  max_memory_mb: 512

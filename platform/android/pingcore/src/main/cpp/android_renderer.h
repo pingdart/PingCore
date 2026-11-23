@@ -1,0 +1,101 @@
+#pragma once
+
+#include <jni.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <pingcore/android/jni.h>
+#include <pingcore/render_scene.h>
+#include <pingcore/text.h>
+
+#include "android_external_texture_internal.h"
+
+namespace pingcore::detail {
+
+std::string AndroidFontName(const Font& font);
+
+android::LocalRef<jbyteArray>
+AndroidTextAttributes(JNIEnv* environment, const AttributedText& text, const TextStyle& base);
+
+class AndroidTextureLayers;
+
+class AndroidRenderer final {
+public:
+  void Initialize(JNIEnv* environment, jclass view_class);
+  void SetTextureLayers(AndroidTextureLayers* texture_layers) noexcept;
+  void BeginDraw();
+  void DrawSlice(
+      JNIEnv* environment,
+      jobject view,
+      jobject canvas,
+      const RenderFrame& frame,
+      std::size_t first_command,
+      std::size_t command_count
+  );
+
+private:
+  struct CommandRange;
+  struct CachedExternalTexture {
+    std::weak_ptr<ExternalTexture> texture;
+    std::shared_ptr<const AndroidBitmapFrame> bitmap_frame;
+    std::shared_ptr<const android::GlFrame> gpu_frame;
+    std::uint64_t draw_epoch = 0;
+  };
+
+  bool RenderSequence(JNIEnv* environment, jobject view, jobject canvas, const PaintSequence& sequence,
+    std::uint64_t node_identity, bool foreground, CommandRange* range);
+  bool RenderSceneNode(JNIEnv* environment, jobject view, jobject canvas, const RenderNode& node, CommandRange* range);
+  [[nodiscard]] const AndroidBitmapFrame* BitmapFrameFor(const std::shared_ptr<ExternalTexture>& texture);
+  [[nodiscard]] std::shared_ptr<const android::GlFrame> GpuFrameFor(const std::shared_ptr<ExternalTexture>& texture);
+  void RenderCommand(JNIEnv* environment, jobject view, jobject canvas, const DrawRectCommand& command);
+  void RenderCommand(JNIEnv* environment, jobject view, jobject canvas, const DrawTextCommand& command,
+                     const TextLayoutBackend* prepared);
+  void RenderCommand(JNIEnv* environment, jobject view, jobject canvas, const DrawTextRunsCommand& command);
+  void RenderCommand(JNIEnv* environment, jobject view, jobject canvas, const DrawImageCommand& command);
+  void RenderCommand(JNIEnv* environment, jobject view, jobject canvas, const DrawExternalTextureCommand& command, const AndroidTextureLayerKey& key);
+  void RenderCommand(JNIEnv* environment, jobject view, jobject canvas, const DrawCircleCommand& command);
+  void RenderCommand(JNIEnv* environment, jobject view, jobject canvas, const DrawLineCommand& command);
+  void RenderCommand(JNIEnv* environment, jobject view, jobject canvas, const DrawArcCommand& command);
+  void RenderCommand(JNIEnv* environment, jobject view, jobject canvas, const DrawBorderCommand& command);
+  void RenderCommand(JNIEnv* environment, jobject view, jobject canvas, const DrawShadowCommand& command);
+  void RenderCommand(JNIEnv* environment, jobject view, jobject canvas, const FillPathCommand& command);
+  void RenderCommand(JNIEnv* environment, jobject view, jobject canvas, const StrokePathCommand& command);
+  void RenderCommand(JNIEnv* environment, jobject view, jobject canvas, const DrawPathShadowCommand& command);
+  void RenderCommand(JNIEnv* environment, jobject view, jobject canvas, const PushClipCommand& command);
+  void RenderCommand(JNIEnv* environment, jobject view, jobject canvas, const PushPathClipCommand& command);
+  void RenderCommand(JNIEnv* environment, jobject view, jobject canvas, const PopClipCommand& command);
+  void RenderCommand(JNIEnv* environment, jobject view, jobject canvas, const PushTransformCommand& command);
+  void RenderCommand(JNIEnv* environment, jobject view, jobject canvas, const PopTransformCommand& command);
+  void RenderCommand(JNIEnv* environment, jobject view, jobject canvas, const PlacePlatformViewCommand& command);
+
+  jmethodID draw_brush_rect_ = nullptr;
+  jmethodID draw_text_ = nullptr;
+  jmethodID draw_prepared_text_ = nullptr;
+  jmethodID draw_text_runs_ = nullptr;
+  jmethodID draw_image_ = nullptr;
+  jmethodID draw_external_texture_ = nullptr;
+  jmethodID draw_circle_ = nullptr;
+  jmethodID draw_line_ = nullptr;
+  jmethodID draw_arc_ = nullptr;
+  jmethodID draw_border_ = nullptr;
+  jmethodID draw_shadow_ = nullptr;
+  jmethodID fill_brush_path_ = nullptr;
+  jmethodID stroke_brush_path_ = nullptr;
+  jmethodID draw_path_shadow_ = nullptr;
+  jmethodID push_clip_ = nullptr;
+  jmethodID push_path_clip_ = nullptr;
+  jmethodID pop_clip_ = nullptr;
+  jmethodID push_opacity_ = nullptr;
+  jmethodID pop_opacity_ = nullptr;
+  jmethodID push_transform_ = nullptr;
+  jmethodID pop_transform_ = nullptr;
+  std::vector<CachedExternalTexture> external_textures_;
+  AndroidTextureLayers* texture_layers_ = nullptr;
+  std::uint64_t draw_epoch_ = 0;
+};
+
+} // namespace pingcore::detail

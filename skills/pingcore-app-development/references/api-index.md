@@ -1,0 +1,53 @@
+# Public API Index
+
+This is a navigation index, not a replacement for the active SDK's public headers.
+
+| Area | Primary public names | Main reference | Authority |
+| --- | --- | --- | --- |
+| App and lifecycle | `Application`, `AppOptions`, `ApplicationContext`, `WindowContext`, `RunApplication`, `UseApplication`, `ApplicationHandle`, `ApplicationActivation`, `ApplicationLifecycleState`, `Lifecycle` | [fundamentals.md](fundamentals.md) | `app.h`, `window.h`, `lifecycle.h` |
+| Services and installation | `UseService`, `ApplicationContext::Provide`, `WindowContext::Provide`, `ApplicationContext::OnActivation`, `AppOptions::application_hooks`, `window_hooks` | [fundamentals.md](fundamentals.md#application-and-window-ownership) | `app.h` |
+| Permissions | `Permission`, `PermissionStatus`, `PermissionSettingsTarget`, `ApplicationHandle::CheckPermissionAsync`, `ApplicationHandle::RequestPermissionAsync`, `ApplicationHandle::OpenPermissionSettingsAsync` | [fundamentals.md](fundamentals.md) | `system.h`, `app.h` |
+| Windows URL schemes | `windows::RegisterUrlScheme`, `windows::UnregisterUrlScheme` | [navigation-and-window.md](navigation-and-window.md) | `system.h` |
+| Local notifications | `LocalNotificationHandle`, `LocalNotification`, `LocalNotificationCapabilities`, `LocalNotificationPresentation`, `DefaultNotificationPresentation`, `TemplateNotificationPresentation`, `PermissionStatus`, `LocalNotificationOperationStatus`, `NotificationActivation`, `ApplicationHandle::LocalNotifications` | [local-notifications.md](local-notifications.md) | `system.h`, `app.h` |
+| System tray | `SystemTrayHandle`, `SystemTrayOptions`, `MenuEntry`, `ApplicationHandle::SystemTray`, `ApplicationHandle::Quit` | [navigation-and-window.md](navigation-and-window.md) | `app.h`, `presentation.h` |
+| Tasks | `Task`, `TaskScope`, `TaskHandle`, `UseTaskScope`, `UseApplicationTaskScope`, `Delay`, `RunWorker`, `WorkerSequence`, `AwaitCallback`, `CallbackCompletion`, `TaskScope::Post` | [fundamentals.md](fundamentals.md#lifecycle-and-tasks) | `task.h` |
+| System tasks | `SystemTask`, `BackgroundTask`, `ContinuedTask`, `OngoingTask`, `TaskState`, `TaskStopped`, `AppOptions::system_tasks` | [fundamentals.md](fundamentals.md#system-tasks) | `system_task.h`, `app.h` |
+| View and composition | `View`, `Scope`, `[[pingcore::composable]]`, `ForEach` | [fundamentals.md](fundamentals.md) | `view.h` |
+| State | `State`, `StateList`, `UseState`, `UseStateList` | [fundamentals.md](fundamentals.md) | `state.h` |
+| Environment | `Environment`, `ProvideEnvironment`, `UseEnvironment`, `UseViewportClass` | [fundamentals.md](fundamentals.md) | `environment.h` |
+| Events | `Event<Result(Arguments...)>`, `On`, `OnClick`, `UseEvents`, `EventEmitter::Emit` | [fundamentals.md](fundamentals.md) | `event.h` |
+| Containers | `Column`, `Row`, `Flow`, `Stack`, `IndexedPages`, `Spacer` | [layout-and-ui.md](layout-and-ui.md) | `view.h` |
+| Controls | `Button`, `IconButton`, toggles, `Select`, `ComboBox`, `TextField`, `TreeView`, `TreeItemInfo`, tabs, progress, slider | [components.md](components.md) | `view.h` |
+| Date and time | `DatePicker`, `TimePicker`, `DatePickerStyle`, `TimePickerStyle`, chrono controlled values | [components.md](components.md#datepicker-and-timepicker) | `view.h`, `theme.h`, `event.h` |
+| Layout | Built-in layout selection; custom `Layout`, `LayoutContext`, `LayoutResult`, `ViewNode` only when needed | [layout-and-ui.md](layout-and-ui.md) | `view.h`, `layout.h` |
+| Mounted geometry | `Bounds`, `ContentBounds`, `LocalToWindow`, `WindowToLocal`, `LocalToWindowBounds` | [layout-and-ui.md](layout-and-ui.md#mounted-coordinate-spaces) | `layout.h` |
+| Virtual layout | `VirtualLayout`, `VirtualLayoutContext`, `VirtualList`, `VirtualGrid` | [layout-and-ui.md](layout-and-ui.md) | `virtual_layout.h`, `view.h` |
+| Scrolling | `ScrollView`, `ScrollController`, `UseScrollController`, `ScrollPhysics`, `ScrollBar` | [layout-and-ui.md](layout-and-ui.md) | `scroll.h`, `modifier.h`, `view.h` |
+| Gestures | `PointerButton`, `PointerEvent`, `HoverEvent`, `PointerCursor`, `PointerCursorKind`, raw `ViewEvents::Pointer`, `ContextMenuRequested`, `PointerIntercept`, multi-tap, long press, drag, transform, typed drag-and-drop | [gestures-and-drag-drop.md](gestures-and-drag-drop.md) | `event.h`, `gesture.h`, `geometry.h`, `modifier.h` |
+| External file reception | `FileDropTarget`, `FileDropOptions`, `FileDropOffer`, `FileDropEvent`, `FileDropEvents` | [gestures-and-drag-drop.md](gestures-and-drag-drop.md#external-file-reception) | `file_drop.h`, `file.h` |
+| Modifiers | `ViewModifier`, built-in property modifiers, retained modifiers | [modifiers.md](modifiers.md) | `modifier.h` |
+| Mounted View targets | `ViewHandle`, `UseViewHandle()`, `RequestFocus()` | [modifiers.md](modifiers.md#mounted-view-targets) | `modifier.h` |
+| Retained behavior | `NodeExtension`, `EmitEvent`, `PrepareGeometry`, `FrameInfo`, invalidation and input hooks | [node-extensions.md](node-extensions.md) | `modifier.h` |
+| Theme | Flat/Material boundaries, `ThemeSpec`, `ThemeBrightness`, `UseSystemThemeBrightness`, typed style overrides, `ThemeDefinition`, `VisualFill`, `Border`, `CornerRadii` | [theme-animation-presentation.md](theme-animation-presentation.md) | `environment.h`, `theme.h`, `navigation.h`, `presentation.h` |
+| Interaction visual | `Indication`, `IndicationLayer`, `RippleEffect`, `FocusRing` | [theme-animation-presentation.md](theme-animation-presentation.md) | `indication.h` |
+| Animation | specs, `MotionController`, animated modifiers, `SceneTransitionHandle`, `RunFromCurrentInteraction` | [theme-animation-presentation.md](theme-animation-presentation.md) | `animation.h` |
+| Presentation | toast, dialog, bottom sheet, popup, menu, tooltip; `DialogOptions::initial_focus`, `PopupHandle::ShowAtAnchor`, `UpdateAnchor` | [theme-animation-presentation.md](theme-animation-presentation.md) | `presentation.h`, `layer.h` |
+| Text input | `TextEditingValue`, configuration, field limits, `TextField::TrailingIcon`, `OnTrailingIconClick`, `ValidationResult`, `Validate` | [text-input-and-semantics.md](text-input-and-semantics.md) | `text_input.h`, `view.h`, `validation.h` |
+| Text and selection | `FontFamily`, `Font`, `TypographyScheme::family`, `TextStyle`, `TextSpanStyle`, `AttributedText`, `TextSpan`, `SelectionArea`, `TextSelectionSource`, `Text::SelectionBlock`, `TextEvents::LinkActivated` | [text-input-and-semantics.md](text-input-and-semantics.md#text-and-selection) | `text.h`, `theme.h`, `view.h`, `event.h` |
+| Custom text layout | `TextMeasurer::CreateTextLayout`, `TextLayout` | [text-input-and-semantics.md](text-input-and-semantics.md#custom-text-layout) | `text.h`, `paint.h` |
+| Semantics | `Semantics`, hierarchical `SemanticBuilder::AddChild`, `SetActiveChild`, `AdoptChild`, semantic roles/actions | [text-input-and-semantics.md](text-input-and-semantics.md) | `semantics.h` |
+| Resources | `Resources`, `ResourceConfiguration`, `GetString`, `GetImage`, `GetVectorImage`, `GetRawResource`, `UseString`, `UseImage`, `UseVectorImage`, `UseRawResource` | [resources-files-network.md](resources-files-network.md) | `resource.h`, `app.h` |
+| Locale and shaping | `Locale`, `TextShapingOptions`, `Text::Shaping`, `TextField::Shaping` | [resources-files-network.md](resources-files-network.md#locale-and-text-shaping) | `resource.h`, `text.h`, `view.h` |
+| Clipboard | `Clipboard`, `ClipboardItem`, `WriteItem`, `WriteItemAsync`, `ReadItemAsync`, `WriteFiles`, `ReadFilesAsync` | [resources-files-network.md](resources-files-network.md#clipboard) | `clipboard.h`, `app.h` |
+| Files and network | `Bytes`, `Uri`, `File`, `FileReference::AsFile`, `PlatformPayload(FileReference)`, `FilePicker::OpenDirectoryAsync`, `CopyDirectoryContentsToAsync`, `DirectoryCopySummary`, `AppDirectories`, `ApplicationHandle::Directories`, `ApplicationHandle::CurrentDirectory`, `HttpClient` | [resources-files-network.md](resources-files-network.md) | `data.h`, `file.h`, `app.h`, `platform_registry.h`, `http.h` |
+| Native file references | Android `PingCoreFileReference.fromUri`, iOS `+[HUXFileReference copyFromFileURL:error:]` | [resources-files-network.md](resources-files-network.md#native-file-references) | Android `PingCoreFileReference`, `ios/platform_registry.h` |
+| Streams and results | `Result`, `IoResult`, `IoError`, `InputStream`, `OutputStream`, `AsyncInputStream`, `AsyncOutputStream`, `HttpResult`, `HttpResponseStream` | [resources-files-network.md](resources-files-network.md#streams) | `data.h`, `stream.h`, `http.h` |
+| Navigation | `NavigationPath`, routed `NavigationStack`, controllers, browser codec | [navigation-and-window.md](navigation-and-window.md) | `navigation.h`, `web/navigation.h` |
+| Window | `WindowOptions`, `WindowContentMode`, `WindowChromeMode`, safe area, system bars, title bar, `UseWindow`, `WindowHandle::IsOpen`, `LifecycleState`, `OnLifecycleChanged` | [navigation-and-window.md](navigation-and-window.md) | `window.h` |
+| Multiple windows | `ApplicationHandle::SupportsMultipleWindows`, `OpenWindow`, `AppOptions::quit_on_last_window_closed`, `ApplicationHandle::Quit` | [navigation-and-window.md](navigation-and-window.md#multiple-windows) | `app.h`, `window.h` |
+| Paint | `Color`, `Color::Rgba32`, `Color::Argb32`, `Brush`, `VisualFill`, `Canvas`, `PaintContext`, `StrokeStyle`, `DrawLine`, `UseTextMeasurer`, `Path`, `Path::ArcTo`, `Path::Contains`, `ArcSize`, `ArcDirection`, gradients, images, vectors | [canvas-paint-and-images.md](canvas-paint-and-images.md) | `color.h`, `paint.h`, `text.h`, `vector.h` |
+| Platform integration | `Runtime`, `UiWindow`, typed platform values, payloads, modules, views, events, application registration, Android Java, Apple Objective-C/Swift, and Web JavaScript factories | [platform-modules.md](platform-modules.md), [platform-views.md](platform-views.md) | `app.h`, `platform_registry.h`, platform registry headers |
+| External frames | `ExternalTexture`, platform texture types, `AcquireFrame()` | [canvas-paint-and-images.md](canvas-paint-and-images.md#external-textures) | `external_texture.h`, platform texture headers |
+| UI testing | `testing::UiTest`, `testing::UiSelector`, `UpdateWindowLifecycleState`, `Pump`, `PumpUntil` | [project-workflow.md](project-workflow.md#ui-testing) | `testing/ui_test.h`, `PingCore::testing` |
+| CMake/CLI | package targets, `pingcore_add_app`, codegen, resources, CLI | [project-workflow.md](project-workflow.md) | installed package and CLI |
+| mcpp modules | `import pingcore`, `pingcore.rules`, package build, codegen, resources | [cpp-modules-and-mcpp.md](cpp-modules-and-mcpp.md) | resolved package and installed mcpp |

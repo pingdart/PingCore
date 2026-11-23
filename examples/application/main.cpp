@@ -1,0 +1,298 @@
+#include <pingcore/pingcore.h>
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <type_traits>
+#include <utility>
+
+using namespace pingcore;
+
+namespace {
+
+struct TextFilePreview {
+  std::string file_name;
+  std::string content{"Open a UTF-8 text document with this application to preview its contents."};
+
+  bool operator==(const TextFilePreview&) const = default;
+};
+
+std::string PlatformActivationHint() {
+#if defined(_WIN32)
+  return "Open pingcore-example://documents/42 in a browser to deliver a URL activation.";
+#elif defined(__ANDROID__)
+  return "Open pingcore-example://documents/42, or choose PingCore Application when another app opens a file.";
+#elif defined(__APPLE__)
+  return "Open pingcore-example://documents/42, or open a UTF-8 text document with PingCore Application.";
+#else
+  return "Platform application shells may map external URLs and files into this activation model.";
+#endif
+}
+
+std::string PlatformActivationSummary() {
+#if defined(_WIN32)
+  return "Windows accepts one URL or a command line containing only existing files.";
+#elif defined(__ANDROID__)
+  return "Android maps supported URLs, document URIs, and local-notification Intents into the application Runtime.";
+#elif defined(__APPLE__)
+  return "Apple application callbacks map registered URL schemes and text documents into the application Runtime.";
+#else
+  return "The current platform uses the shared application activation boundary when its shell provides a mapping.";
+#endif
+}
+
+std::string DescribeActivation(const ApplicationActivation& activation) {
+  return std::visit(
+      [](const auto& value) {
+        using Value = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<Value, LaunchActivation>) {
+          return std::string{"ordinary launch"};
+        } else if constexpr (std::is_same_v<Value, UrlActivation>) {
+          return "URL: " + value.url.ToString();
+        } else if constexpr (std::is_same_v<Value, FileActivation>) {
+          std::string result = "files:";
+          for (const FileReference& file : value.files) {
+            result += " " + file.Name();
+          }
+          return result;
+        } else {
+          return "notification: " + value.identifier;
+        }
+      },
+      activation
+  );
+}
+
+std::string DescribeLifecycleState(ApplicationLifecycleState state) {
+  switch (state) {
+  case ApplicationLifecycleState::Active:
+    return "active";
+  case ApplicationLifecycleState::Inactive:
+    return "inactive";
+  case ApplicationLifecycleState::Background:
+    return "background";
+  }
+  return "unknown";
+}
+
+std::string DescribePermissionStatus(PermissionStatus status) {
+  switch (status) {
+  case PermissionStatus::NotDetermined:
+    return "not determined";
+  case PermissionStatus::Granted:
+    return "granted";
+  case PermissionStatus::Denied:
+    return "denied";
+  case PermissionStatus::PermanentlyDenied:
+    return "permanently denied";
+  case PermissionStatus::Restricted:
+    return "restricted";
+  case PermissionStatus::Provisional:
+    return "provisional";
+  case PermissionStatus::Unavailable:
+    return "unavailable";
+  case PermissionStatus::Limited:
+    return "limited";
+  case PermissionStatus::SystemDisabled:
+    return "location services off";
+  }
+  return "unknown";
+}
+
+std::optional<FileReference> ActivatedFile(const ApplicationActivation& activation) {
+  const auto* files = std::get_if<FileActivation>(&activation);
+  if (files == nullptr || files->files.empty()) {
+    return std::nullopt;
+  }
+  return files->files.front();
+}
+
+void UpdateTextFilePreview(
+    const ApplicationActivation& activation,
+    TaskScope tasks,
+    State<TextFilePreview> preview,
+    State<std::uint64_t> generation
+) {
+  const std::uint64_t current_generation = generation + 1;
+  generation = current_generation;
+
+  std::optional<FileReference> file = ActivatedFile(activation);
+  if (!file) {
+    preview = TextFilePreview{};
+    return;
+  }
+
+  const std::string file_name = file->Name();
+  preview = {file_name, "Reading text content..."};
+  tasks.Launch([file = std::move(*file), file_name, preview, generation, current_generation]() -> Task<void> {
+    IoResult<std::string> result = co_await file.ReadStringAsync();
+    if (generation != current_generation) {
+      co_return;
+    }
+    if (!result.Succeeded()) {
+      preview = {file_name, "Read failed: " + result.Error().message};
+      co_return;
+    }
+    std::string content = std::move(result).Value();
+    preview = {file_name, content.empty() ? "The file is empty." : std::move(content)};
+  });
+}
+
+[[pingcore::composable]]
+View TextFilePreviewCard(const TextFilePreview& preview) {
+  const ThemeSpec& theme = UseTheme();
+  return Column {
+    Text("Text file preview", TextRole::Title),
+    Text(preview.file_name.empty() ? "No text document activated" : preview.file_name, TextRole::Label)
+        .With(Foreground(theme.colors.primary)),
+    SelectionArea {
+      Text(preview.content),
+    },
+  }.With(
+      Padding(theme.spacing.large),
+      Spacing(theme.spacing.small),
+      Background(theme.colors.surface_container_low),
+      CornerRadius(theme.shapes.medium)
+  );
+}
+
+[[pingcore::composable]]
+View PermissionCard(const ApplicationHandle& application, TaskScope tasks) {
+  auto status = UseState(std::optional<PermissionStatus>{});
+  auto settings_unavailable = UseState(false);
+  const auto refresh = [=] {
+    tasks.Launch([=]() -> Task<void> {
+      status = co_await application.CheckPermissionAsync(Permission::Location);
+    });
+  };
+  application.OnLifecycleChanged([=](ApplicationLifecycleState state) {
+    if (state == ApplicationLifecycleState::Active && status.Get().has_value()) {
+      refresh();
+    }
+  });
+  const auto current = status.Get();
+  const ThemeSpec& theme = UseTheme();
+  return Column {
+    Text("Location permission", TextRole::Title),
+    Text::Format(TextRole::Label, "Location: {}", current ? DescribePermissionStatus(*current) : "not checked")
+        .With(Foreground(theme.colors.primary)),
+    Button("Check location").OnClick(refresh),
+    Button("Request location").OnClick([=] {
+      tasks.Launch([=]() -> Task<void> {
+        status = co_await application.RequestPermissionAsync(Permission::Location);
+      });
+    }),
+    Button("Open location settings").OnClick([=] {
+      tasks.Launch([=]() -> Task<void> {
+        const auto location = co_await application.CheckPermissionAsync(Permission::Location);
+        status = location;
+        const auto target = location == PermissionStatus::SystemDisabled
+                                ? PermissionSettingsTarget::System
+                                : PermissionSettingsTarget::Application;
+        bool opened = co_await application.OpenPermissionSettingsAsync(Permission::Location, target);
+        if (!opened && target == PermissionSettingsTarget::Application) {
+          opened = co_await application.OpenPermissionSettingsAsync(
+              Permission::Location, PermissionSettingsTarget::System);
+        }
+        settings_unavailable = !opened;
+      });
+    }),
+    settings_unavailable.Get() ? View(Text("Open the location settings manually.")) : View{},
+  }.With(
+      Padding(theme.spacing.large),
+      Spacing(theme.spacing.small),
+      CrossAlign(CrossAxisAlignment::Stretch),
+      Background(theme.colors.surface_container_low),
+      CornerRadius(theme.shapes.medium)
+  );
+}
+
+struct DemoViewModel {
+  State<std::vector<std::string>> activations{std::vector<std::string>{}};
+  State<TextFilePreview> preview{TextFilePreview{}};
+  State<std::uint64_t> preview_generation{0};
+};
+
+void InstallApplication(ApplicationContext& context) {
+  auto model = std::make_shared<DemoViewModel>();
+  context.Provide(model);
+  const auto application = UseApplication();
+  const auto tasks = UseApplicationTaskScope();
+  if (const auto& startup = application.StartupActivation()) {
+    model->activations = std::vector<std::string>{"Startup: " + DescribeActivation(*startup)};
+    UpdateTextFilePreview(*startup, tasks, model->preview, model->preview_generation);
+  }
+  context.OnActivation([model, tasks](ApplicationActivation activation) {
+    model->activations.Update([&](auto& values) { values.push_back("Subsequent: " + DescribeActivation(activation)); });
+    UpdateTextFilePreview(activation, tasks, model->preview, model->preview_generation);
+  });
+}
+
+[[pingcore::composable]] View ApplicationContent() {
+  const ApplicationHandle application = UseApplication();
+  const auto model = UseService<DemoViewModel>();
+  const ApplicationLifecycleState lifecycle_state = application.LifecycleState();
+  auto tasks = UseTaskScope();
+  auto lifecycle_transitions =
+      UseStateList<std::string>({"Initially observed: " + DescribeLifecycleState(lifecycle_state)});
+  application.OnLifecycleChanged([=](ApplicationLifecycleState state) {
+    lifecycle_transitions.PushBack("Transition: " + DescribeLifecycleState(state));
+  });
+  const ThemeSpec& theme = UseTheme();
+  return ScrollView {
+    Column {
+      Text("Application lifecycle and activation", TextRole::Title),
+      Text("Current lifecycle: " + DescribeLifecycleState(lifecycle_state), TextRole::Label)
+          .With(Foreground(theme.colors.primary)),
+      Text("Ordered lifecycle transitions remain available after the application returns to the foreground."),
+      Column {
+        ForEach(lifecycle_transitions, [](const std::string& transition) { return Text(transition); }),
+      }.With(
+          Padding(theme.spacing.large),
+          Spacing(theme.spacing.small),
+          Background(theme.colors.surface_container_low),
+          CornerRadius(theme.shapes.medium)
+      ),
+      Text(
+          "StartupActivation is immutable for this application lifetime. Later platform activations enter the same application "
+          "policy through OnActivation."
+      ),
+      Text(PlatformActivationSummary()),
+      Text(PlatformActivationHint()),
+      Column {
+        ForEach(model->activations, [](const std::string& activation) { return Text(activation); }),
+      }.With(
+          Padding(theme.spacing.large),
+          Spacing(theme.spacing.small),
+          Background(theme.colors.surface_container_low),
+          CornerRadius(theme.shapes.medium)
+      ),
+      TextFilePreviewCard(model->preview),
+      PermissionCard(application, tasks),
+    }.With(
+        Padding(theme.spacing.extra_large),
+        Spacing(theme.spacing.medium),
+        CrossAlign(CrossAxisAlignment::Stretch)
+    ),
+  }.With(Background(theme.colors.background));
+}
+
+View App() {
+  return MaterialTheme {
+    ApplicationContent(),
+  };
+}
+
+AppOptions Options() {
+  AppOptions options;
+  options.window = {
+      .title = "PingCore Application",
+      .initial_size = {720.0F, 520.0F},
+  };
+  options.application_hooks = {InstallApplication};
+  return options;
+}
+
+} // namespace
+
+const Application application{App, Options()};

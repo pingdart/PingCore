@@ -1,0 +1,51 @@
+if (NOT PINGCORE_WIX_PAYLOAD_DIRECTORY)
+    message(FATAL_ERROR "PINGCORE_WIX_PAYLOAD_DIRECTORY is required")
+endif ()
+if (NOT PINGCORE_WIX_PAYLOAD_EXECUTABLE)
+    message(FATAL_ERROR "PINGCORE_WIX_PAYLOAD_EXECUTABLE is required")
+endif ()
+if (NOT PINGCORE_WIX_PAYLOAD_OUTPUT)
+    message(FATAL_ERROR "PINGCORE_WIX_PAYLOAD_OUTPUT is required")
+endif ()
+if (NOT IS_DIRECTORY "${PINGCORE_WIX_PAYLOAD_DIRECTORY}")
+    message(FATAL_ERROR "PingCore WiX payload directory does not exist: ${PINGCORE_WIX_PAYLOAD_DIRECTORY}")
+endif ()
+
+function(_pingcore_escape_wix_xml output value)
+    string(REPLACE "&" "&amp;" PINGCORE_WIX_ESCAPED "${value}")
+    string(REPLACE "\"" "&quot;" PINGCORE_WIX_ESCAPED "${PINGCORE_WIX_ESCAPED}")
+    string(REPLACE "<" "&lt;" PINGCORE_WIX_ESCAPED "${PINGCORE_WIX_ESCAPED}")
+    string(REPLACE ">" "&gt;" PINGCORE_WIX_ESCAPED "${PINGCORE_WIX_ESCAPED}")
+    set(${output} "${PINGCORE_WIX_ESCAPED}" PARENT_SCOPE)
+endfunction()
+
+file(GLOB_RECURSE PINGCORE_WIX_PAYLOAD_FILES
+        LIST_DIRECTORIES FALSE
+        RELATIVE "${PINGCORE_WIX_PAYLOAD_DIRECTORY}"
+        "${PINGCORE_WIX_PAYLOAD_DIRECTORY}/*"
+)
+list(SORT PINGCORE_WIX_PAYLOAD_FILES)
+set(PINGCORE_WIX_PAYLOAD_XML
+        "<Wix xmlns=\"http://wixtoolset.org/schemas/v4/wxs\">\n  <Fragment>\n    <PayloadGroup Id=\"PingCoreInstallerPayloads\">\n"
+)
+foreach (PINGCORE_WIX_PAYLOAD_FILE IN LISTS PINGCORE_WIX_PAYLOAD_FILES)
+    if (PINGCORE_WIX_PAYLOAD_FILE STREQUAL PINGCORE_WIX_PAYLOAD_EXECUTABLE)
+        continue()
+    endif ()
+    set(PINGCORE_WIX_PAYLOAD_SOURCE
+            "${PINGCORE_WIX_PAYLOAD_DIRECTORY}/${PINGCORE_WIX_PAYLOAD_FILE}"
+    )
+    set(PINGCORE_WIX_PAYLOAD_DESTINATION
+            "${PINGCORE_WIX_PAYLOAD_FILE}"
+    )
+    string(REPLACE "/" "\\" PINGCORE_WIX_PAYLOAD_DESTINATION
+            "${PINGCORE_WIX_PAYLOAD_DESTINATION}"
+    )
+    _pingcore_escape_wix_xml(PINGCORE_WIX_PAYLOAD_SOURCE "${PINGCORE_WIX_PAYLOAD_SOURCE}")
+    _pingcore_escape_wix_xml(PINGCORE_WIX_PAYLOAD_DESTINATION "${PINGCORE_WIX_PAYLOAD_DESTINATION}")
+    string(APPEND PINGCORE_WIX_PAYLOAD_XML
+            "      <Payload SourceFile=\"${PINGCORE_WIX_PAYLOAD_SOURCE}\" Name=\"${PINGCORE_WIX_PAYLOAD_DESTINATION}\" />\n"
+    )
+endforeach ()
+string(APPEND PINGCORE_WIX_PAYLOAD_XML "    </PayloadGroup>\n  </Fragment>\n</Wix>\n")
+file(WRITE "${PINGCORE_WIX_PAYLOAD_OUTPUT}" "${PINGCORE_WIX_PAYLOAD_XML}")

@@ -1,0 +1,3203 @@
+#include "win32_renderer.h"
+#include "internal_access.h"
+
+#include <d2d1_1.h>
+#include <d2d1_1helper.h>
+#include <d2d1effects.h>
+#include <d3d11.h>
+#include <d3d11_1.h>
+#if defined(PINGCORE_WINDOWS_7_COMPAT)
+// Expose the SDK declarations for runtime-loaded DirectComposition.
+#pragma push_macro("NTDDI_VERSION")
+#undef NTDDI_VERSION
+#define NTDDI_VERSION NTDDI_WIN8
+#endif
+#include <dcomp.h>
+#if defined(PINGCORE_WINDOWS_7_COMPAT)
+#pragma pop_macro("NTDDI_VERSION")
+#endif
+#include <dwrite.h>
+#include <dxgi1_2.h>
+#include <wincodec.h>
+#include <wrl/client.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <concepts>
+#include <cstring>
+#include <functional>
+#include <iterator>
+#include <limits>
+#include <memory>
+#include <new>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include "graphics/bitmap_internal.h"
+#include "graphics/path_internal.h"
+#include "graphics/paint_internal.h"
+#include "resources/resource_internal.h"
+#include "graphics/shadow_internal.h"
+#include "text/text_internal.h"
+#include "text/font_internal.h"
+#include "win32_external_texture_internal.h"
+#include "win32_internal.h"
+#include "macros_internal.h"
+
+namespace pingcore::detail {
+
+namespace {
+
+using Microsoft::WRL::ComPtr;
+
+ComPtr<IWICImagingFactory> CreateWicFactory() {
+  ComPtr<IWICImagingFactory> factory;
+  CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(factory.GetAddressOf()));
+  return factory;
+}
+
+ComPtr<IWICBitmapFrameDecode> DecodeWicFrame(IWICImagingFactory& factory, const ImageAsset& image) {
+  const auto bytes = image.EncodedBytes();
+  if (bytes.empty() || bytes.size() > std::numeric_limits<DWORD>::max()) return {};
+  ComPtr<IWICStream> stream;
+  ComPtr<IWICBitmapDecoder> decoder;
+  ComPtr<IWICBitmapFrameDecode> frame;
+  if (FAILED(factory.CreateStream(stream.GetAddressOf())) ||
+      FAILED(stream->InitializeFromMemory(reinterpret_cast<BYTE*>(const_cast<std::byte*>(bytes.data())),
+                                          static_cast<DWORD>(bytes.size()))) ||
+      FAILED(factory.CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnLoad,
+                                             decoder.GetAddressOf())) ||
+      FAILED(decoder->GetFrame(0, frame.GetAddressOf()))) {
+    return {};
+  }
+  return frame;
+}
+
+ComPtr<IWICBitmapSource> ConvertWicPixels(
+    IWICImagingFactory& factory, IWICBitmapSource& source, REFWICPixelFormatGUID format) {
+  ComPtr<IWICFormatConverter> converter;
+  if (FAILED(factory.CreateFormatConverter(converter.GetAddressOf())) ||
+      FAILED(converter->Initialize(&source, format, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom))) {
+    return {};
+  }
+  return converter;
+}
+
+ComPtr<IWICBitmap> CreateWicBitmap(IWICImagingFactory& factory, const Bitmap& bitmap) {
+  const auto bytes = bitmap.Pixels();
+  if (bytes.empty() || bytes.size() > std::numeric_limits<UINT>::max()) return {};
+  ComPtr<IWICBitmap> source;
+  if (FAILED(factory.CreateBitmapFromMemory(
+          bitmap.PixelWidth(), bitmap.PixelHeight(), GUID_WICPixelFormat32bppRGBA, bitmap.PixelWidth() * 4,
+          static_cast<UINT>(bytes.size()), reinterpret_cast<BYTE*>(const_cast<std::byte*>(bytes.data())),
+          source.GetAddressOf()))) {
+    return {};
+  }
+  return source;
+}
+
+ComPtr<IWICBitmapSource> SrgbWicFrame(IWICImagingFactory& factory, IWICBitmapFrameDecode& frame) {
+  UINT count = 0;
+  if (SUCCEEDED(frame.GetColorContexts(0, nullptr, &count)) && count > 0) {
+    std::vector<ComPtr<IWICColorContext>> contexts(count);
+    std::vector<IWICColorContext*> pointers;
+    pointers.reserve(count);
+    for (auto& context : contexts) {
+      if (FAILED(factory.CreateColorContext(context.GetAddressOf()))) return {};
+      pointers.push_back(context.Get());
+    }
+    UINT found = 0;
+    if (SUCCEEDED(frame.GetColorContexts(count, pointers.data(), &found)) && found <= count) {
+      ComPtr<IWICColorContext> target;
+      if (FAILED(factory.CreateColorContext(target.GetAddressOf())) ||
+          FAILED(target->InitializeFromExifColorSpace(1))) return {};
+      for (UINT index = 0; index < found; ++index) {
+        ComPtr<IWICColorTransform> transform;
+        if (SUCCEEDED(factory.CreateColorTransformer(transform.GetAddressOf())) &&
+            SUCCEEDED(transform->Initialize(&frame, pointers[index], target.Get(), GUID_WICPixelFormat32bppRGBA))) {
+          return transform;
+        }
+      }
+    }
+  }
+  return ConvertWicPixels(factory, frame, GUID_WICPixelFormat32bppRGBA);
+}
+
+class WicWorkerApartment {
+public:
+  WicWorkerApartment() {
+    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
+      throw std::runtime_error("PingCore could not initialize the image codec's COM apartment");
+    }
+  }
+  ~WicWorkerApartment() { CoUninitialize(); }
+  WicWorkerApartment(const WicWorkerApartment&) = delete;
+  WicWorkerApartment& operator=(const WicWorkerApartment&) = delete;
+};
+
+template <class Interface> class ComObject : public Interface {
+public:
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** result) override {
+    if (!result)
+      return E_POINTER;
+    *result = nullptr;
+    if (!IsEqualIID(id, __uuidof(IUnknown)) && !IsEqualIID(id, __uuidof(Interface)))
+      return E_NOINTERFACE;
+    *result = static_cast<Interface*>(this);
+    AddRef();
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override {
+    return ++references_;
+  }
+  ULONG STDMETHODCALLTYPE Release() override {
+    const auto remaining = --references_;
+    if (!remaining)
+      delete this;
+    return remaining;
+  }
+
+protected:
+  virtual ~ComObject() = default;
+
+private:
+  std::atomic<ULONG> references_{1};
+};
+
+class Win32FontStream final : public ComObject<IDWriteFontFileStream> {
+public:
+  explicit Win32FontStream(std::shared_ptr<const FontFaceData> face) : face_(std::move(face)) {}
+  HRESULT STDMETHODCALLTYPE ReadFileFragment(const void** data, UINT64 offset, UINT64 size, void** context) override {
+    if (!data || !context)
+      return E_POINTER;
+    *data = nullptr;
+    *context = nullptr;
+    if (offset > face_->bytes.size() || size > face_->bytes.size() - offset)
+      return E_INVALIDARG;
+    *data = face_->bytes.data() + static_cast<std::size_t>(offset);
+    return S_OK;
+  }
+  void STDMETHODCALLTYPE ReleaseFileFragment(void*) override {}
+  HRESULT STDMETHODCALLTYPE GetFileSize(UINT64* size) override {
+    if (!size)
+      return E_POINTER;
+    *size = face_->bytes.size();
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetLastWriteTime(UINT64*) override {
+    return E_NOTIMPL;
+  }
+
+private:
+  std::shared_ptr<const FontFaceData> face_;
+};
+
+class Win32FontFileLoader final : public ComObject<IDWriteFontFileLoader> {
+public:
+  explicit Win32FontFileLoader(std::shared_ptr<const FontFaceData> face) : face_(std::move(face)) {}
+  HRESULT STDMETHODCALLTYPE CreateStreamFromKey(const void* key, UINT32 size, IDWriteFontFileStream** stream) override {
+    if (!stream)
+      return E_POINTER;
+    *stream = nullptr;
+    if (!key || size != sizeof(face_->identity) || std::memcmp(key, &face_->identity, size) != 0)
+      return E_INVALIDARG;
+    *stream = new (std::nothrow) Win32FontStream(face_);
+    return *stream ? S_OK : E_OUTOFMEMORY;
+  }
+
+private:
+  std::shared_ptr<const FontFaceData> face_;
+};
+
+class Win32FontEnumerator final : public ComObject<IDWriteFontFileEnumerator> {
+public:
+  explicit Win32FontEnumerator(IDWriteFontFile* file) : file_(file) {}
+  HRESULT STDMETHODCALLTYPE MoveNext(BOOL* current) override {
+    if (!current)
+      return E_POINTER;
+    *current = !visited_;
+    current_ = !visited_;
+    visited_ = true;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetCurrentFontFile(IDWriteFontFile** file) override {
+    if (!file)
+      return E_POINTER;
+    *file = nullptr;
+    return current_ ? file_.CopyTo(file) : E_FAIL;
+  }
+
+private:
+  Microsoft::WRL::ComPtr<IDWriteFontFile> file_;
+  bool visited_ = false;
+  bool current_ = false;
+};
+
+class Win32FontCollectionLoader final : public ComObject<IDWriteFontCollectionLoader> {
+public:
+  explicit Win32FontCollectionLoader(IDWriteFontFile* file) : file_(file) {}
+  HRESULT STDMETHODCALLTYPE CreateEnumeratorFromKey(IDWriteFactory*, const void*, UINT32,
+                                                    IDWriteFontFileEnumerator** enumerator) override {
+    if (!enumerator)
+      return E_POINTER;
+    *enumerator = new (std::nothrow) Win32FontEnumerator(file_.Get());
+    return *enumerator ? S_OK : E_OUTOFMEMORY;
+  }
+
+private:
+  Microsoft::WRL::ComPtr<IDWriteFontFile> file_;
+};
+
+// Every native layout retains its registrations, including layouts that outlive their renderer.
+class Win32FontCollection {
+public:
+  ~Win32FontCollection() {
+    collection.Reset();
+    if (collection_registered_)
+      factory_->UnregisterFontCollectionLoader(collection_loader_.Get());
+    collection_loader_.Reset();
+    if (file_registered_)
+      factory_->UnregisterFontFileLoader(file_loader_.Get());
+  }
+
+  HRESULT Initialize(IDWriteFactory* factory, const std::shared_ptr<const FontFaceData>& face) {
+    factory_ = factory;
+    file_loader_.Attach(new (std::nothrow) Win32FontFileLoader(face));
+    if (!file_loader_)
+      return E_OUTOFMEMORY;
+    HRESULT result = factory->RegisterFontFileLoader(file_loader_.Get());
+    if (FAILED(result))
+      return result;
+    file_registered_ = true;
+    Microsoft::WRL::ComPtr<IDWriteFontFile> file;
+    result = factory->CreateCustomFontFileReference(&face->identity, sizeof(face->identity), file_loader_.Get(), &file);
+    if (FAILED(result))
+      return result;
+    collection_loader_.Attach(new (std::nothrow) Win32FontCollectionLoader(file.Get()));
+    if (!collection_loader_)
+      return E_OUTOFMEMORY;
+    result = factory->RegisterFontCollectionLoader(collection_loader_.Get());
+    if (FAILED(result))
+      return result;
+    collection_registered_ = true;
+    result = factory->CreateCustomFontCollection(collection_loader_.Get(), &face->identity, sizeof(face->identity),
+                                                 &collection);
+    if (FAILED(result))
+      return result;
+    if (collection->GetFontFamilyCount() != 1)
+      return E_FAIL;
+    Microsoft::WRL::ComPtr<IDWriteFontFamily> family;
+    result = collection->GetFontFamily(0, &family);
+    if (FAILED(result))
+      return result;
+    Microsoft::WRL::ComPtr<IDWriteLocalizedStrings> names;
+    result = family->GetFamilyNames(&names);
+    if (FAILED(result))
+      return result;
+    UINT32 length = 0;
+    result = names->GetStringLength(0, &length);
+    if (FAILED(result))
+      return result;
+    name.resize(static_cast<std::size_t>(length) + 1);
+    result = names->GetString(0, name.data(), length + 1);
+    if (FAILED(result))
+      return result;
+    name.resize(length);
+    Microsoft::WRL::ComPtr<IDWriteFont> font;
+    // DirectWrite may enumerate synthetic variants; retain the supplied face's own attributes.
+    for (UINT32 index = 0; index < family->GetFontCount(); ++index) {
+      result = family->GetFont(index, font.ReleaseAndGetAddressOf());
+      if (FAILED(result))
+        return result;
+      if (font->GetSimulations() == DWRITE_FONT_SIMULATIONS_NONE)
+        break;
+    }
+    if (!font || font->GetSimulations() != DWRITE_FONT_SIMULATIONS_NONE)
+      return E_FAIL;
+    weight = font->GetWeight();
+    style = font->GetStyle();
+    stretch = font->GetStretch();
+    return S_OK;
+  }
+
+  Microsoft::WRL::ComPtr<IDWriteFontCollection> collection;
+  std::wstring name;
+  DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL;
+  DWRITE_FONT_STYLE style = DWRITE_FONT_STYLE_NORMAL;
+  DWRITE_FONT_STRETCH stretch = DWRITE_FONT_STRETCH_NORMAL;
+
+private:
+  Microsoft::WRL::ComPtr<IDWriteFactory> factory_;
+  Microsoft::WRL::ComPtr<IDWriteFontFileLoader> file_loader_;
+  Microsoft::WRL::ComPtr<IDWriteFontCollectionLoader> collection_loader_;
+  bool file_registered_ = false;
+  bool collection_registered_ = false;
+};
+
+using FontRetentions = std::vector<std::shared_ptr<Win32FontCollection>>;
+
+constexpr float kDipsPerInch = 96.0F;
+constexpr float kFullCircle = 6.28318530717958647692F;
+// The effect property stores the enum as UINT32; some MinGW headers expose the property but omit its enum.
+constexpr UINT32 kShadowOptimizationBalanced = 1U;
+
+void ThrowIfFailed(HRESULT result, const char* message) {
+  if (FAILED(result)) {
+    throw std::runtime_error(message);
+  }
+}
+
+D2D1_COLOR_F ToD2DColor(Color color) {
+  return D2D1::ColorF(color.red, color.green, color.blue, color.alpha);
+}
+
+D2D1_RECT_F ToD2DRect(Rect rect) {
+  return D2D1::RectF(rect.x, rect.y, rect.x + rect.width, rect.y + rect.height);
+}
+
+D2D1_MATRIX_3X2_F ToD2DTransform(Transform2D transform) {
+  return D2D1::Matrix3x2F(transform.m11, transform.m12, transform.m21, transform.m22, transform.translate_x,
+                         transform.translate_y);
+}
+
+D2D1_CAP_STYLE ToD2DCap(StrokeCap cap) {
+  switch (cap) {
+  case StrokeCap::Round:
+    return D2D1_CAP_STYLE_ROUND;
+  case StrokeCap::Square:
+    return D2D1_CAP_STYLE_SQUARE;
+  case StrokeCap::Butt:
+  default:
+    return D2D1_CAP_STYLE_FLAT;
+  }
+}
+
+D2D1_LINE_JOIN ToD2DJoin(StrokeJoin join) {
+  switch (join) {
+  case StrokeJoin::Round:
+    return D2D1_LINE_JOIN_ROUND;
+  case StrokeJoin::Bevel:
+    return D2D1_LINE_JOIN_BEVEL;
+  case StrokeJoin::Miter:
+  default:
+    return D2D1_LINE_JOIN_MITER;
+  }
+}
+
+void CombineHash(std::size_t& seed, std::size_t value) noexcept {
+  seed ^= value + 0x9e3779b9U + (seed << 6U) + (seed >> 2U);
+}
+
+std::size_t HashFont(const Font& font) noexcept {
+  std::size_t result = HashFontFamily(font.Family());
+  CombineHash(result, std::hash<float>{}(font.Size()));
+  CombineHash(result, std::hash<FontWeight>{}(font.Weight()));
+  CombineHash(result, std::hash<FontSlant>{}(font.Slant()));
+  return result;
+}
+
+std::size_t HashShaping(const TextShapingOptions& shaping) noexcept {
+  std::size_t result = std::hash<TextDirection>{}(shaping.direction);
+  CombineHash(result, std::hash<std::string>{}(shaping.locale));
+  return result;
+}
+
+} // namespace
+
+Task<Bitmap> DecodeBitmap(ImageAsset image, std::uint16_t orientation) {
+  return RunWorker([orientation](ImageAsset source) {
+    if (!source.HasValue()) throw std::logic_error("PingCore cannot decode a missing image asset");
+    const WicWorkerApartment apartment;
+    const auto factory = CreateWicFactory();
+    auto frame = factory ? DecodeWicFrame(*factory.Get(), source) : ComPtr<IWICBitmapFrameDecode>{};
+    UINT width = 0;
+    UINT height = 0;
+    if (!frame || FAILED(frame->GetSize(&width, &height))) {
+      throw std::runtime_error("PingCore could not decode image pixels");
+    }
+    const auto size = BitmapByteSize(width, height);
+    if (size > std::numeric_limits<UINT>::max()) {
+      throw std::runtime_error("PingCore image exceeds the Windows codec size limit");
+    }
+    Bytes pixels(size);
+    const auto converted = SrgbWicFrame(*factory.Get(), *frame.Get());
+    if (!converted || FAILED(converted->CopyPixels(nullptr, width * 4, static_cast<UINT>(size),
+                                                    reinterpret_cast<BYTE*>(pixels.data())))) {
+      throw std::runtime_error("PingCore could not copy image pixels");
+    }
+    return ApplyEncodedOrientation(Bitmap::FromRgba8(width, height, std::move(pixels), source.Scale()), orientation);
+  }, std::move(image));
+}
+
+Task<Bytes> EncodeBitmap(Bitmap bitmap, ImageEncodeOptions options) {
+  return RunWorker([](Bitmap pixels, ImageEncodeOptions settings) {
+    const WicWorkerApartment apartment;
+    const bool jpeg = settings.format == ImageFormat::Jpeg;
+    if (jpeg) pixels = FlattenBitmap(std::move(pixels), settings.jpeg_background);
+    const auto factory = CreateWicFactory();
+    const auto source = factory ? CreateWicBitmap(*factory.Get(), pixels) : ComPtr<IWICBitmap>{};
+    ComPtr<IStream> stream;
+    ComPtr<IWICBitmapEncoder> encoder;
+    ComPtr<IWICBitmapFrameEncode> frame;
+    ComPtr<IPropertyBag2> properties;
+    if (!source || FAILED(CreateStreamOnHGlobal(nullptr, TRUE, stream.GetAddressOf())) ||
+        FAILED(factory->CreateEncoder(jpeg ? GUID_ContainerFormatJpeg : GUID_ContainerFormatPng,
+                                      nullptr, encoder.GetAddressOf())) ||
+        FAILED(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache)) ||
+        FAILED(encoder->CreateNewFrame(frame.GetAddressOf(), properties.GetAddressOf()))) {
+      throw std::runtime_error("PingCore could not prepare image encoding");
+    }
+    if (jpeg) {
+      PROPBAG2 property{};
+      wchar_t name[] = L"ImageQuality";
+      property.pstrName = name;
+      VARIANT value{};
+      value.vt = VT_R4;
+      value.fltVal = settings.jpeg_quality / 100.0F;
+      if (!properties || FAILED(properties->Write(1, &property, &value))) {
+        throw std::runtime_error("PingCore could not set the JPEG quality");
+      }
+    }
+    WICPixelFormatGUID format = jpeg ? GUID_WICPixelFormat24bppBGR : GUID_WICPixelFormat32bppBGRA;
+    if (FAILED(frame->Initialize(properties.Get())) ||
+        FAILED(frame->SetSize(pixels.PixelWidth(), pixels.PixelHeight())) ||
+        FAILED(frame->SetPixelFormat(&format))) {
+      throw std::runtime_error("PingCore could not configure image encoding");
+    }
+    if (!IsEqualGUID(format, jpeg ? GUID_WICPixelFormat24bppBGR : GUID_WICPixelFormat32bppBGRA)) {
+      throw std::runtime_error("PingCore Windows encoder rejected the required output pixel format");
+    }
+    const auto converted = ConvertWicPixels(*factory.Get(), *source.Get(), format);
+    if (!converted || FAILED(frame->WriteSource(converted.Get(), nullptr)) || FAILED(frame->Commit()) ||
+        FAILED(encoder->Commit())) {
+      throw std::runtime_error("PingCore could not encode the bitmap");
+    }
+
+    STATSTG stats{};
+    LARGE_INTEGER start{};
+    if (FAILED(stream->Stat(&stats, STATFLAG_NONAME)) || stats.cbSize.QuadPart == 0 ||
+        stats.cbSize.QuadPart > std::numeric_limits<ULONG>::max() ||
+        FAILED(stream->Seek(start, STREAM_SEEK_SET, nullptr))) {
+      throw std::runtime_error("PingCore could not read encoded image bytes");
+    }
+    Bytes bytes(static_cast<std::size_t>(stats.cbSize.QuadPart));
+    ULONG count = 0;
+    if (FAILED(stream->Read(bytes.data(), static_cast<ULONG>(bytes.size()), &count)) || count != bytes.size()) {
+      throw std::runtime_error("PingCore could not read encoded image bytes");
+    }
+    return bytes;
+  }, std::move(bitmap), options);
+}
+
+class Win32InlineObject final : public ComObject<IDWriteInlineObject> {
+public:
+  explicit Win32InlineObject(const TextInlineObject& object)
+      : metrics_{object.width, object.ascent + object.descent, object.ascent, FALSE} {}
+
+  HRESULT STDMETHODCALLTYPE Draw(void*, IDWriteTextRenderer*, FLOAT, FLOAT, BOOL, BOOL, IUnknown*) override {
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetMetrics(DWRITE_INLINE_OBJECT_METRICS* metrics) override {
+    *metrics = metrics_;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetOverhangMetrics(DWRITE_OVERHANG_METRICS* metrics) override {
+    *metrics = {};
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetBreakConditions(DWRITE_BREAK_CONDITION* before, DWRITE_BREAK_CONDITION* after) override {
+    *before = DWRITE_BREAK_CONDITION_CAN_BREAK;
+    *after = DWRITE_BREAK_CONDITION_CAN_BREAK;
+    return S_OK;
+  }
+
+private:
+  DWRITE_INLINE_OBJECT_METRICS metrics_;
+};
+
+class Win32TextLayout final : public TextLayoutBackend {
+public:
+  Win32TextLayout(std::wstring text, ComPtr<IDWriteTextLayout> layout, std::vector<TextOffset> caret_offsets,
+      FontRetentions fonts)
+      : text_(std::move(text)), fonts_(std::move(fonts)), layout_(std::move(layout)),
+        caret_offsets_(std::move(caret_offsets)) {}
+
+  static std::vector<TextOffset> CaretOffsets(IDWriteTextLayout& layout) {
+    UINT32 count = 0;
+    layout.GetClusterMetrics(nullptr, 0, &count);
+    std::vector<DWRITE_CLUSTER_METRICS> clusters(count);
+    if (count > 0) {
+      ThrowIfFailed(layout.GetClusterMetrics(clusters.data(), count, &count),
+          "PingCore could not query DirectWrite text clusters");
+      clusters.resize(count);
+    }
+    std::vector<TextOffset> offsets;
+    offsets.reserve(clusters.size() + 1);
+    offsets.push_back(0);
+    for (const auto& cluster : clusters) {
+      offsets.push_back(offsets.back() + cluster.length);
+    }
+    return offsets;
+  }
+
+  Size Measure() const override {
+    DWRITE_TEXT_METRICS metrics{};
+    ThrowIfFailed(layout_->GetMetrics(&metrics), "PingCore could not measure a DirectWrite text layout");
+    return {
+        std::ceil(metrics.widthIncludingTrailingWhitespace),
+        std::ceil(metrics.height),
+    };
+  }
+
+  std::vector<TextLineMetrics> LineMetrics() const override {
+    DWRITE_TEXT_METRICS paragraph{};
+    ThrowIfFailed(layout_->GetMetrics(&paragraph), "PingCore could not measure a DirectWrite text layout");
+    std::vector<DWRITE_LINE_METRICS> lines(paragraph.lineCount);
+    UINT32 count = 0;
+    ThrowIfFailed(layout_->GetLineMetrics(lines.data(), paragraph.lineCount, &count),
+        "PingCore could not query DirectWrite line metrics");
+    std::vector<TextLineMetrics> result;
+    result.reserve(count);
+    TextOffset offset = 0;
+    float top = paragraph.top;
+    for (UINT32 index = 0; index < count; ++index) {
+      const DWRITE_LINE_METRICS& line = lines[index];
+      const TextOffset end = offset + line.length - line.newlineLength;
+      const auto fragments = RangeRects({offset, end});
+      float left = fragments.empty() ? CaretRect(offset, TextAffinity::Downstream).x : fragments.front().x;
+      float right = left;
+      for (const Rect& fragment : fragments) {
+        left = std::min(left, fragment.x);
+        right = std::max(right, fragment.x + fragment.width);
+      }
+      result.push_back({{offset, end}, {left, top, right - left, line.height}, top + line.baseline});
+      offset += line.length;
+      top += line.height;
+    }
+    return result;
+  }
+
+  TextPosition HitTest(Point point) const override {
+    BOOL trailing = FALSE;
+    BOOL inside = FALSE;
+    DWRITE_HIT_TEST_METRICS metrics{};
+    ThrowIfFailed(
+        layout_->HitTestPoint(point.x, point.y, &trailing, &inside, &metrics),
+        "PingCore could not hit test a DirectWrite text layout"
+    );
+    TextOffset offset = std::min<TextOffset>(static_cast<TextOffset>(text_.size()),
+        static_cast<TextOffset>(metrics.textPosition) + (trailing != FALSE ? metrics.length : 0));
+    if (offset > 0 && offset < static_cast<TextOffset>(text_.size())) {
+      const auto previous = PreviousCaretOffset(offset);
+      const auto next = NextCaretOffset(previous);
+      if (next != offset) {
+        offset = trailing != FALSE ? next : previous;
+      }
+    }
+    return {
+        offset,
+        trailing != FALSE ? TextAffinity::Upstream : TextAffinity::Downstream,
+    };
+  }
+
+  Rect CaretRect(TextOffset offset, TextAffinity affinity) const override {
+    UINT32 position = static_cast<UINT32>(std::clamp<TextOffset>(offset, 0, text_.size()));
+    const BOOL trailing = affinity == TextAffinity::Upstream && position > 0;
+    if (trailing != FALSE) {
+      --position;
+    }
+    DWRITE_HIT_TEST_METRICS metrics{};
+    float x = 0.0F;
+    float y = 0.0F;
+    ThrowIfFailed(
+        layout_->HitTestTextPosition(position, trailing, &x, &y, &metrics),
+        "PingCore could not locate a DirectWrite text caret"
+    );
+    return {
+        x,
+        y,
+        1.0F,
+        metrics.height,
+    };
+  }
+
+  std::vector<Rect> RangeRects(TextRange range) const override {
+    const TextOffset start = std::clamp<TextOffset>(range.start, 0, text_.size());
+    const TextOffset end = std::clamp<TextOffset>(range.end, start, text_.size());
+    if (start == end) {
+      return {};
+    }
+
+    UINT32 count = 0;
+    // Query fragment count rather than allocating by text length; bidi and wrapping determine the actual geometry.
+    const HRESULT query = layout_->HitTestTextRange(static_cast<UINT32>(start), static_cast<UINT32>(end - start),
+        0.0F, 0.0F, nullptr, 0, &count);
+    if (query != E_NOT_SUFFICIENT_BUFFER) {
+      ThrowIfFailed(query, "PingCore could not count DirectWrite text range fragments");
+    }
+    std::vector<DWRITE_HIT_TEST_METRICS> metrics(count);
+    const HRESULT result = layout_->HitTestTextRange(static_cast<UINT32>(start), static_cast<UINT32>(end - start),
+        0.0F, 0.0F, metrics.data(), static_cast<UINT32>(metrics.size()), &count);
+    ThrowIfFailed(result, "PingCore could not locate a DirectWrite text range");
+
+    std::vector<Rect> rects;
+    rects.reserve(count);
+    for (UINT32 index = 0; index < count; ++index) {
+      rects.push_back({
+          metrics[index].left,
+          metrics[index].top,
+          metrics[index].width,
+          metrics[index].height,
+      });
+    }
+    return rects;
+  }
+
+  TextOffset PreviousCaretOffset(TextOffset offset) const override {
+    const auto found = std::lower_bound(caret_offsets_.begin(), caret_offsets_.end(), offset);
+    return found == caret_offsets_.begin() ? 0 : *std::prev(found);
+  }
+
+  TextOffset NextCaretOffset(TextOffset offset) const override {
+    const auto found = std::upper_bound(caret_offsets_.begin(), caret_offsets_.end(), offset);
+    return found == caret_offsets_.end() ? caret_offsets_.back() : *found;
+  }
+
+  IDWriteTextLayout* Layout() const noexcept { return layout_.Get(); }
+
+private:
+  std::wstring text_;
+  FontRetentions fonts_;
+  ComPtr<IDWriteTextLayout> layout_;
+  std::vector<TextOffset> caret_offsets_;
+};
+
+struct Win32Renderer::Impl {
+  struct ClipState {
+    bool uses_layer = false;
+    ComPtr<ID2D1Layer> layer;
+    ComPtr<ID2D1Geometry> geometry;
+  };
+
+  struct ShadowMask {
+    Size size;
+    float corner_radius = 0.0F;
+    float blur_radius = 0.0F;
+    ComPtr<ID2D1CommandList> commands;
+    // The exterior clip removes the caster from the blurred mask so offsets never form a solid duplicate shape.
+    ComPtr<ID2D1Geometry> exterior_clip;
+  };
+
+  struct CachedPathGeometry {
+    Path path;
+    PathFillRule fill_rule = PathFillRule::NonZero;
+    ComPtr<ID2D1PathGeometry> geometry;
+  };
+
+  struct CachedImage {
+    std::uint64_t identity = 0;
+    std::size_t byte_size = 0;
+    ComPtr<ID2D1Bitmap1> bitmap;
+  };
+
+  struct CachedPixelTexture {
+    std::weak_ptr<windows::PixelTexture> texture;
+    // The CPU frame outlives device resources so a reset can rebuild its Direct2D bitmap without another publish.
+    std::shared_ptr<const Win32PixelFrame> frame;
+    ComPtr<ID2D1Bitmap1> bitmap;
+    std::uint64_t draw_epoch = std::numeric_limits<std::uint64_t>::max();
+  };
+
+  struct CachedD3D11Texture {
+    std::weak_ptr<windows::D3D11Texture> texture;
+    // The producer-device snapshot survives renderer device resets and can be reopened without another publication.
+    std::shared_ptr<const windows::D3D11Frame> frame;
+    ComPtr<ID3D11Texture2D> shared_texture;
+    ComPtr<IDXGIKeyedMutex> keyed_mutex;
+    ComPtr<ID2D1Bitmap1> bitmap;
+    bool acquired = false;
+  };
+
+  struct FontHash {
+    std::size_t operator()(const Font& font) const noexcept {
+      return HashFont(font);
+    }
+  };
+
+  struct TextRunKey {
+    std::string text;
+    Font font;
+    TextDecoration decoration = TextDecoration::None;
+    TextShapingOptions shaping;
+
+    bool operator==(const TextRunKey&) const = default;
+  };
+
+  struct TextRunKeyView {
+    std::string_view text;
+    const Font& font;
+    TextDecoration decoration;
+    const TextShapingOptions& shaping;
+  };
+
+  struct TextRunKeyHash {
+    using is_transparent = void;
+
+    std::size_t operator()(const TextRunKey& key) const noexcept {
+      return Hash(key.text, key.font, key.decoration, key.shaping);
+    }
+
+    std::size_t operator()(const TextRunKeyView& key) const noexcept {
+      return Hash(key.text, key.font, key.decoration, key.shaping);
+    }
+
+  private:
+    static std::size_t Hash(
+        std::string_view text, const Font& font, TextDecoration decoration, const TextShapingOptions& shaping
+    ) noexcept {
+      std::size_t result = std::hash<std::string_view>{}(text);
+      CombineHash(result, HashFont(font));
+      CombineHash(result, std::hash<TextDecoration>{}(decoration));
+      CombineHash(result, HashShaping(shaping));
+      return result;
+    }
+  };
+
+  struct TextRunKeyEqual {
+    using is_transparent = void;
+
+    bool operator()(const TextRunKey& left, const TextRunKey& right) const noexcept {
+      return left == right;
+    }
+
+    bool operator()(const TextRunKey& left, const TextRunKeyView& right) const noexcept {
+      return std::string_view(left.text) == right.text && left.font == right.font &&
+             left.decoration == right.decoration && left.shaping == right.shaping;
+    }
+
+    bool operator()(const TextRunKeyView& left, const TextRunKey& right) const noexcept {
+      return (*this)(right, left);
+    }
+  };
+
+  struct CachedTextRun {
+    FontRetentions fonts;
+    ComPtr<IDWriteTextLayout> layout;
+    TextRunMetrics metrics;
+    float baseline = 0.0F;
+  };
+
+  struct ParagraphKey {
+    AttributedText text;
+    Font font;
+    TextDecoration decoration = TextDecoration::None;
+    TextLayoutOptions options;
+    Size size;
+
+    bool operator==(const ParagraphKey&) const = default;
+  };
+
+  struct ParagraphKeyView {
+    const AttributedText& text;
+    const Font& font;
+    TextDecoration decoration;
+    const TextLayoutOptions& options;
+    Size size;
+  };
+
+  struct ParagraphKeyHash {
+    using is_transparent = void;
+
+    std::size_t operator()(const ParagraphKey& key) const noexcept {
+      return Hash(key.text, key.font, key.decoration, key.options, key.size);
+    }
+
+    std::size_t operator()(const ParagraphKeyView& key) const noexcept {
+      return Hash(key.text, key.font, key.decoration, key.options, key.size);
+    }
+
+  private:
+    static std::size_t Hash(const AttributedText& text, const Font& font, TextDecoration decoration,
+        const TextLayoutOptions& options, Size size) noexcept {
+      std::size_t result = InternalAccess::BodyHash(text);
+      CombineHash(result, HashFont(font));
+      CombineHash(result, std::hash<TextDecoration>{}(decoration));
+      CombineHash(result, HashShaping(options.shaping));
+      CombineHash(result, std::hash<TextAlign>{}(options.align));
+      CombineHash(result, std::hash<TextVerticalAlign>{}(options.vertical_align));
+      CombineHash(result, std::hash<TextWrap>{}(options.wrap));
+      CombineHash(result, std::hash<float>{}(size.width));
+      CombineHash(result, std::hash<float>{}(size.height));
+      return result;
+    }
+  };
+
+  struct ParagraphKeyEqual {
+    using is_transparent = void;
+
+    bool operator()(const ParagraphKey& left, const ParagraphKey& right) const noexcept {
+      return left == right;
+    }
+
+    bool operator()(const ParagraphKey& left, const ParagraphKeyView& right) const noexcept {
+      return left.text == right.text && left.font == right.font &&
+             left.decoration == right.decoration && left.options == right.options && left.size == right.size;
+    }
+
+    bool operator()(const ParagraphKeyView& left, const ParagraphKey& right) const noexcept {
+      return (*this)(right, left);
+    }
+  };
+
+  struct ResolvedFont {
+    ComPtr<IDWriteFontCollection> collection;
+    std::wstring name;
+    DWRITE_FONT_WEIGHT weight;
+    DWRITE_FONT_STYLE style;
+    DWRITE_FONT_STRETCH stretch = DWRITE_FONT_STRETCH_NORMAL;
+  };
+
+  struct ParagraphFontRun {
+    DWRITE_TEXT_RANGE range;
+    ResolvedFont font;
+    float size;
+    TextDecoration decoration;
+  };
+
+  struct ParagraphInputs {
+    std::wstring text;
+    ResolvedFont base_font;
+    std::vector<ParagraphFontRun> runs;
+    TextDirection direction;
+    std::optional<TextLayoutMetrics> metrics;
+    float measured_width = 0.0F;
+    TextWrap measured_wrap = TextWrap::Word;
+  };
+
+  struct CachedParagraph {
+    FontRetentions fonts;
+    ComPtr<IDWriteTextLayout> layout;
+    std::size_t cost = 0;
+    std::unique_ptr<ParagraphInputs> inputs;
+  };
+
+  struct ParagraphCache {
+    using Entries = std::unordered_map<ParagraphKey, std::shared_ptr<CachedParagraph>,
+                                       ParagraphKeyHash, ParagraphKeyEqual>;
+    Entries measured;
+    Entries drawn;
+    std::size_t bytes = 0;
+    std::size_t drawn_bytes = 0;
+
+    std::shared_ptr<CachedParagraph> Find(const ParagraphKeyView& key) const {
+      const auto paint = drawn.find(key);
+      if (paint != drawn.end()) {
+        return paint->second;
+      }
+      const auto measure = measured.find(key);
+      return measure == measured.end() ? nullptr : measure->second;
+    }
+
+    void Store(ParagraphKey key, const std::shared_ptr<CachedParagraph>& paragraph, bool drawing) {
+      constexpr std::size_t maximum_paragraphs = 256;
+      const auto cost = paragraph->cost;
+      if (cost > paragraph_cache_budget || (!drawing &&
+          (drawn.size() >= maximum_paragraphs || drawn_bytes + cost > paragraph_cache_budget))) {
+        return;
+      }
+      while (measured.size() + drawn.size() >= maximum_paragraphs || bytes + cost > paragraph_cache_budget) {
+        auto& entries = measured.empty() ? drawn : measured;
+        const auto entry = entries.begin();
+        bytes -= entry->second->cost;
+        if (measured.empty()) {
+          drawn_bytes -= entry->second->cost;
+        }
+        entries.erase(entry);
+      }
+      (drawing ? drawn : measured).emplace(std::move(key), paragraph);
+      bytes += cost;
+      if (drawing) {
+        drawn_bytes += cost;
+      }
+    }
+  };
+
+  std::shared_ptr<CachedParagraph> ParagraphInputsFor(
+      const AttributedText& text, const TextStyle& style, const TextShapingOptions& shaping, bool drawing) {
+    const TextLayoutOptions key_options{.shaping = shaping};
+    if (auto cached = paragraphs_.Find({text, style.font, style.decoration, key_options, {}})) {
+      return cached;
+    }
+    ValidateParagraphLength(text);
+    auto paragraph = std::make_shared<CachedParagraph>();
+    paragraph->inputs = std::make_unique<ParagraphInputs>();
+    auto& inputs = *paragraph->inputs;
+    inputs.text = Utf8ToWide(text.PlainText());
+    inputs.direction = ResolveParagraphDirection(text.PlainText(), shaping.direction);
+    inputs.base_font = ResolveFont(style.font, paragraph->fonts);
+    inputs.runs = ResolveParagraphFonts(text, style, paragraph->fonts);
+    paragraph->cost = ParagraphCacheCost(text);
+    // A draw without a preceding measurement retains only its drawable layout.
+    if (!drawing) {
+      paragraphs_.Store({text, style.font, style.decoration, key_options, {}}, paragraph, false);
+    }
+    return paragraph;
+  }
+
+  TextLayoutMetrics
+  MeasureText(const AttributedText& text, const TextStyle& style, float max_width, const TextLayoutOptions& options) {
+    const bool constrained = std::isfinite(max_width);
+    if (constrained && max_width <= 0.0F) {
+      ValidateParagraphLength(text);
+      return {};
+    }
+    TextLayoutOptions measurement_options = options;
+    ResolveDefaultLocale(measurement_options.shaping);
+    const auto paragraph = ParagraphInputsFor(text, style, measurement_options.shaping, false);
+    auto& inputs = *paragraph->inputs;
+    if (inputs.metrics && inputs.measured_width == max_width && inputs.measured_wrap == options.wrap) {
+      return *inputs.metrics;
+    }
+    auto format = CreateTextFormat(inputs.base_font, style.font.Size(), Utf8ToWide(measurement_options.shaping.locale));
+    // Alignment does not affect intrinsic metrics. Keeping text at the physical left avoids precision loss when an
+    // unbounded DirectWrite layout uses its maximum finite width.
+    measurement_options.align =
+        inputs.direction == TextDirection::RightToLeft ? TextAlign::Trailing : TextAlign::Leading;
+    ConfigureTextFormat(*format.Get(), measurement_options, inputs.direction);
+
+    const float layout_width = constrained ? max_width : std::numeric_limits<float>::max();
+    ComPtr<IDWriteTextLayout> layout;
+    ThrowIfFailed(
+        write_factory_->CreateTextLayout(
+            inputs.text.data(),
+            static_cast<UINT32>(inputs.text.size()),
+            format.Get(),
+            layout_width,
+            std::numeric_limits<float>::max(),
+            layout.GetAddressOf()
+        ),
+        "PingCore could not create a DirectWrite text layout"
+    );
+
+    ApplyTextAttributes(*layout.Get(), text, inputs.runs);
+    DWRITE_TEXT_METRICS metrics{};
+    ThrowIfFailed(layout->GetMetrics(&metrics), "PingCore could not measure a DirectWrite text layout");
+    const float width = constrained ? std::min(metrics.widthIncludingTrailingWhitespace, max_width)
+                                    : metrics.widthIncludingTrailingWhitespace;
+    UINT32 line_count = 0;
+    layout->GetLineMetrics(nullptr, 0, &line_count);
+    std::vector<DWRITE_LINE_METRICS> lines(line_count);
+    if (line_count > 0) {
+      ThrowIfFailed(
+          layout->GetLineMetrics(lines.data(), line_count, &line_count),
+          "PingCore could not query DirectWrite line metrics"
+      );
+    }
+    const float first_baseline = lines.empty() ? 0.0F : lines.front().baseline;
+    const float last_baseline = lines.empty() ? 0.0F : metrics.height - lines.back().height + lines.back().baseline;
+    const Size size{std::ceil(width), std::ceil(metrics.height)};
+    inputs.metrics = TextLayoutMetrics{
+        .size = size,
+        .first_baseline = first_baseline,
+        .last_baseline = last_baseline,
+        .line_count = line_count,
+    };
+    inputs.measured_width = max_width;
+    inputs.measured_wrap = options.wrap;
+    return *inputs.metrics;
+  }
+
+  TextRunMetrics MeasureRun(std::string_view text, const TextStyle& style, const TextShapingOptions& options) {
+    RequireSingleLineTextRun(text);
+    if (text.empty()) {
+      return {.font_metrics = Metrics(style.font)};
+    }
+    return TextRunFor(text, style, options).metrics;
+  }
+
+  std::unique_ptr<TextLayoutBackend> CreatePlatformTextLayout(
+      const AttributedText& text, const TextStyle& style, float max_width, const TextLayoutOptions& options) {
+    ValidateParagraphLength(text);
+    std::wstring wide = Utf8ToWide(text.PlainText());
+    FontRetentions fonts;
+    ComPtr<IDWriteTextFormat> format = CreateTextFormat(style.font, fonts, options.shaping.locale);
+    const bool constrained = std::isfinite(max_width);
+    ConfigureTextFormat(*format.Get(), options, ResolveParagraphDirection(text.PlainText(), options.shaping.direction));
+
+    ComPtr<IDWriteTextLayout> layout;
+    ThrowIfFailed(
+        write_factory_->CreateTextLayout(
+            wide.data(),
+            static_cast<UINT32>(wide.size()),
+            format.Get(),
+            constrained ? std::max(1.0F, max_width) : std::numeric_limits<float>::max(),
+            std::numeric_limits<float>::max(),
+            layout.GetAddressOf()
+        ),
+        "PingCore could not create an editable DirectWrite text layout"
+    );
+    // Font overrides may split DirectWrite glyph runs inside a grapheme; caret stops belong to the undecorated body.
+    auto caret_offsets = Win32TextLayout::CaretOffsets(*layout.Get());
+    ApplyTextAttributes(*layout.Get(), text, ResolveParagraphFonts(text, style, fonts));
+    return std::make_unique<Win32TextLayout>(std::move(wide), std::move(layout), std::move(caret_offsets), std::move(fonts));
+  }
+
+  static void ValidateParagraphLength(const AttributedText& text) {
+    if (text.Length() > std::numeric_limits<UINT32>::max()) {
+      throw std::invalid_argument("PingCore DirectWrite paragraph exceeds the supported length");
+    }
+  }
+
+  std::vector<ParagraphFontRun> ResolveParagraphFonts(
+      const AttributedText& text, const TextStyle& style, FontRetentions& fonts) {
+    const auto resolved = ResolveTextRuns(text, style);
+    std::vector<ParagraphFontRun> runs;
+    runs.reserve(resolved.size());
+    for (const auto& run : resolved) {
+      runs.push_back({{static_cast<UINT32>(run.range.start), static_cast<UINT32>(run.range.Length())},
+                      ResolveFont(run.style.font, fonts), run.style.font.Size(), run.style.decoration});
+    }
+    return runs;
+  }
+
+  void ApplyTextAttributes(IDWriteTextLayout& layout, const AttributedText& text,
+      std::span<const ParagraphFontRun> runs) {
+    for (const auto& run : runs) {
+      const auto range = run.range;
+      const auto& resolved = run.font;
+      ThrowIfFailed(layout.SetFontCollection(resolved.collection.Get(), range),
+          "PingCore could not set paragraph font collection");
+      ThrowIfFailed(layout.SetFontStretch(resolved.stretch, range), "PingCore could not set paragraph font stretch");
+      ThrowIfFailed(layout.SetFontFamilyName(resolved.name.c_str(), range), "PingCore could not set paragraph font family");
+      ThrowIfFailed(layout.SetFontSize(run.size, range), "PingCore could not set paragraph font size");
+      ThrowIfFailed(layout.SetFontWeight(resolved.weight, range),
+          "PingCore could not set paragraph font weight");
+      ThrowIfFailed(
+          layout.SetFontStyle(
+              resolved.style, range),
+          "PingCore could not set paragraph font slant"
+      );
+      ThrowIfFailed(layout.SetUnderline(HasTextDecoration(run.decoration, TextDecoration::Underline), range),
+          "PingCore could not set paragraph underline");
+      ThrowIfFailed(
+          layout.SetStrikethrough(HasTextDecoration(run.decoration, TextDecoration::StrikeThrough), range),
+          "PingCore could not set paragraph strikethrough");
+    }
+    for (const auto& object : text.InlineObjects()) {
+      ComPtr<IDWriteInlineObject> replacement;
+      replacement.Attach(new Win32InlineObject(object));
+      ThrowIfFailed(layout.SetInlineObject(replacement.Get(), {static_cast<UINT32>(object.offset), 1}),
+          "PingCore could not configure a DirectWrite inline object");
+    }
+  }
+
+  void ApplyTextForeground(IDWriteTextLayout& layout, const AttributedText& text) {
+    // Inherited foreground is supplied by DrawTextLayout's brush; only explicit span colors become effects.
+    for (const auto& item : text.StyleRanges()) {
+      if (item.style.foreground) {
+        ComPtr<ID2D1SolidColorBrush> foreground;
+        ThrowIfFailed(device_context_->CreateSolidColorBrush(ToD2DColor(*item.style.foreground), &foreground),
+            "PingCore could not create paragraph foreground");
+        ThrowIfFailed(
+            layout.SetDrawingEffect(foreground.Get(),
+                {static_cast<UINT32>(item.range.start), static_cast<UINT32>(item.range.Length())}),
+            "PingCore could not set paragraph foreground"
+        );
+      }
+    }
+  }
+
+  void InitializeFactories() {
+    D2D1_FACTORY_OPTIONS factory_options{};
+    ThrowIfFailed(
+        D2D1CreateFactory(
+            D2D1_FACTORY_TYPE_SINGLE_THREADED,
+            __uuidof(ID2D1Factory1),
+            &factory_options,
+            reinterpret_cast<void**>(d2d_factory_.GetAddressOf())
+        ),
+        "PingCore could not create a Direct2D factory"
+    );
+    ThrowIfFailed(
+        DWriteCreateFactory(
+            DWRITE_FACTORY_TYPE_SHARED,
+            __uuidof(IDWriteFactory),
+            reinterpret_cast<IUnknown**>(write_factory_.GetAddressOf())
+        ),
+        "PingCore could not create a DirectWrite factory"
+    );
+    PINGCORE_DISCARD(CoCreateInstance(
+        CLSID_WICImagingFactory,
+        nullptr,
+        CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(wic_factory_.GetAddressOf())
+    ));
+  }
+
+  [[nodiscard]] float DpiScale() const noexcept {
+    return std::max(dpi_, 1.0F) / kDipsPerInch;
+  }
+
+  std::wstring FontFamilyName(const Font& font) const {
+    if (font.FamilyKind() == FontFamilyKind::Monospace) {
+      return L"Consolas";
+    }
+    if (font.FamilyKind() == FontFamilyKind::Named) {
+      return Utf8ToWide(font.FamilyName());
+    }
+    return L"Segoe UI";
+  }
+
+  ResolvedFont ResolveFont(const Font& font, FontRetentions& retained) {
+    if (auto face = ResolveFontFace(font)) {
+      auto cached = custom_fonts_.find(face->identity);
+      if (cached == custom_fonts_.end()) {
+        auto loaded = std::make_shared<Win32FontCollection>();
+        if (FAILED(loaded->Initialize(write_factory_.Get(), face))) {
+          OutputDebugStringW(L"PingCore could not decode a custom font; using the system font\n");
+          loaded.reset();
+        }
+        if (custom_fonts_.size() >= 64) custom_fonts_.erase(custom_fonts_.begin());
+        cached = custom_fonts_.emplace(face->identity, std::move(loaded)).first;
+      }
+      if (const auto& loaded = cached->second) {
+        if (std::find(retained.begin(), retained.end(), loaded) == retained.end()) retained.push_back(loaded);
+        return {loaded->collection, loaded->name, loaded->weight, loaded->style, loaded->stretch};
+      }
+    }
+    ComPtr<IDWriteFontCollection> system;
+    ThrowIfFailed(write_factory_->GetSystemFontCollection(system.GetAddressOf()),
+        "PingCore could not access the DirectWrite font collection");
+    return {std::move(system), FontFamilyName(font), static_cast<DWRITE_FONT_WEIGHT>(font.Weight()),
+        font.Slant() == FontSlant::Italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL};
+  }
+
+  static std::wstring DefaultTextLocale() {
+    wchar_t name[LOCALE_NAME_MAX_LENGTH]{};
+    if (GetUserDefaultLocaleName(name, static_cast<int>(std::size(name))) == 0) {
+      return L"en-us";
+    }
+    return name;
+  }
+
+  void UpdateTextLocale() {
+    auto locale = WideToUtf8(DefaultTextLocale());
+    if (locale != paragraph_locale_) {
+      paragraph_locale_ = std::move(locale);
+      paragraphs_ = {};
+    }
+  }
+
+  void ResolveDefaultLocale(TextShapingOptions& shaping) {
+    if (!shaping.locale.empty()) {
+      return;
+    }
+    if (paragraph_locale_.empty()) {
+      UpdateTextLocale();
+    }
+    shaping.locale = paragraph_locale_;
+  }
+
+  ComPtr<IDWriteTextFormat> CreateTextFormat(const Font& font, FontRetentions& retained, std::string_view locale = {}) {
+    return CreateTextFormat(ResolveFont(font, retained), font.Size(),
+                            locale.empty() ? DefaultTextLocale() : Utf8ToWide(locale));
+  }
+
+  ComPtr<IDWriteTextFormat> CreateTextFormat(const ResolvedFont& font, float size, const std::wstring& locale) {
+    ComPtr<IDWriteTextFormat> format;
+    ThrowIfFailed(
+        write_factory_->CreateTextFormat(font.name.c_str(), font.collection.Get(), font.weight, font.style,
+            font.stretch, size, locale.c_str(), format.GetAddressOf()),
+        "PingCore could not create a DirectWrite text format"
+    );
+    return format;
+  }
+
+  static void ConfigureTextFormat(IDWriteTextFormat& format, const TextLayoutOptions& options, TextDirection direction) {
+    format.SetWordWrapping(options.wrap == TextWrap::Word ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP);
+    switch (options.align) {
+    case TextAlign::Center:
+      format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+      break;
+    case TextAlign::Trailing:
+      format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+      break;
+    case TextAlign::Leading:
+      format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+      break;
+    }
+    if (direction == TextDirection::RightToLeft) {
+      format.SetReadingDirection(DWRITE_READING_DIRECTION_RIGHT_TO_LEFT);
+    } else {
+      format.SetReadingDirection(DWRITE_READING_DIRECTION_LEFT_TO_RIGHT);
+    }
+  }
+
+  CachedTextRun& TextRunFor(std::string_view text, const TextStyle& style, const TextShapingOptions& shaping) {
+    const auto cached = text_runs_.find(TextRunKeyView{text, style.font, style.decoration, shaping});
+    if (cached != text_runs_.end()) {
+      return cached->second;
+    }
+
+    const std::wstring wide = Utf8ToWide(text);
+    FontRetentions fonts;
+    ComPtr<IDWriteTextFormat> format = CreateTextFormat(style.font, fonts, shaping.locale);
+    const auto direction = ResolveParagraphDirection(text, shaping.direction);
+    ConfigureTextFormat(*format.Get(), TextLayoutOptions{.wrap = TextWrap::NoWrap}, direction);
+    ComPtr<IDWriteTextLayout> layout;
+    ThrowIfFailed(
+        write_factory_->CreateTextLayout(
+            wide.data(),
+            static_cast<UINT32>(wide.size()),
+            format.Get(),
+            std::numeric_limits<float>::max(),
+            std::numeric_limits<float>::max(),
+            layout.GetAddressOf()
+        ),
+        "PingCore could not create a DirectWrite text run layout"
+    );
+    if (HasTextDecoration(style.decoration, TextDecoration::Underline)) {
+      ThrowIfFailed(
+          layout->SetUnderline(TRUE, DWRITE_TEXT_RANGE{0, static_cast<UINT32>(wide.size())}),
+          "PingCore could not configure DirectWrite text run underline"
+      );
+    }
+    if (HasTextDecoration(style.decoration, TextDecoration::StrikeThrough)) {
+      ThrowIfFailed(
+          layout->SetStrikethrough(TRUE, DWRITE_TEXT_RANGE{0, static_cast<UINT32>(wide.size())}),
+          "PingCore could not configure DirectWrite text run strikethrough"
+      );
+    }
+
+    DWRITE_TEXT_METRICS text_metrics{};
+    ThrowIfFailed(layout->GetMetrics(&text_metrics), "PingCore could not measure a DirectWrite text run");
+    UINT32 line_count = 0;
+    layout->GetLineMetrics(nullptr, 0, &line_count);
+    DWRITE_LINE_METRICS line{};
+    if (line_count == 0 || FAILED(layout->GetLineMetrics(&line, 1, &line_count))) {
+      throw std::runtime_error("PingCore could not query DirectWrite text run baseline");
+    }
+    const float advance = text_metrics.widthIncludingTrailingWhitespace;
+    const float layout_width = std::max(1.0F, advance);
+    const float layout_height = std::max(1.0F, line.height);
+    ThrowIfFailed(layout->SetMaxWidth(layout_width), "PingCore could not constrain DirectWrite text run width");
+    ThrowIfFailed(layout->SetMaxHeight(layout_height), "PingCore could not constrain DirectWrite text run height");
+
+    DWRITE_OVERHANG_METRICS overhang{};
+    ThrowIfFailed(layout->GetOverhangMetrics(&overhang), "PingCore could not query DirectWrite text run bounds");
+    const float left = std::max(0.0F, overhang.left);
+    const float top = std::max(0.0F, overhang.top);
+    const float right = std::max(0.0F, overhang.right);
+    const float bottom = std::max(0.0F, overhang.bottom);
+    Rect visual_bounds{
+        -left,
+        -line.baseline - top,
+        layout_width + left + right,
+        layout_height + top + bottom,
+    };
+    const FontMetrics font_metrics = Metrics(style.font);
+    const auto include_decoration = [&](float center, float thickness) {
+      if (advance <= 0.0F || thickness <= 0.0F) {
+        return;
+      }
+      const Rect decoration{0.0F, center - thickness * 0.5F, advance, thickness};
+      const float left_edge = std::min(visual_bounds.x, decoration.x);
+      const float top_edge = std::min(visual_bounds.y, decoration.y);
+      const float right_edge = std::max(visual_bounds.x + visual_bounds.width, decoration.x + decoration.width);
+      const float bottom_edge = std::max(visual_bounds.y + visual_bounds.height, decoration.y + decoration.height);
+      visual_bounds = {left_edge, top_edge, right_edge - left_edge, bottom_edge - top_edge};
+    };
+    if (HasTextDecoration(style.decoration, TextDecoration::Underline)) {
+      include_decoration(font_metrics.underline_position, font_metrics.underline_thickness);
+    }
+    if (HasTextDecoration(style.decoration, TextDecoration::StrikeThrough)) {
+      include_decoration(-font_metrics.strike_through_position, font_metrics.strike_through_thickness);
+    }
+
+    constexpr std::size_t maximum_text_runs = 1024;
+    if (text_runs_.size() >= maximum_text_runs) {
+      text_runs_.erase(text_runs_.begin());
+    }
+    auto [inserted, was_inserted] = text_runs_.emplace(
+        TextRunKey{std::string(text), style.font, style.decoration, shaping},
+        CachedTextRun{
+            std::move(fonts),
+            std::move(layout),
+            {advance, visual_bounds, font_metrics},
+            line.baseline,
+        }
+    );
+    return inserted->second;
+  }
+
+  std::shared_ptr<CachedParagraph> ParagraphFor(const DrawTextCommand& command) {
+    const Size size{command.rect.width, command.rect.height};
+    auto options = command.options;
+    options.vertical_align = TextVerticalAlign::Top;
+    ResolveDefaultLocale(options.shaping);
+    if (auto cached = paragraphs_.Find({command.text, command.style.font, command.style.decoration, options, size})) {
+      return cached;
+    }
+
+    const auto paragraph = ParagraphInputsFor(command.text, command.style, options.shaping, true);
+    const auto& inputs = *paragraph->inputs;
+    auto format = CreateTextFormat(inputs.base_font, command.style.font.Size(), Utf8ToWide(options.shaping.locale));
+    ConfigureTextFormat(*format.Get(), options, inputs.direction);
+    auto result = std::make_shared<CachedParagraph>();
+    ThrowIfFailed(
+        write_factory_->CreateTextLayout(
+            inputs.text.data(),
+            static_cast<UINT32>(inputs.text.size()),
+            format.Get(),
+            command.rect.width,
+            command.rect.height,
+            result->layout.GetAddressOf()
+        ),
+        "PingCore could not create a DirectWrite text paragraph"
+    );
+    ApplyTextAttributes(*result->layout.Get(), command.text, inputs.runs);
+    // Only the drawable layout owns D2D effects.
+    ApplyTextForeground(*result->layout.Get(), command.text);
+    result->fonts = paragraph->fonts;
+    result->cost = ParagraphCacheCost(command.text);
+    paragraphs_.Store(
+        {command.text, command.style.font, command.style.decoration, std::move(options), size}, result, true);
+    return result;
+  }
+
+  FontMetrics Metrics(const Font& font) {
+    const auto cached = font_metrics_.find(font);
+    if (cached != font_metrics_.end()) {
+      return cached->second;
+    }
+    FontRetentions retained;
+    const auto selected = ResolveFont(font, retained);
+    auto collection = selected.collection;
+    const std::wstring& family_name = selected.name;
+    UINT32 family_index = 0;
+    BOOL exists = FALSE;
+    ThrowIfFailed(
+        collection->FindFamilyName(family_name.c_str(), &family_index, &exists),
+        "PingCore could not resolve a DirectWrite font family"
+    );
+    if (exists == FALSE) {
+      collection->FindFamilyName(L"Segoe UI", &family_index, &exists);
+    }
+    ComPtr<IDWriteFontFamily> family;
+    ThrowIfFailed(
+        collection->GetFontFamily(family_index, family.GetAddressOf()),
+        "PingCore could not access a font family"
+    );
+    ComPtr<IDWriteFont> resolved;
+    ThrowIfFailed(
+        family->GetFirstMatchingFont(
+            selected.weight,
+            selected.stretch,
+            selected.style,
+            resolved.GetAddressOf()
+        ),
+        "PingCore could not resolve a DirectWrite font"
+    );
+    ComPtr<IDWriteFontFace> face;
+    ThrowIfFailed(resolved->CreateFontFace(face.GetAddressOf()), "PingCore could not create a DirectWrite font face");
+    DWRITE_FONT_METRICS metrics{};
+    face->GetMetrics(&metrics);
+    const float scale = font.Size() / static_cast<float>(metrics.designUnitsPerEm);
+    const FontMetrics result{
+        .ascent = metrics.ascent * scale,
+        .descent = metrics.descent * scale,
+        .leading = metrics.lineGap * scale,
+        .underline_position = -metrics.underlinePosition * scale,
+        .underline_thickness = metrics.underlineThickness * scale,
+        .strike_through_position = metrics.strikethroughPosition * scale,
+        .strike_through_thickness = metrics.strikethroughThickness * scale,
+    };
+    constexpr std::size_t maximum_font_metrics = 64;
+    if (font_metrics_.size() >= maximum_font_metrics) {
+      font_metrics_.erase(font_metrics_.begin());
+    }
+    font_metrics_.emplace(font, result);
+    return result;
+  }
+
+  bool EnsureDeviceResources() {
+    if (device_context_) {
+      return true;
+    }
+
+    constexpr D3D_FEATURE_LEVEL feature_levels[]{
+        D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0,
+    };
+    D3D_FEATURE_LEVEL feature_level{};
+    HRESULT device_result = D3D11CreateDevice(
+        nullptr,
+        D3D_DRIVER_TYPE_HARDWARE,
+        nullptr,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        feature_levels,
+        static_cast<UINT>(std::size(feature_levels)),
+        D3D11_SDK_VERSION,
+        d3d_device_.GetAddressOf(),
+        &feature_level,
+        nullptr
+    );
+    if (FAILED(device_result)) {
+      device_result = D3D11CreateDevice(
+          nullptr,
+          D3D_DRIVER_TYPE_WARP,
+          nullptr,
+          D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+          feature_levels,
+          static_cast<UINT>(std::size(feature_levels)),
+          D3D11_SDK_VERSION,
+          d3d_device_.GetAddressOf(),
+          &feature_level,
+          nullptr
+      );
+    }
+    if (FAILED(device_result)) {
+      DiscardDeviceResources();
+      return false;
+    }
+
+    ComPtr<IDXGIDevice> dxgi_device;
+    if (FAILED(d3d_device_.As(&dxgi_device)) ||
+        FAILED(d2d_factory_->CreateDevice(dxgi_device.Get(), d2d_device_.GetAddressOf())) ||
+        FAILED(d2d_device_->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, device_context_.GetAddressOf())) ||
+        FAILED(device_context_->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::Black), brush_.GetAddressOf()))) {
+      DiscardDeviceResources();
+      return false;
+    }
+    device_context_->SetDpi(dpi_, dpi_);
+    return true;
+  }
+
+  bool EnsureDirectComposition() {
+    if (!platform_composition_) {
+      return true;
+    }
+    if (composition_device_ && composition_target_ && composition_visual_) {
+      return true;
+    }
+
+    ComPtr<IDXGIDevice> dxgi_device;
+    if (FAILED(d3d_device_.As(&dxgi_device))) {
+      return false;
+    }
+
+    HRESULT result = E_NOTIMPL;
+#if defined(PINGCORE_WINDOWS_7_COMPAT)
+    if (dcomp_library_ == nullptr) {
+      dcomp_library_ = LoadLibraryW(L"dcomp.dll");
+    }
+    using CreateDeviceFunction = HRESULT(WINAPI*)(IDXGIDevice*, REFIID, void**);
+    const auto create_device =
+        dcomp_library_ == nullptr
+            ? nullptr
+            : reinterpret_cast<CreateDeviceFunction>(GetProcAddress(dcomp_library_, "DCompositionCreateDevice"));
+    if (create_device != nullptr) {
+      result = create_device(
+          dxgi_device.Get(),
+          __uuidof(IDCompositionDevice),
+          reinterpret_cast<void**>(composition_device_.GetAddressOf())
+      );
+    }
+#else
+    result = DCompositionCreateDevice(
+        dxgi_device.Get(),
+        __uuidof(IDCompositionDevice),
+        reinterpret_cast<void**>(composition_device_.GetAddressOf())
+    );
+#endif
+    if (FAILED(result) ||
+        FAILED(composition_device_->CreateTargetForHwnd(window_, TRUE, composition_target_.GetAddressOf())) ||
+        FAILED(composition_device_->CreateVisual(composition_visual_.GetAddressOf())) ||
+        FAILED(composition_target_->SetRoot(composition_visual_.Get()))) {
+      composition_visual_.Reset();
+      composition_target_.Reset();
+      composition_device_.Reset();
+      return false;
+    }
+    return true;
+  }
+
+  bool EnsureShadowResources() {
+    if (shadow_context_ && shadow_brush_ && shadow_effect_ && shadow_clip_layer_) {
+      return true;
+    }
+    DiscardShadowResources();
+
+    ComPtr<ID2D1DeviceContext> shadow_context;
+    ComPtr<ID2D1SolidColorBrush> shadow_brush;
+    ComPtr<ID2D1Effect> shadow_effect;
+    ComPtr<ID2D1Layer> shadow_clip_layer;
+    if (FAILED(d2d_device_->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, shadow_context.GetAddressOf())) ||
+        FAILED(shadow_context->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White), shadow_brush.GetAddressOf())) ||
+        FAILED(device_context_->CreateEffect(CLSID_D2D1Shadow, shadow_effect.GetAddressOf())) ||
+        FAILED(device_context_->CreateLayer(nullptr, shadow_clip_layer.GetAddressOf()))) {
+      return false;
+    }
+
+    shadow_context->SetDpi(dpi_, dpi_);
+    shadow_context_ = std::move(shadow_context);
+    shadow_brush_ = std::move(shadow_brush);
+    shadow_effect_ = std::move(shadow_effect);
+    shadow_clip_layer_ = std::move(shadow_clip_layer);
+    return true;
+  }
+
+  HRESULT CreateSwapChain(IDXGIFactory2& factory, DXGI_SWAP_EFFECT effect, UINT buffer_count, UINT width, UINT height) {
+    DXGI_SWAP_CHAIN_DESC1 description{};
+    description.Width = platform_composition_ ? width : 0;
+    description.Height = platform_composition_ ? height : 0;
+    description.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    description.SampleDesc.Count = 1;
+    description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    description.BufferCount = buffer_count;
+    description.Scaling = DXGI_SCALING_STRETCH;
+    description.SwapEffect = effect;
+    description.AlphaMode = platform_composition_ ? DXGI_ALPHA_MODE_PREMULTIPLIED : DXGI_ALPHA_MODE_IGNORE;
+    if (platform_composition_) {
+      return factory
+          .CreateSwapChainForComposition(d3d_device_.Get(), &description, nullptr, swap_chain_.GetAddressOf());
+    }
+    return factory
+        .CreateSwapChainForHwnd(d3d_device_.Get(), window_, &description, nullptr, nullptr, swap_chain_.GetAddressOf());
+  }
+
+  bool EnsureSizeDependentResources() {
+    if (swap_chain_target_ && scene_target_) {
+      return true;
+    }
+    if (!EnsureDeviceResources()) {
+      return false;
+    }
+    if (!EnsureDirectComposition()) {
+      throw std::runtime_error("PingCore could not initialize DirectComposition for a Windows window");
+    }
+    RECT client{};
+    GetClientRect(window_, &client);
+    const UINT width = static_cast<UINT>(std::max(0L, client.right - client.left));
+    const UINT height = static_cast<UINT>(std::max(0L, client.bottom - client.top));
+    if (width == 0 || height == 0) {
+      return false;
+    }
+
+    if (!swap_chain_) {
+      ComPtr<IDXGIDevice> dxgi_device;
+      ComPtr<IDXGIAdapter> adapter;
+      ComPtr<IDXGIFactory2> factory;
+      if (FAILED(d3d_device_.As(&dxgi_device)) || FAILED(dxgi_device->GetAdapter(adapter.GetAddressOf())) ||
+          FAILED(adapter->GetParent(__uuidof(IDXGIFactory2), reinterpret_cast<void**>(factory.GetAddressOf())))) {
+        DiscardDeviceResources();
+        return false;
+      }
+
+#if defined(PINGCORE_WINDOWS_7_COMPAT)
+      HRESULT swap_chain_result = CreateSwapChain(*factory.Get(), DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, 2, width, height);
+      supports_dirty_present_ = SUCCEEDED(swap_chain_result);
+      if (FAILED(swap_chain_result) && !platform_composition_) {
+        swap_chain_.Reset();
+        swap_chain_result = CreateSwapChain(*factory.Get(), DXGI_SWAP_EFFECT_SEQUENTIAL, 1, width, height);
+        supports_dirty_present_ = false;
+      }
+#else
+      const HRESULT swap_chain_result =
+          CreateSwapChain(*factory.Get(), DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, 2, width, height);
+      supports_dirty_present_ = SUCCEEDED(swap_chain_result);
+#endif
+      if (FAILED(swap_chain_result)) {
+        DiscardDeviceResources();
+        if (platform_composition_) {
+          ThrowIfFailed(swap_chain_result, "PingCore could not create the Windows PlatformView composition surface");
+        }
+        return false;
+      }
+      if (platform_composition_) {
+        HRESULT composition_result = composition_visual_->SetContent(swap_chain_.Get());
+        if (SUCCEEDED(composition_result)) {
+          composition_result = composition_device_->Commit();
+        }
+        if (FAILED(composition_result)) {
+          DiscardDeviceResources();
+          ThrowIfFailed(composition_result, "PingCore could not attach the Windows PlatformView composition surface");
+        }
+      } else {
+        PINGCORE_DISCARD(factory->MakeWindowAssociation(window_, DXGI_MWA_NO_ALT_ENTER));
+      }
+    }
+
+    ComPtr<IDXGISurface> surface;
+    if (FAILED(swap_chain_->GetBuffer(0, __uuidof(IDXGISurface), reinterpret_cast<void**>(surface.GetAddressOf())))) {
+      DiscardDeviceResources();
+      return false;
+    }
+
+    const D2D1_BITMAP_PROPERTIES1 swap_chain_properties = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+        D2D1::PixelFormat(
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            platform_composition_ ? D2D1_ALPHA_MODE_PREMULTIPLIED : D2D1_ALPHA_MODE_IGNORE
+        ),
+        dpi_,
+        dpi_
+    );
+    const D2D1_BITMAP_PROPERTIES1 scene_properties = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_TARGET,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+        dpi_,
+        dpi_
+    );
+    if (FAILED(device_context_->CreateBitmapFromDxgiSurface(
+            surface.Get(),
+            &swap_chain_properties,
+            swap_chain_target_.GetAddressOf()
+        )) ||
+        FAILED(
+            device_context_
+                ->CreateBitmap(D2D1::SizeU(width, height), nullptr, 0, &scene_properties, scene_target_.GetAddressOf())
+        )) {
+      DiscardDeviceResources();
+      return false;
+    }
+    force_full_repaint_ = true;
+    return true;
+  }
+
+  void DiscardSizeDependentResources() noexcept {
+    if (device_context_) {
+      device_context_->SetTarget(nullptr);
+    }
+    scene_target_.Reset();
+    swap_chain_target_.Reset();
+  }
+
+  void DiscardShadowResources() noexcept {
+    shadow_masks_.clear();
+    shadow_effect_.Reset();
+    shadow_brush_.Reset();
+    shadow_clip_layer_.Reset();
+    shadow_context_.Reset();
+  }
+
+  HRESULT ReleaseD3D11Textures() noexcept {
+    HRESULT first_failure = S_OK;
+    for (CachedD3D11Texture& entry : d3d11_textures_) {
+      if (!entry.acquired) {
+        continue;
+      }
+      const HRESULT result = entry.keyed_mutex->ReleaseSync(1);
+      if (FAILED(result) && SUCCEEDED(first_failure)) {
+        first_failure = result;
+      }
+      entry.acquired = false;
+    }
+    return first_failure;
+  }
+
+  void ResetExternalTextureResources() noexcept {
+    PINGCORE_DISCARD(ReleaseD3D11Textures());
+    for (CachedPixelTexture& entry : pixel_textures_) {
+      entry.bitmap.Reset();
+    }
+    for (CachedD3D11Texture& entry : d3d11_textures_) {
+      entry.bitmap.Reset();
+      entry.keyed_mutex.Reset();
+      entry.shared_texture.Reset();
+    }
+  }
+
+  void BeginExternalTextureFrame() {
+    if (external_texture_draw_epoch_ == std::numeric_limits<std::uint64_t>::max()) {
+      external_texture_draw_epoch_ = 0;
+      for (CachedPixelTexture& entry : pixel_textures_) {
+        entry.draw_epoch = std::numeric_limits<std::uint64_t>::max();
+      }
+    } else {
+      ++external_texture_draw_epoch_;
+    }
+
+    std::erase_if(pixel_textures_, [](const CachedPixelTexture& entry) {
+      const std::shared_ptr<windows::PixelTexture> texture = entry.texture.lock();
+      return !texture || !texture->IsActive();
+    });
+    std::erase_if(d3d11_textures_, [](const CachedD3D11Texture& entry) {
+      const std::shared_ptr<windows::D3D11Texture> texture = entry.texture.lock();
+      return !texture || !texture->IsActive();
+    });
+  }
+
+  void DiscardDeviceResources() noexcept {
+    // Paragraph drawing effects retain D2D brushes, so those layouts cannot survive device resource recreation.
+    paragraphs_ = {};
+    clip_stack_.clear();
+    transform_stack_.clear();
+    DiscardSizeDependentResources();
+    DiscardShadowResources();
+    ResetExternalTextureResources();
+    path_geometries_.clear();
+    images_.clear();
+    image_cache_bytes_ = 0;
+    brush_.Reset();
+    swap_chain_.Reset();
+    if (composition_target_ && composition_device_) {
+      PINGCORE_DISCARD(composition_target_->SetRoot(nullptr));
+      PINGCORE_DISCARD(composition_device_->Commit());
+    }
+    composition_visual_.Reset();
+    composition_target_.Reset();
+    composition_device_.Reset();
+    device_context_.Reset();
+    d2d_device_.Reset();
+    d3d_device_.Reset();
+    supports_dirty_present_ = false;
+    force_full_repaint_ = true;
+  }
+
+  bool EnablePlatformComposition(HWND window) {
+    window_ = window;
+    if (platform_composition_) {
+      return false;
+    }
+    // Switching back to an HWND swap chain would tear down the window surface during every PlatformView unmount.
+    platform_composition_ = true;
+    DiscardDeviceResources();
+    return true;
+  }
+
+  void ResizeRenderTarget() {
+    force_full_repaint_ = true;
+    if (!swap_chain_) {
+      return;
+    }
+    RECT client{};
+    GetClientRect(window_, &client);
+    const UINT width = static_cast<UINT>(std::max(0L, client.right - client.left));
+    const UINT height = static_cast<UINT>(std::max(0L, client.bottom - client.top));
+    DiscardSizeDependentResources();
+    if (width == 0 || height == 0) {
+      return;
+    }
+    if (FAILED(swap_chain_->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0))) {
+      DiscardDeviceResources();
+    }
+  }
+
+  Win32RenderResult Render(const RenderFrame& frame, const RECT& paint_rect) {
+    if (paint_rect.left >= paint_rect.right || paint_rect.top >= paint_rect.bottom) {
+      return Win32RenderResult::Skipped;
+    }
+    if (!EnsureSizeDependentResources()) {
+      return Win32RenderResult::Skipped;
+    }
+
+    RECT client{};
+    GetClientRect(window_, &client);
+    RECT render_rect = force_full_repaint_ ? client : paint_rect;
+    const Rect paint_bounds = Win32PixelRectToDips(render_rect, DpiScale());
+    const Rect client_bounds = Win32PixelRectToDips(client, DpiScale());
+    clip_stack_.clear();
+    transform_stack_.clear();
+    BeginExternalTextureFrame();
+    if (frame.scene.root != nullptr && !PrepareD3D11Textures(*frame.scene.root)) {
+      return Win32RenderResult::Retry;
+    }
+    device_context_->SetTarget(scene_target_.Get());
+    device_context_->BeginDraw();
+    HRESULT result = S_OK;
+    try {
+      device_context_->SetTransform(D2D1::Matrix3x2F::Identity());
+      device_context_->PushAxisAlignedClip(ToD2DRect(paint_bounds), D2D1_ANTIALIAS_MODE_ALIASED);
+      if (transparent_background_) {
+        // Clear damaged pixels even when the old drawing has disappeared from the retained scene.
+        device_context_->Clear(D2D1::ColorF(0.0F, 0.0F));
+      } else {
+        SetBrushColor(Color::Rgb(247, 248, 250));
+        device_context_->FillRectangle(ToD2DRect(client_bounds), brush_.Get());
+      }
+
+      if (frame.scene.root != nullptr) {
+        RenderSceneNode(*frame.scene.root);
+      }
+      while (!transform_stack_.empty()) {
+        RenderCommand(PopTransformCommand{});
+      }
+      while (!clip_stack_.empty()) {
+        PopClip();
+      }
+      device_context_->SetTransform(D2D1::Matrix3x2F::Identity());
+      device_context_->PopAxisAlignedClip();
+      result = device_context_->EndDraw();
+    } catch (...) {
+      PINGCORE_DISCARD(device_context_->EndDraw());
+      PINGCORE_DISCARD(ReleaseD3D11Textures());
+      throw;
+    }
+    const HRESULT release_result = ReleaseD3D11Textures();
+    if (result == D2DERR_RECREATE_TARGET) {
+      DiscardDeviceResources();
+      return Win32RenderResult::Recreate;
+    }
+    ThrowIfFailed(result, "PingCore could not render the Windows frame");
+    ThrowIfFailed(release_result, "PingCore could not release Windows D3D11 textures after rendering");
+
+    device_context_->SetTarget(swap_chain_target_.Get());
+    device_context_->BeginDraw();
+    device_context_->SetTransform(D2D1::Matrix3x2F::Identity());
+    if (platform_composition_) {
+      device_context_->Clear(D2D1::ColorF(0.0F, 0.0F));
+    }
+    // Every rotating back buffer receives the complete retained scene; Present1 still limits native damage.
+    device_context_->DrawBitmap(scene_target_.Get());
+    result = device_context_->EndDraw();
+    if (result == D2DERR_RECREATE_TARGET) {
+      DiscardDeviceResources();
+      return Win32RenderResult::Recreate;
+    }
+    ThrowIfFailed(result, "PingCore could not copy the Windows frame to the swap chain");
+
+    if (supports_dirty_present_) {
+      DXGI_PRESENT_PARAMETERS present_parameters{};
+      present_parameters.DirtyRectsCount = 1;
+      present_parameters.pDirtyRects = &render_rect;
+      result = swap_chain_->Present1(1, 0, &present_parameters);
+    } else {
+      result = swap_chain_->Present(1, 0);
+    }
+    if (result == DXGI_ERROR_DEVICE_REMOVED || result == DXGI_ERROR_DEVICE_RESET) {
+      DiscardDeviceResources();
+      return Win32RenderResult::Recreate;
+    }
+    ThrowIfFailed(result, "PingCore could not present the Windows frame");
+    force_full_repaint_ = false;
+    return Win32RenderResult::Presented;
+  }
+
+  void RenderSequence(const PaintSequence& sequence) {
+    for (const PaintCommand& command : sequence.Commands()) {
+      std::visit([this, &sequence, &command](const auto& value) {
+        if constexpr (std::same_as<std::remove_cvref_t<decltype(value)>, DrawTextCommand>) {
+          const auto* prepared = InternalAccess::TextLayoutForPaint(sequence, command);
+          RenderCommand(value, prepared);
+        } else {
+          RenderCommand(value);
+        }
+      }, command);
+    }
+  }
+
+  void RenderSceneNode(const RenderNode& node) {
+    const float opacity = std::clamp(node.opacity, 0.0F, 1.0F);
+    if (!node.visible || opacity <= 0.0F) {
+      return;
+    }
+
+    Transform2D transform = node.transform;
+    transform.translate_x += node.offset.x;
+    transform.translate_y += node.offset.y;
+    const bool transformed = !transform.IsIdentity();
+    if (transformed) {
+      RenderCommand(PushTransformCommand{transform});
+    }
+
+    ComPtr<ID2D1Layer> opacity_layer;
+    if (opacity < 1.0F) {
+      ThrowIfFailed(
+          device_context_->CreateLayer(nullptr, opacity_layer.GetAddressOf()),
+          "PingCore could not create a Direct2D opacity layer"
+      );
+      device_context_->PushLayer(
+          D2D1::LayerParameters(
+              D2D1::InfiniteRect(),
+              nullptr,
+              D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+              D2D1::IdentityMatrix(),
+              opacity
+          ),
+          opacity_layer.Get()
+      );
+    }
+
+    RenderSequence(node.content);
+    for (const RenderClip& clip : node.child_clips) {
+      std::visit([this](const auto& command) { RenderCommand(command); }, clip);
+    }
+    const bool children_transformed = !node.children_transform.IsIdentity();
+    if (children_transformed) {
+      RenderCommand(PushTransformCommand{node.children_transform});
+    }
+    for (const RenderNode* child : node.children) {
+      if (child != nullptr) {
+        RenderSceneNode(*child);
+      }
+    }
+    if (children_transformed) {
+      RenderCommand(PopTransformCommand{});
+    }
+    for (std::size_t index = 0; index < node.child_clips.size(); ++index) {
+      RenderCommand(PopClipCommand{});
+    }
+    RenderSequence(node.foreground);
+    if (opacity_layer != nullptr) {
+      device_context_->PopLayer();
+    }
+    if (transformed) {
+      RenderCommand(PopTransformCommand{});
+    }
+  }
+
+  void SetBrushColor(Color color) {
+    brush_->SetColor(ToD2DColor(color));
+  }
+
+  void RenderCommand(const DrawRectCommand& command) {
+    if (command.rect.IsEmpty()) {
+      return;
+    }
+    const ComPtr<ID2D1Brush> brush = CreateBrush(command.rect, command.brush);
+    if (brush) {
+      FillBrushRect(command.rect, command.corner_radius, brush.Get());
+    }
+  }
+
+  void RenderCommand(const DrawTextCommand& command, const TextLayoutBackend* prepared) {
+    if (command.rect.width <= 0.0F || command.rect.height <= 0.0F) {
+      return;
+    }
+    const auto* resolved = dynamic_cast<const Win32TextLayout*>(prepared);
+    const auto paragraph = resolved ? nullptr : ParagraphFor(command);
+    auto* layout = resolved ? resolved->Layout() : paragraph->layout.Get();
+    struct TemporaryForeground {
+      IDWriteTextLayout* layout;
+      UINT32 length;
+      ~TemporaryForeground() {
+        if (layout != nullptr) {
+          PINGCORE_DISCARD(layout->SetDrawingEffect(nullptr, {0, length}));
+        }
+      }
+    };
+    const bool has_foreground = resolved && std::ranges::any_of(command.text.StyleRanges(), [](const auto& item) {
+      return item.style.foreground.has_value();
+    });
+    // The retained layout must release device brushes before another frame or device can use it.
+    const TemporaryForeground foreground{has_foreground ? layout : nullptr, static_cast<UINT32>(command.text.Length())};
+    if (has_foreground) {
+      ApplyTextForeground(*layout, command.text);
+    }
+    DWRITE_TEXT_METRICS metrics{};
+    ThrowIfFailed(layout->GetMetrics(&metrics), "PingCore could not measure a DirectWrite text paragraph");
+    const float remaining_height = std::max(0.0F, command.rect.height - metrics.height);
+    float vertical_offset = 0.0F;
+    if (command.options.vertical_align == TextVerticalAlign::Center) {
+      vertical_offset = remaining_height * 0.5F;
+    } else if (command.options.vertical_align == TextVerticalAlign::Bottom) {
+      vertical_offset = remaining_height;
+    }
+    SetBrushColor(command.style.foreground);
+    device_context_->PushAxisAlignedClip(ToD2DRect(command.rect), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    // DirectWrite range fragments preserve wrapping and bidi gaps; one enclosing rectangle would color unrelated text.
+    for (const auto& item : command.text.StyleRanges()) {
+      if (!item.style.background || item.style.background->alpha <= 0.0F) {
+        continue;
+      }
+      UINT32 count = 0;
+      layout->HitTestTextRange(static_cast<UINT32>(item.range.start), static_cast<UINT32>(item.range.Length()),
+          0.0F, 0.0F, nullptr, 0, &count);
+      std::vector<DWRITE_HIT_TEST_METRICS> fragments(count);
+      if (count > 0) {
+        ThrowIfFailed(
+            layout->HitTestTextRange(static_cast<UINT32>(item.range.start), static_cast<UINT32>(item.range.Length()),
+                command.rect.x + command.paragraph_offset.x,
+                command.rect.y + vertical_offset + command.paragraph_offset.y, fragments.data(), count, &count),
+            "PingCore could not resolve paragraph background"
+        );
+        SetBrushColor(*item.style.background);
+        for (const auto& fragment : fragments) {
+          device_context_->FillRectangle(ToD2DRect({fragment.left, fragment.top, fragment.width, fragment.height}),
+              brush_.Get());
+        }
+      }
+    }
+    SetBrushColor(command.style.foreground);
+    // Direct2D color glyph layers ignore the foreground brush's alpha.
+    const bool opaque_foreground = command.style.foreground.alpha >= 1.0F &&
+        std::ranges::all_of(command.text.StyleRanges(), [](const auto& item) {
+          return !item.style.foreground || item.style.foreground->alpha >= 1.0F;
+        });
+    device_context_->DrawTextLayout(
+        D2D1::Point2F(
+            command.rect.x + command.paragraph_offset.x,
+            command.rect.y + vertical_offset + command.paragraph_offset.y
+        ),
+        layout,
+        brush_.Get(),
+        opaque_foreground ? D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT : D2D1_DRAW_TEXT_OPTIONS_NONE
+    );
+    device_context_->PopAxisAlignedClip();
+  }
+
+  void RenderCommand(const DrawTextRunsCommand& command) {
+    for (const TextRun& run : command.runs) {
+      if (run.text.empty() || run.bounds.IsEmpty() || run.style.foreground.alpha <= 0.0F) {
+        continue;
+      }
+      CachedTextRun& cached = TextRunFor(run.text, run.style, run.shaping);
+      SetBrushColor(run.style.foreground);
+      const bool opaque_foreground = run.style.foreground.alpha >= 1.0F;
+      device_context_->DrawTextLayout(
+          D2D1::Point2F(run.baseline_origin.x, run.baseline_origin.y - cached.baseline),
+          cached.layout.Get(),
+          brush_.Get(),
+          opaque_foreground ? D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT : D2D1_DRAW_TEXT_OPTIONS_NONE
+      );
+    }
+  }
+
+  ComPtr<ID2D1Bitmap1> ImageBitmapFor(const RasterImage& image) {
+    const auto identity = RasterImageIdentity(image);
+    const auto cached =
+        std::ranges::find_if(images_, [identity](const CachedImage& entry) { return entry.identity == identity; });
+    if (cached != images_.end()) {
+      std::rotate(cached, cached + 1, images_.end());
+      return images_.back().bitmap;
+    }
+    if (!wic_factory_) wic_factory_ = CreateWicFactory();
+    if (!wic_factory_) return {};
+    const auto source = std::visit([this](const auto& value) -> ComPtr<IWICBitmapSource> {
+      if constexpr (std::same_as<std::decay_t<decltype(value)>, Bitmap>) {
+        return CreateWicBitmap(*wic_factory_.Get(), value);
+      } else {
+        return DecodeWicFrame(*wic_factory_.Get(), value);
+      }
+    }, image);
+    if (!source) return {};
+    const auto converted = ConvertWicPixels(*wic_factory_.Get(), *source.Get(), GUID_WICPixelFormat32bppPBGRA);
+    ComPtr<ID2D1Bitmap1> bitmap;
+    if (!converted ||
+        FAILED(device_context_->CreateBitmapFromWicBitmap(converted.Get(), nullptr, bitmap.GetAddressOf()))) {
+      return {};
+    }
+    const D2D1_SIZE_U pixel_size = bitmap->GetPixelSize();
+    const std::size_t byte_size =
+        pixel_size.width > std::numeric_limits<std::size_t>::max() / 4U / std::max(1U, pixel_size.height)
+            ? std::numeric_limits<std::size_t>::max()
+            : static_cast<std::size_t>(pixel_size.width) * pixel_size.height * 4U;
+    constexpr std::size_t image_cache_budget = 64U * 1024U * 1024U;
+    if (byte_size > image_cache_budget) {
+      // Retain one oversized image so repeated frames do not decode it again; the next insertion evicts it.
+      images_.clear();
+      images_.push_back({identity, byte_size, bitmap});
+      image_cache_bytes_ = byte_size;
+      return images_.back().bitmap;
+    }
+    while (!images_.empty() && image_cache_bytes_ > image_cache_budget - byte_size) {
+      image_cache_bytes_ -= images_.front().byte_size;
+      images_.erase(images_.begin());
+    }
+    images_.push_back({identity, byte_size, bitmap});
+    image_cache_bytes_ += byte_size;
+    return bitmap;
+  }
+
+  void RenderCommand(const DrawImageCommand& command) {
+    if (command.destination.IsEmpty() || command.source.IsEmpty() || command.opacity <= 0.0F) {
+      return;
+    }
+    ComPtr<ID2D1Bitmap1> bitmap = ImageBitmapFor(command.image);
+    if (!bitmap) {
+      return;
+    }
+    const float scale = RasterImageScale(command.image);
+    const D2D1_RECT_F source = D2D1::RectF(
+        command.source.x * scale,
+        command.source.y * scale,
+        (command.source.x + command.source.width) * scale,
+        (command.source.y + command.source.height) * scale
+    );
+    device_context_->DrawBitmap(
+        bitmap.Get(),
+        ToD2DRect(command.destination),
+        command.opacity,
+        command.sampling == ImageSampling::Nearest ? D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+                                                   : D2D1_INTERPOLATION_MODE_LINEAR,
+        source
+    );
+  }
+
+  ComPtr<ID2D1GradientStopCollection> CreateGradientStops(const std::vector<GradientStop>& stops) {
+    std::vector<D2D1_GRADIENT_STOP> native;
+    native.reserve(stops.size());
+    for (const GradientStop& stop : stops) {
+      native.push_back({stop.offset, ToD2DColor(stop.color)});
+    }
+    ComPtr<ID2D1GradientStopCollection> collection;
+    if (FAILED(device_context_->CreateGradientStopCollection(
+            native.data(),
+            static_cast<UINT32>(native.size()),
+            collection.GetAddressOf()
+        ))) {
+      return {};
+    }
+    return collection;
+  }
+
+  ComPtr<ID2D1LinearGradientBrush> CreateLinearGradientBrush(Rect rect, const LinearGradient& value) {
+    const ComPtr<ID2D1GradientStopCollection> stops = CreateGradientStops(value.stops);
+    if (!stops) {
+      return {};
+    }
+    ComPtr<ID2D1LinearGradientBrush> gradient;
+    if (FAILED(device_context_->CreateLinearGradientBrush(
+            D2D1::LinearGradientBrushProperties(
+                D2D1::Point2F(value.start.x, value.start.y), D2D1::Point2F(value.end.x, value.end.y)
+            ),
+            stops.Get(),
+            gradient.GetAddressOf()))) {
+      return {};
+    }
+    gradient->SetTransform(ToD2DTransform(ResolveGradientTransform(rect, value)));
+    return gradient;
+  }
+
+  ComPtr<ID2D1RadialGradientBrush> CreateRadialGradientBrush(Rect rect, const RadialGradient& value) {
+    const ComPtr<ID2D1GradientStopCollection> stops = CreateGradientStops(value.stops);
+    if (!stops) {
+      return {};
+    }
+    ComPtr<ID2D1RadialGradientBrush> gradient;
+    if (FAILED(device_context_->CreateRadialGradientBrush(
+            D2D1::RadialGradientBrushProperties(
+                D2D1::Point2F(value.center.x, value.center.y), D2D1::Point2F(), value.radius.width, value.radius.width
+            ),
+            stops.Get(), gradient.GetAddressOf()))) {
+      return {};
+    }
+    gradient->SetTransform(ToD2DTransform(ResolveGradientTransform(rect, value)));
+    return gradient;
+  }
+
+  ComPtr<ID2D1Brush> CreateBrush(Rect bounds, const Brush& brush) {
+    return std::visit(
+        [this, bounds](const auto& value) -> ComPtr<ID2D1Brush> {
+          using Value = std::decay_t<decltype(value)>;
+          if constexpr (std::same_as<Value, Color>) {
+            SetBrushColor(value);
+            return brush_;
+          } else if constexpr (std::same_as<Value, LinearGradient>) {
+            ComPtr<ID2D1Brush> result;
+            const ComPtr<ID2D1LinearGradientBrush> gradient = CreateLinearGradientBrush(bounds, value);
+            if (gradient) {
+              gradient.As(&result);
+            }
+            return result;
+          } else {
+            ComPtr<ID2D1Brush> result;
+            const ComPtr<ID2D1RadialGradientBrush> gradient = CreateRadialGradientBrush(bounds, value);
+            if (gradient) {
+              gradient.As(&result);
+            }
+            return result;
+          }
+        },
+        brush.Get()
+    );
+  }
+
+  void FillBrushRect(Rect rect, float corner_radius, ID2D1Brush* brush) {
+    if (corner_radius > 0.0F) {
+      device_context_->FillRoundedRectangle(
+          D2D1::RoundedRect(ToD2DRect(rect), corner_radius, corner_radius),
+          brush
+      );
+    } else {
+      device_context_->FillRectangle(ToD2DRect(rect), brush);
+    }
+  }
+
+  void UploadExternalTextureFrame(CachedPixelTexture& cached, const Win32PixelFrame& frame) {
+    const std::span<const std::byte> pixels = frame.Pixels();
+    const auto pitch = static_cast<UINT32>(frame.BytesPerRow());
+    if (cached.bitmap) {
+      const D2D1_SIZE_U size = cached.bitmap->GetPixelSize();
+      if (size.width == static_cast<UINT32>(frame.PixelWidth()) &&
+          size.height == static_cast<UINT32>(frame.PixelHeight())) {
+        ThrowIfFailed(
+            cached.bitmap->CopyFromMemory(nullptr, pixels.data(), pitch),
+            "PingCore could not update the Windows external texture bitmap"
+        );
+        return;
+      }
+    }
+
+    const D2D1_BITMAP_PROPERTIES1 properties = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_NONE,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+        kDipsPerInch,
+        kDipsPerInch
+    );
+    ComPtr<ID2D1Bitmap1> bitmap;
+    ThrowIfFailed(
+        device_context_->CreateBitmap(
+            D2D1::SizeU(static_cast<UINT32>(frame.PixelWidth()), static_cast<UINT32>(frame.PixelHeight())),
+            pixels.data(),
+            pitch,
+            &properties,
+            bitmap.GetAddressOf()
+        ),
+        "PingCore could not create the Windows external texture bitmap"
+    );
+    cached.bitmap = std::move(bitmap);
+  }
+
+  ID2D1Bitmap1* PixelTextureBitmapFor(const std::shared_ptr<ExternalTexture>& texture) {
+    const std::shared_ptr<windows::PixelTexture> pixel_texture =
+        std::dynamic_pointer_cast<windows::PixelTexture>(texture);
+    if (!pixel_texture) {
+      throw std::logic_error("PingCore external texture is incompatible with the Windows renderer");
+    }
+    auto cached = std::ranges::find_if(pixel_textures_, [&pixel_texture](const CachedPixelTexture& entry) {
+      return entry.texture.lock() == pixel_texture;
+    });
+    if (cached == pixel_textures_.end()) {
+      pixel_textures_.push_back({.texture = pixel_texture});
+      cached = pixel_textures_.end() - 1;
+    }
+    if (cached->draw_epoch == external_texture_draw_epoch_) {
+      return cached->bitmap.Get();
+    }
+    cached->draw_epoch = external_texture_draw_epoch_;
+
+    const std::shared_ptr<const Win32PixelFrame> frame = GetPixelFrame(*pixel_texture);
+    if (frame && frame != cached->frame) {
+      UploadExternalTextureFrame(*cached, *frame);
+      cached->frame = frame;
+    } else if (!cached->bitmap && cached->frame) {
+      UploadExternalTextureFrame(*cached, *cached->frame);
+    }
+    return cached->bitmap.Get();
+  }
+
+  using D3D11TextureList = std::vector<std::shared_ptr<windows::D3D11Texture>>;
+
+  void CollectD3D11Textures(const PaintSequence& sequence, D3D11TextureList& textures) {
+    if (!sequence.HasExternalTextureCommands()) {
+      return;
+    }
+    for (const PaintCommand& paint_command : sequence.Commands()) {
+      const auto* command = std::get_if<DrawExternalTextureCommand>(&paint_command);
+      if (command == nullptr || command->destination.IsEmpty() || command->source.IsEmpty() ||
+          command->opacity <= 0.0F) {
+        continue;
+      }
+      const std::shared_ptr<windows::D3D11Texture> texture =
+          std::dynamic_pointer_cast<windows::D3D11Texture>(command->texture);
+      if (texture && std::ranges::none_of(textures, [&texture](const auto& existing) { return existing == texture; })) {
+        textures.push_back(texture);
+      }
+    }
+  }
+
+  void CollectD3D11Textures(const RenderNode& node, D3D11TextureList& textures) {
+    if (!node.visible || node.opacity <= 0.0F) {
+      return;
+    }
+    CollectD3D11Textures(node.content, textures);
+    for (const RenderNode* child : node.children) {
+      if (child != nullptr) {
+        CollectD3D11Textures(*child, textures);
+      }
+    }
+    CollectD3D11Textures(node.foreground, textures);
+  }
+
+  void ResetD3D11Import(CachedD3D11Texture& cached) noexcept {
+    cached.bitmap.Reset();
+    cached.keyed_mutex.Reset();
+    cached.shared_texture.Reset();
+  }
+
+  HRESULT AcquireD3D11Texture(CachedD3D11Texture& cached) {
+    if (!cached.frame) {
+      return S_OK;
+    }
+    if (!cached.shared_texture) {
+      cached.shared_texture = D3D11FrameAccess::Open(*cached.frame, *d3d_device_.Get());
+      ThrowIfFailed(
+          cached.shared_texture.As(&cached.keyed_mutex),
+          "PingCore could not synchronize a Windows D3D11 texture"
+      );
+    }
+
+    const HRESULT acquire_result = cached.keyed_mutex->AcquireSync(1, 0);
+    if (acquire_result != S_OK) {
+      return acquire_result;
+    }
+    cached.acquired = true;
+    if (cached.bitmap) {
+      return S_OK;
+    }
+
+    try {
+      ComPtr<IDXGISurface> surface;
+      ThrowIfFailed(cached.shared_texture.As(&surface), "PingCore could not access a Windows D3D11 texture surface");
+      const D2D1_ALPHA_MODE alpha_mode = cached.frame->Alpha() == windows::D3D11Texture::Alpha::Opaque
+                                             ? D2D1_ALPHA_MODE_IGNORE
+                                             : D2D1_ALPHA_MODE_PREMULTIPLIED;
+      const D2D1_BITMAP_PROPERTIES1 properties = D2D1::BitmapProperties1(
+          D2D1_BITMAP_OPTIONS_NONE,
+          D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, alpha_mode),
+          kDipsPerInch,
+          kDipsPerInch
+      );
+      ThrowIfFailed(
+          device_context_->CreateBitmapFromDxgiSurface(surface.Get(), &properties, cached.bitmap.GetAddressOf()),
+          "PingCore could not create a Direct2D bitmap for a Windows D3D11 texture"
+      );
+    } catch (...) {
+      PINGCORE_DISCARD(cached.keyed_mutex->ReleaseSync(1));
+      cached.acquired = false;
+      ResetD3D11Import(cached);
+      throw;
+    }
+    return S_OK;
+  }
+
+  bool PrepareD3D11Textures(const RenderNode& root) {
+    D3D11TextureList requested;
+    CollectD3D11Textures(root, requested);
+    for (const std::shared_ptr<windows::D3D11Texture>& texture : requested) {
+      auto cached = std::ranges::find_if(d3d11_textures_, [&texture](const CachedD3D11Texture& entry) {
+        return entry.texture.lock() == texture;
+      });
+      if (cached == d3d11_textures_.end()) {
+        d3d11_textures_.push_back({.texture = texture});
+        cached = d3d11_textures_.end() - 1;
+      }
+      const std::shared_ptr<const windows::D3D11Frame> frame = texture->AcquireFrame();
+      if (frame != cached->frame) {
+        ResetD3D11Import(*cached);
+        cached->frame = frame;
+      }
+    }
+
+    std::vector<CachedD3D11Texture*> acquisitions;
+    acquisitions.reserve(requested.size());
+    for (CachedD3D11Texture& cached : d3d11_textures_) {
+      const std::shared_ptr<windows::D3D11Texture> texture = cached.texture.lock();
+      if (cached.frame && std::ranges::find(requested, texture) != requested.end()) {
+        acquisitions.push_back(&cached);
+      }
+    }
+    std::ranges::sort(acquisitions, [](const CachedD3D11Texture* left, const CachedD3D11Texture* right) {
+      return std::less<const windows::D3D11Frame*>{}(left->frame.get(), right->frame.get());
+    });
+
+    try {
+      for (CachedD3D11Texture* cached : acquisitions) {
+        const HRESULT result = AcquireD3D11Texture(*cached);
+        if (result == WAIT_TIMEOUT) {
+          ThrowIfFailed(
+              ReleaseD3D11Textures(),
+              "PingCore could not release Windows D3D11 textures after a synchronization timeout"
+          );
+          return false;
+        }
+        if (result == WAIT_ABANDONED) {
+          throw std::runtime_error("PingCore Windows D3D11 texture synchronization was abandoned");
+        }
+        ThrowIfFailed(result, "PingCore could not acquire a Windows D3D11 texture for rendering");
+      }
+    } catch (...) {
+      PINGCORE_DISCARD(ReleaseD3D11Textures());
+      throw;
+    }
+    return true;
+  }
+
+  ID2D1Bitmap1* D3D11TextureBitmapFor(const std::shared_ptr<windows::D3D11Texture>& texture) {
+    const auto cached = std::ranges::find_if(d3d11_textures_, [&texture](const CachedD3D11Texture& entry) {
+      return entry.texture.lock() == texture;
+    });
+    return cached != d3d11_textures_.end() && cached->acquired ? cached->bitmap.Get() : nullptr;
+  }
+
+  ID2D1Bitmap1* ExternalTextureBitmapFor(const std::shared_ptr<ExternalTexture>& texture) {
+    if (const auto d3d11_texture = std::dynamic_pointer_cast<windows::D3D11Texture>(texture)) {
+      return D3D11TextureBitmapFor(d3d11_texture);
+    }
+    return PixelTextureBitmapFor(texture);
+  }
+
+  void RenderCommand(const DrawExternalTextureCommand& command) {
+    if (command.destination.IsEmpty() || command.source.IsEmpty() || command.opacity <= 0.0F) {
+      return;
+    }
+    ID2D1Bitmap1* bitmap = ExternalTextureBitmapFor(command.texture);
+    if (bitmap == nullptr) {
+      return;
+    }
+    const Size intrinsic_size = command.texture->IntrinsicSize();
+    const D2D1_SIZE_U pixel_size = bitmap->GetPixelSize();
+    const float scale_x = static_cast<float>(pixel_size.width) / intrinsic_size.width;
+    const float scale_y = static_cast<float>(pixel_size.height) / intrinsic_size.height;
+    const D2D1_RECT_F source = D2D1::RectF(
+        command.source.x * scale_x,
+        command.source.y * scale_y,
+        (command.source.x + command.source.width) * scale_x,
+        (command.source.y + command.source.height) * scale_y
+    );
+    device_context_->DrawBitmap(
+        bitmap,
+        ToD2DRect(command.destination),
+        command.opacity,
+        command.sampling == ImageSampling::Nearest ? D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+                                                   : D2D1_INTERPOLATION_MODE_LINEAR,
+        source
+    );
+  }
+
+  ComPtr<ID2D1StrokeStyle> CreateStrokeStyle(const StrokeStyle& stroke) const {
+    ComPtr<ID2D1StrokeStyle> result;
+    const D2D1_CAP_STYLE d2d_cap = ToD2DCap(stroke.cap);
+    std::vector<float> dashes;
+    if (!stroke.dash_pattern.empty()) {
+      dashes.reserve(stroke.dash_pattern.size());
+      for (const float length : stroke.dash_pattern) {
+        dashes.push_back(length / stroke.width);
+      }
+    }
+    const D2D1_STROKE_STYLE_PROPERTIES properties{
+        d2d_cap,
+        d2d_cap,
+        d2d_cap,
+        ToD2DJoin(stroke.join),
+        stroke.miter_limit,
+        dashes.empty() ? D2D1_DASH_STYLE_SOLID : D2D1_DASH_STYLE_CUSTOM,
+        dashes.empty() ? 0.0F : stroke.dash_offset / stroke.width,
+    };
+    if (FAILED(d2d_factory_->CreateStrokeStyle(
+            properties,
+            dashes.empty() ? nullptr : dashes.data(),
+            static_cast<UINT32>(dashes.size()),
+            result.GetAddressOf()
+        ))) {
+      return {};
+    }
+    return result;
+  }
+
+  ComPtr<ID2D1PathGeometry> CreatePathGeometry(const Path& path, PathFillRule fill_rule) const {
+    ComPtr<ID2D1PathGeometry> geometry;
+    if (FAILED(d2d_factory_->CreatePathGeometry(geometry.GetAddressOf()))) {
+      return {};
+    }
+    ComPtr<ID2D1GeometrySink> sink;
+    if (FAILED(geometry->Open(sink.GetAddressOf()))) {
+      return {};
+    }
+    sink->SetFillMode(fill_rule == PathFillRule::EvenOdd ? D2D1_FILL_MODE_ALTERNATE : D2D1_FILL_MODE_WINDING);
+    bool figure_open = false;
+    for (const PathElement& element : InternalAccess::Elements(path)) {
+      switch (element.verb) {
+      case PathVerb::MoveTo:
+        if (figure_open) {
+          sink->EndFigure(D2D1_FIGURE_END_OPEN);
+        }
+        sink->BeginFigure(D2D1::Point2F(element.points[0].x, element.points[0].y), D2D1_FIGURE_BEGIN_FILLED);
+        figure_open = true;
+        break;
+      case PathVerb::LineTo:
+        sink->AddLine(D2D1::Point2F(element.points[0].x, element.points[0].y));
+        break;
+      case PathVerb::QuadraticTo:
+        sink->AddQuadraticBezier(
+            D2D1::QuadraticBezierSegment(
+                D2D1::Point2F(element.points[0].x, element.points[0].y),
+                D2D1::Point2F(element.points[1].x, element.points[1].y)
+            )
+        );
+        break;
+      case PathVerb::CubicTo:
+        sink->AddBezier(
+            D2D1::BezierSegment(
+                D2D1::Point2F(element.points[0].x, element.points[0].y),
+                D2D1::Point2F(element.points[1].x, element.points[1].y),
+                D2D1::Point2F(element.points[2].x, element.points[2].y)
+            )
+        );
+        break;
+      case PathVerb::Close:
+        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+        figure_open = false;
+        break;
+      }
+    }
+    if (figure_open) {
+      sink->EndFigure(D2D1_FIGURE_END_OPEN);
+    }
+    if (FAILED(sink->Close())) {
+      return {};
+    }
+    return geometry;
+  }
+
+  ComPtr<ID2D1PathGeometry> PathGeometryFor(const Path& path, PathFillRule fill_rule) {
+    const auto existing = std::find_if(path_geometries_.begin(), path_geometries_.end(), [&](const auto& entry) {
+      return entry.fill_rule == fill_rule && entry.path == path;
+    });
+    if (existing != path_geometries_.end()) {
+      return existing->geometry;
+    }
+    ComPtr<ID2D1PathGeometry> geometry = CreatePathGeometry(path, fill_rule);
+    if (!geometry) {
+      return {};
+    }
+    constexpr std::size_t maximum_path_geometries = 128;
+    if (path_geometries_.size() >= maximum_path_geometries) {
+      path_geometries_.erase(path_geometries_.begin());
+    }
+    path_geometries_.push_back({path, fill_rule, geometry});
+    return geometry;
+  }
+
+  void RenderCommand(const DrawCircleCommand& command) {
+    if (command.radius <= 0.0F || command.color.alpha <= 0.0F) {
+      return;
+    }
+    SetBrushColor(command.color);
+    device_context_->FillEllipse(
+        D2D1::Ellipse(D2D1::Point2F(command.center.x, command.center.y), command.radius, command.radius),
+        brush_.Get()
+    );
+  }
+
+  void RenderCommand(const DrawLineCommand& command) {
+    if (command.start == command.end || command.style.width <= 0.0F || command.color.alpha <= 0.0F) {
+      return;
+    }
+    ComPtr<ID2D1StrokeStyle> stroke_style = CreateStrokeStyle(command.style);
+    if (!stroke_style) {
+      return;
+    }
+    SetBrushColor(command.color);
+    device_context_->DrawLine(
+        D2D1::Point2F(command.start.x, command.start.y),
+        D2D1::Point2F(command.end.x, command.end.y),
+        brush_.Get(),
+        command.style.width,
+        stroke_style.Get()
+    );
+  }
+
+  void RenderCommand(const DrawArcCommand& command) {
+    if (command.radius <= 0.0F || command.style.width <= 0.0F || command.color.alpha <= 0.0F ||
+        !std::isfinite(command.start_angle) || !std::isfinite(command.sweep_angle) || command.sweep_angle == 0.0F) {
+      return;
+    }
+
+    SetBrushColor(command.color);
+    ComPtr<ID2D1StrokeStyle> stroke_style = CreateStrokeStyle(command.style);
+    const bool full_circle = std::abs(command.sweep_angle) >= kFullCircle - 0.0001F;
+    if (full_circle && command.style.dash_pattern.empty()) {
+      device_context_->DrawEllipse(
+          D2D1::Ellipse(D2D1::Point2F(command.center.x, command.center.y), command.radius, command.radius),
+          brush_.Get(),
+          command.style.width,
+          stroke_style.Get()
+      );
+      return;
+    }
+
+    const D2D1_POINT_2F start{
+        command.center.x + std::cos(command.start_angle) * command.radius,
+        command.center.y + std::sin(command.start_angle) * command.radius,
+    };
+    const float end_angle = command.start_angle + command.sweep_angle;
+    const D2D1_POINT_2F end{
+        command.center.x + std::cos(end_angle) * command.radius,
+        command.center.y + std::sin(end_angle) * command.radius,
+    };
+
+    ComPtr<ID2D1PathGeometry> geometry;
+    if (FAILED(d2d_factory_->CreatePathGeometry(geometry.GetAddressOf()))) {
+      return;
+    }
+    ComPtr<ID2D1GeometrySink> sink;
+    if (FAILED(geometry->Open(sink.GetAddressOf()))) {
+      return;
+    }
+    sink->BeginFigure(start, D2D1_FIGURE_BEGIN_HOLLOW);
+    const D2D1_SWEEP_DIRECTION direction =
+        command.sweep_angle > 0.0F ? D2D1_SWEEP_DIRECTION_CLOCKWISE : D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE;
+    if (full_circle) {
+      const float middle_angle = command.start_angle + std::copysign(kFullCircle * 0.5F, command.sweep_angle);
+      sink->AddArc(
+          D2D1::ArcSegment(
+              D2D1::Point2F(
+                  command.center.x + std::cos(middle_angle) * command.radius,
+                  command.center.y + std::sin(middle_angle) * command.radius
+              ),
+              D2D1::SizeF(command.radius, command.radius),
+              0.0F,
+              direction,
+              D2D1_ARC_SIZE_SMALL
+          )
+      );
+      sink->AddArc(
+          D2D1::ArcSegment(start, D2D1::SizeF(command.radius, command.radius), 0.0F, direction, D2D1_ARC_SIZE_SMALL)
+      );
+    } else {
+      sink->AddArc(
+          D2D1::ArcSegment(
+              end,
+              D2D1::SizeF(command.radius, command.radius),
+              0.0F,
+              direction,
+              std::abs(command.sweep_angle) > 3.14159265358979323846F ? D2D1_ARC_SIZE_LARGE : D2D1_ARC_SIZE_SMALL
+          )
+      );
+    }
+    sink->EndFigure(full_circle ? D2D1_FIGURE_END_CLOSED : D2D1_FIGURE_END_OPEN);
+    if (FAILED(sink->Close())) {
+      return;
+    }
+
+    device_context_->DrawGeometry(geometry.Get(), brush_.Get(), command.style.width, stroke_style.Get());
+  }
+
+  void RenderCommand(const DrawBorderCommand& command) {
+    if (command.style.width <= 0.0F || command.color.alpha <= 0.0F || command.rect.width <= 0.0F ||
+        command.rect.height <= 0.0F) {
+      return;
+    }
+    if (!command.style.dash_pattern.empty() || command.style.join != StrokeJoin::Miter ||
+        command.style.miter_limit != 4.0F) {
+      RenderCommand(StrokePathCommand{
+          CreateBorderStrokePath(command.rect, CornerRadii{command.corner_radius}, command.style.width),
+          command.color,
+          command.rect,
+          command.style,
+      });
+      return;
+    }
+    const float inset = command.style.width * 0.5F;
+    const Rect rect{
+        command.rect.x + inset,
+        command.rect.y + inset,
+        std::max(0.0F, command.rect.width - command.style.width),
+        std::max(0.0F, command.rect.height - command.style.width),
+    };
+    const float radius = std::max(0.0F, command.corner_radius - inset);
+    SetBrushColor(command.color);
+    device_context_
+        ->DrawRoundedRectangle(D2D1::RoundedRect(ToD2DRect(rect), radius, radius), brush_.Get(), command.style.width);
+  }
+
+  void RenderCommand(const DrawShadowCommand& command) {
+    const ResolvedShadow resolved = ResolveShadow(command);
+    if (resolved.IsEmpty() || command.color.alpha <= 0.0F) {
+      return;
+    }
+    if (command.blur_radius <= 0.0F) {
+      RenderCommand(DrawRectCommand{resolved.caster, command.color, resolved.corner_radius});
+      return;
+    }
+    if (!EnsureShadowResources()) {
+      return;
+    }
+
+    const ShadowMask* mask = ShadowMaskFor(resolved, command.blur_radius);
+    if (mask == nullptr) {
+      return;
+    }
+    shadow_effect_->SetInput(0, mask->commands.Get());
+    if (FAILED(shadow_effect_->SetValue(D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION, resolved.standard_deviation)) ||
+        FAILED(shadow_effect_->SetValue(
+            D2D1_SHADOW_PROP_COLOR,
+            D2D1_VECTOR_4F{command.color.red, command.color.green, command.color.blue, command.color.alpha}
+        )) ||
+        FAILED(shadow_effect_->SetValue(D2D1_SHADOW_PROP_OPTIMIZATION, kShadowOptimizationBalanced))) {
+      shadow_effect_->SetInput(0, nullptr);
+      return;
+    }
+
+    D2D1_MATRIX_3X2_F previous;
+    device_context_->GetTransform(&previous);
+    device_context_->SetTransform(D2D1::Matrix3x2F::Translation(resolved.caster.x, resolved.caster.y) * previous);
+
+    device_context_->PushLayer(
+        D2D1::LayerParameters1(
+            D2D1::InfiniteRect(),
+            mask->exterior_clip.Get(),
+            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            D2D1::Matrix3x2F::Identity(),
+            1.0F,
+            nullptr,
+            D2D1_LAYER_OPTIONS1_NONE
+        ),
+        shadow_clip_layer_.Get()
+    );
+    device_context_->DrawImage(shadow_effect_.Get());
+    device_context_->PopLayer();
+    device_context_->SetTransform(previous);
+    shadow_effect_->SetInput(0, nullptr);
+  }
+
+  void RenderCommand(const FillPathCommand& command) {
+    if (command.path.IsEmpty()) {
+      return;
+    }
+    ComPtr<ID2D1PathGeometry> geometry = PathGeometryFor(command.path, command.fill_rule);
+    const ComPtr<ID2D1Brush> brush = CreateBrush(command.brush_bounds, command.brush);
+    if (geometry && brush) {
+      device_context_->FillGeometry(geometry.Get(), brush.Get());
+    }
+  }
+
+  void RenderCommand(const StrokePathCommand& command) {
+    if (command.path.IsEmpty() || command.style.width <= 0.0F) {
+      return;
+    }
+    ComPtr<ID2D1PathGeometry> geometry = PathGeometryFor(command.path, PathFillRule::NonZero);
+    ComPtr<ID2D1StrokeStyle> stroke_style = CreateStrokeStyle(command.style);
+    const ComPtr<ID2D1Brush> brush = CreateBrush(command.brush_bounds, command.brush);
+    if (geometry && stroke_style && brush) {
+      device_context_->DrawGeometry(geometry.Get(), brush.Get(), command.style.width, stroke_style.Get());
+    }
+  }
+
+  void RenderCommand(const DrawPathShadowCommand& command) {
+    if (command.path.IsEmpty() || command.color.alpha <= 0.0F) {
+      return;
+    }
+    ComPtr<ID2D1PathGeometry> geometry = PathGeometryFor(command.path, command.fill_rule);
+    if (!geometry) {
+      return;
+    }
+
+    D2D1_MATRIX_3X2_F previous;
+    device_context_->GetTransform(&previous);
+    const D2D1_MATRIX_3X2_F translation = D2D1::Matrix3x2F::Translation(command.offset.x, command.offset.y);
+    if (command.blur_radius <= 0.0F) {
+      device_context_->SetTransform(translation * previous);
+      SetBrushColor(command.color);
+      device_context_->FillGeometry(geometry.Get(), brush_.Get());
+      device_context_->SetTransform(previous);
+      return;
+    }
+    if (!EnsureShadowResources()) {
+      return;
+    }
+
+    ComPtr<ID2D1CommandList> commands;
+    if (FAILED(shadow_context_->CreateCommandList(commands.GetAddressOf()))) {
+      return;
+    }
+    shadow_context_->SetTarget(commands.Get());
+    shadow_context_->BeginDraw();
+    shadow_context_->SetTransform(D2D1::Matrix3x2F::Identity());
+    shadow_context_->FillGeometry(geometry.Get(), shadow_brush_.Get());
+    const HRESULT draw_result = shadow_context_->EndDraw();
+    shadow_context_->SetTarget(nullptr);
+    if (FAILED(draw_result) || FAILED(commands->Close())) {
+      return;
+    }
+
+    const Rect bounds = command.path.Bounds();
+    ComPtr<ID2D1RectangleGeometry> outer;
+    ComPtr<ID2D1PathGeometry> exterior;
+    ComPtr<ID2D1GeometrySink> exterior_sink;
+    if (FAILED(d2d_factory_->CreateRectangleGeometry(
+            D2D1::RectF(
+                bounds.x - command.blur_radius,
+                bounds.y - command.blur_radius,
+                bounds.x + bounds.width + command.blur_radius,
+                bounds.y + bounds.height + command.blur_radius
+            ),
+            outer.GetAddressOf()
+        )) ||
+        FAILED(d2d_factory_->CreatePathGeometry(exterior.GetAddressOf())) ||
+        FAILED(exterior->Open(exterior_sink.GetAddressOf())) ||
+        FAILED(outer->CombineWithGeometry(
+            geometry.Get(),
+            D2D1_COMBINE_MODE_EXCLUDE,
+            nullptr,
+            D2D1_DEFAULT_FLATTENING_TOLERANCE,
+            exterior_sink.Get()
+        )) ||
+        FAILED(exterior_sink->Close())) {
+      return;
+    }
+
+    shadow_effect_->SetInput(0, commands.Get());
+    if (FAILED(shadow_effect_->SetValue(D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION, command.blur_radius / 3.0F)) ||
+        FAILED(shadow_effect_->SetValue(
+            D2D1_SHADOW_PROP_COLOR,
+            D2D1_VECTOR_4F{command.color.red, command.color.green, command.color.blue, command.color.alpha}
+        )) ||
+        FAILED(shadow_effect_->SetValue(D2D1_SHADOW_PROP_OPTIMIZATION, kShadowOptimizationBalanced))) {
+      shadow_effect_->SetInput(0, nullptr);
+      return;
+    }
+
+    device_context_->SetTransform(translation * previous);
+    device_context_->PushLayer(
+        D2D1::LayerParameters1(
+            D2D1::InfiniteRect(),
+            exterior.Get(),
+            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            D2D1::Matrix3x2F::Identity(),
+            1.0F,
+            nullptr,
+            D2D1_LAYER_OPTIONS1_NONE
+        ),
+        shadow_clip_layer_.Get()
+    );
+    device_context_->DrawImage(shadow_effect_.Get());
+    device_context_->PopLayer();
+    device_context_->SetTransform(previous);
+    shadow_effect_->SetInput(0, nullptr);
+  }
+
+  ShadowMask* ShadowMaskFor(const ResolvedShadow& shadow, float blur_radius) {
+    const Size size{shadow.caster.width, shadow.caster.height};
+    const auto existing = std::find_if(shadow_masks_.begin(), shadow_masks_.end(), [&](const ShadowMask& mask) {
+      return mask.size == size && mask.corner_radius == shadow.corner_radius && mask.blur_radius == blur_radius;
+    });
+    if (existing != shadow_masks_.end()) {
+      return &*existing;
+    }
+
+    ComPtr<ID2D1CommandList> commands;
+    if (FAILED(shadow_context_->CreateCommandList(commands.GetAddressOf()))) {
+      return nullptr;
+    }
+    shadow_context_->SetTarget(commands.Get());
+    shadow_context_->BeginDraw();
+    shadow_context_->SetTransform(D2D1::Matrix3x2F::Identity());
+    if (shadow.corner_radius > 0.0F) {
+      shadow_context_->FillRoundedRectangle(
+          D2D1::RoundedRect(
+              D2D1::RectF(0.0F, 0.0F, size.width, size.height),
+              shadow.corner_radius,
+              shadow.corner_radius
+          ),
+          shadow_brush_.Get()
+      );
+    } else {
+      shadow_context_->FillRectangle(D2D1::RectF(0.0F, 0.0F, size.width, size.height), shadow_brush_.Get());
+    }
+    const HRESULT result = shadow_context_->EndDraw();
+    shadow_context_->SetTarget(nullptr);
+    if (FAILED(result) || FAILED(commands->Close())) {
+      return nullptr;
+    }
+
+    ComPtr<ID2D1RectangleGeometry> outer;
+    ComPtr<ID2D1PathGeometry> outside_path;
+    ComPtr<ID2D1GeometrySink> outside_sink;
+    const D2D1_RECT_F outer_rect =
+        D2D1::RectF(-blur_radius, -blur_radius, size.width + blur_radius, size.height + blur_radius);
+    if (FAILED(d2d_factory_->CreateRectangleGeometry(outer_rect, outer.GetAddressOf())) ||
+        FAILED(d2d_factory_->CreatePathGeometry(outside_path.GetAddressOf())) ||
+        FAILED(outside_path->Open(outside_sink.GetAddressOf()))) {
+      return nullptr;
+    }
+
+    HRESULT combine_result = E_FAIL;
+    if (shadow.corner_radius > 0.0F) {
+      ComPtr<ID2D1RoundedRectangleGeometry> caster;
+      if (FAILED(d2d_factory_->CreateRoundedRectangleGeometry(
+              D2D1::RoundedRect(
+                  D2D1::RectF(0.0F, 0.0F, size.width, size.height),
+                  shadow.corner_radius,
+                  shadow.corner_radius
+              ),
+              caster.GetAddressOf()
+          ))) {
+        return nullptr;
+      }
+      combine_result = outer->CombineWithGeometry(
+          caster.Get(),
+          D2D1_COMBINE_MODE_EXCLUDE,
+          nullptr,
+          D2D1_DEFAULT_FLATTENING_TOLERANCE,
+          outside_sink.Get()
+      );
+    } else {
+      ComPtr<ID2D1RectangleGeometry> caster;
+      if (FAILED(d2d_factory_->CreateRectangleGeometry(
+              D2D1::RectF(0.0F, 0.0F, size.width, size.height),
+              caster.GetAddressOf()
+          ))) {
+        return nullptr;
+      }
+      combine_result = outer->CombineWithGeometry(
+          caster.Get(),
+          D2D1_COMBINE_MODE_EXCLUDE,
+          nullptr,
+          D2D1_DEFAULT_FLATTENING_TOLERANCE,
+          outside_sink.Get()
+      );
+    }
+    if (FAILED(combine_result) || FAILED(outside_sink->Close())) {
+      return nullptr;
+    }
+
+    constexpr std::size_t maximum_shadow_masks = 64;
+    if (shadow_masks_.size() >= maximum_shadow_masks) {
+      shadow_masks_.erase(shadow_masks_.begin());
+    }
+    shadow_masks_.push_back({size, shadow.corner_radius, blur_radius, commands, outside_path});
+    return &shadow_masks_.back();
+  }
+
+  void RenderCommand(const PushClipCommand& command) {
+    if (command.corner_radius <= 0.0F) {
+      device_context_->PushAxisAlignedClip(ToD2DRect(command.rect), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+      clip_stack_.push_back({});
+      return;
+    }
+
+    const float radius =
+        std::max(0.0F, std::min(command.corner_radius, std::min(command.rect.width, command.rect.height) * 0.5F));
+    ComPtr<ID2D1RoundedRectangleGeometry> geometry;
+    if (FAILED(d2d_factory_->CreateRoundedRectangleGeometry(
+            D2D1::RoundedRect(ToD2DRect(command.rect), radius, radius),
+            geometry.GetAddressOf()
+        ))) {
+      device_context_->PushAxisAlignedClip(ToD2DRect(command.rect), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+      clip_stack_.push_back({});
+      return;
+    }
+    ComPtr<ID2D1Layer> layer;
+    if (FAILED(device_context_->CreateLayer(nullptr, layer.GetAddressOf()))) {
+      device_context_->PushAxisAlignedClip(ToD2DRect(command.rect), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+      clip_stack_.push_back({});
+      return;
+    }
+
+    device_context_->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(), geometry.Get()), layer.Get());
+    ClipState state;
+    state.uses_layer = true;
+    state.layer = std::move(layer);
+    state.geometry = std::move(geometry);
+    clip_stack_.push_back(std::move(state));
+  }
+
+  void RenderCommand(const PushPathClipCommand& command) {
+    ComPtr<ID2D1PathGeometry> geometry = PathGeometryFor(command.path, command.fill_rule);
+    ComPtr<ID2D1Layer> layer;
+    if (!geometry || FAILED(device_context_->CreateLayer(nullptr, layer.GetAddressOf()))) {
+      device_context_->PushAxisAlignedClip(D2D1::RectF(0.0F, 0.0F, 0.0F, 0.0F), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+      clip_stack_.push_back({});
+      return;
+    }
+    device_context_->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(), geometry.Get()), layer.Get());
+    ClipState state;
+    state.uses_layer = true;
+    state.layer = std::move(layer);
+    state.geometry = std::move(geometry);
+    clip_stack_.push_back(std::move(state));
+  }
+
+  void RenderCommand(const PopClipCommand&) {
+    PopClip();
+  }
+
+  void RenderCommand(const PushTransformCommand& command) {
+    D2D1_MATRIX_3X2_F previous;
+    device_context_->GetTransform(&previous);
+    transform_stack_.push_back(previous);
+    const D2D1::Matrix3x2F transform(
+        command.transform.m11,
+        command.transform.m12,
+        command.transform.m21,
+        command.transform.m22,
+        command.transform.translate_x,
+        command.transform.translate_y
+    );
+    device_context_->SetTransform(transform * previous);
+  }
+
+  void RenderCommand(const PopTransformCommand&) {
+    if (transform_stack_.empty()) {
+      return;
+    }
+    device_context_->SetTransform(transform_stack_.back());
+    transform_stack_.pop_back();
+  }
+
+  void RenderCommand(const PlacePlatformViewCommand& command) {
+    if (!platform_composition_) {
+      throw std::logic_error("PingCore Windows PlatformView requires DirectComposition");
+    }
+    const D2D1_PRIMITIVE_BLEND previous = device_context_->GetPrimitiveBlend();
+    const D2D1_ANTIALIAS_MODE previous_antialias = device_context_->GetAntialiasMode();
+    device_context_->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
+    device_context_->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+    brush_->SetColor(D2D1::ColorF(0.0F, 0.0F));
+    device_context_->FillRectangle(ToD2DRect(command.Bounds()), brush_.Get());
+    device_context_->SetAntialiasMode(previous_antialias);
+    device_context_->SetPrimitiveBlend(previous);
+  }
+
+  void PopClip() {
+    if (clip_stack_.empty()) {
+      return;
+    }
+    if (clip_stack_.back().uses_layer) {
+      device_context_->PopLayer();
+    } else {
+      device_context_->PopAxisAlignedClip();
+    }
+    clip_stack_.pop_back();
+  }
+
+  HWND window_ = nullptr;
+  float dpi_ = kDipsPerInch;
+  bool force_full_repaint_ = true;
+  bool supports_dirty_present_ = false;
+  bool transparent_background_ = false;
+  bool platform_composition_ = false;
+  ComPtr<ID2D1Factory1> d2d_factory_;
+  ComPtr<IDWriteFactory> write_factory_;
+  std::unordered_map<std::uint64_t, std::shared_ptr<Win32FontCollection>> custom_fonts_;
+  ComPtr<IWICImagingFactory> wic_factory_;
+  ComPtr<ID3D11Device> d3d_device_;
+  ComPtr<ID2D1Device> d2d_device_;
+  ComPtr<ID2D1DeviceContext> device_context_;
+  ComPtr<ID2D1DeviceContext> shadow_context_;
+  ComPtr<IDXGISwapChain1> swap_chain_;
+  ComPtr<IDCompositionDevice> composition_device_;
+  ComPtr<IDCompositionTarget> composition_target_;
+  ComPtr<IDCompositionVisual> composition_visual_;
+  ComPtr<ID2D1Bitmap1> swap_chain_target_;
+  ComPtr<ID2D1Bitmap1> scene_target_;
+  ComPtr<ID2D1SolidColorBrush> brush_;
+  ComPtr<ID2D1SolidColorBrush> shadow_brush_;
+  ComPtr<ID2D1Effect> shadow_effect_;
+  ComPtr<ID2D1Layer> shadow_clip_layer_;
+  std::vector<ShadowMask> shadow_masks_;
+  std::vector<CachedPathGeometry> path_geometries_;
+  std::vector<CachedImage> images_;
+  std::size_t image_cache_bytes_ = 0;
+  std::vector<CachedPixelTexture> pixel_textures_;
+  std::vector<CachedD3D11Texture> d3d11_textures_;
+  std::uint64_t external_texture_draw_epoch_ = 0;
+  std::unordered_map<Font, FontMetrics, FontHash> font_metrics_;
+  std::unordered_map<TextRunKey, CachedTextRun, TextRunKeyHash, TextRunKeyEqual> text_runs_;
+  ParagraphCache paragraphs_;
+  std::string paragraph_locale_;
+  std::vector<ClipState> clip_stack_;
+  std::vector<D2D1_MATRIX_3X2_F> transform_stack_;
+#if defined(PINGCORE_WINDOWS_7_COMPAT)
+  HMODULE dcomp_library_ = nullptr;
+#endif
+};
+
+Win32Renderer::Win32Renderer() : impl_(std::make_unique<Impl>()) {}
+
+Win32Renderer::~Win32Renderer() = default;
+
+void Win32Renderer::Initialize(bool transparent_background) {
+  impl_->InitializeFactories();
+  impl_->transparent_background_ = transparent_background;
+  impl_->platform_composition_ = transparent_background;
+}
+
+void Win32Renderer::Discard() noexcept {
+  impl_->DiscardDeviceResources();
+  impl_->pixel_textures_.clear();
+  impl_->d3d11_textures_.clear();
+  impl_->transparent_background_ = false;
+  impl_->platform_composition_ = false;
+  impl_->paragraph_locale_.clear();
+  impl_->text_runs_.clear();
+  impl_->font_metrics_.clear();
+  impl_->wic_factory_.Reset();
+  impl_->custom_fonts_.clear();
+  impl_->write_factory_.Reset();
+  impl_->d2d_factory_.Reset();
+#if defined(PINGCORE_WINDOWS_7_COMPAT)
+  if (impl_->dcomp_library_ != nullptr) {
+    FreeLibrary(impl_->dcomp_library_);
+    impl_->dcomp_library_ = nullptr;
+  }
+#endif
+  impl_->window_ = nullptr;
+}
+
+void Win32Renderer::UpdateTextLocale() {
+  impl_->UpdateTextLocale();
+}
+
+void Win32Renderer::ResetDeviceResources() noexcept {
+  impl_->DiscardDeviceResources();
+}
+
+void Win32Renderer::Resize(HWND window, float dpi) {
+  impl_->window_ = window;
+  impl_->dpi_ = dpi;
+  impl_->ResizeRenderTarget();
+}
+
+void Win32Renderer::DpiChanged(HWND window, float dpi) {
+  impl_->window_ = window;
+  impl_->dpi_ = dpi;
+  if (impl_->device_context_) {
+    impl_->device_context_->SetDpi(dpi, dpi);
+  }
+  if (impl_->shadow_context_) {
+    impl_->shadow_context_->SetDpi(dpi, dpi);
+    impl_->shadow_masks_.clear();
+  }
+  impl_->DiscardSizeDependentResources();
+  impl_->force_full_repaint_ = true;
+}
+
+bool Win32Renderer::EnablePlatformComposition(HWND window) {
+  return impl_->EnablePlatformComposition(window);
+}
+
+FontMetrics Win32Renderer::Metrics(const Font& font) {
+  return impl_->Metrics(font);
+}
+
+TextRunMetrics
+Win32Renderer::MeasureRun(std::string_view text, const TextStyle& style, const TextShapingOptions& options) {
+  return impl_->MeasureRun(text, style, options);
+}
+
+TextLayoutMetrics Win32Renderer::MeasureText(std::string_view text, const TextStyle& style, float max_width,
+    const TextLayoutOptions& options) {
+  return MeasureText(AttributedText(std::string(text)), style, max_width, options);
+}
+
+TextLayoutMetrics Win32Renderer::MeasureText(const AttributedText& text, const TextStyle& style, float max_width,
+    const TextLayoutOptions& options) {
+  return impl_->MeasureText(text, style, max_width, options);
+}
+
+std::unique_ptr<TextLayoutBackend> Win32Renderer::CreatePlatformTextLayout(
+    const AttributedText& text, const TextStyle& style, float max_width, const TextLayoutOptions& options) {
+  return impl_->CreatePlatformTextLayout(text, style, max_width, options);
+}
+
+Win32RenderResult Win32Renderer::Render(HWND window, float dpi, const RenderFrame& frame, const RECT& paint_rect) {
+  impl_->window_ = window;
+  impl_->dpi_ = dpi;
+  return impl_->Render(frame, paint_rect);
+}
+
+} // namespace pingcore::detail

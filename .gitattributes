@@ -1,0 +1,7 @@
+**/raw/** -text
+*.icns -text
+*.ico -text
+*.png -text
+*.sh text eol=lf
+**/gradlew text eol=lf
+tools/pingcore_cli/templates/platform/linux/** text eol=lf

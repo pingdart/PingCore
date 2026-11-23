@@ -1,0 +1,1215 @@
+#include <pingcore/navigation.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <deque>
+#include <stdexcept>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include <pingcore/environment.h>
+#include <pingcore/modifier.h>
+#include <pingcore/state.h>
+#include <pingcore/theme.h>
+
+#include "graphics/geometry_internal.h"
+#include "runtime/mounted_node_internal.h"
+#include "runtime/transition_internal.h"
+#include "internal_access.h"
+#include "macros_internal.h"
+
+namespace pingcore::detail {
+
+namespace {
+
+enum class NavigationOperationKind {
+  Push,
+  Pop,
+  Replace,
+  SetPath,
+};
+
+struct NavigationEntry {
+  std::uint64_t id = 0;
+  std::function<View()> factory;
+};
+
+struct RealizedNavigationRoute {
+  NavigationRouteDescriptor descriptor;
+  std::uint64_t entry_id = 0;
+};
+
+struct NavigationOperation {
+  std::uint64_t id = 0;
+  NavigationOperationKind kind = NavigationOperationKind::Pop;
+  std::function<View()> factory;
+  std::vector<NavigationRouteDescriptor> route_path;
+  bool ready_to_start = true;
+};
+
+struct NavigationTransition {
+  NavigationOperationKind kind = NavigationOperationKind::Pop;
+  std::uint64_t source_id = 0;
+  std::uint64_t destination_id = 0;
+  float progress = 0.0F;
+  float target = 1.0F;
+  bool interactive = false;
+  bool complete_operation = true;
+  std::vector<std::uint64_t> retire_ids;
+  bool gesture_driven = false;
+  std::optional<TransitionSpec> spec{};
+  TransitionContext context{};
+  TransitionFrame frame{};
+  bool native_fallback = false;
+};
+
+struct NavigationEnvironmentEntry {
+  std::weak_ptr<NavigationCoordinator> coordinator;
+  std::optional<std::type_index> route_type;
+  std::shared_ptr<void> path_state;
+  std::shared_ptr<void> history_commit;
+};
+
+struct NavigationEnvironmentNode {
+  NavigationEnvironmentEntry entry;
+  std::shared_ptr<const NavigationEnvironmentNode> parent;
+};
+
+struct NavigationEnvironment {
+  std::shared_ptr<const NavigationEnvironmentNode> current;
+
+  static NavigationEnvironment Default() {
+    return {};
+  }
+
+  bool operator==(const NavigationEnvironment&) const = default;
+};
+
+struct NavigationCoordinatorValue {
+  using Value = std::shared_ptr<NavigationCoordinator>;
+};
+
+struct NavigationEntryIdValue {
+  using Value = std::uint64_t;
+};
+
+AnimationSpec ContinuationAnimation(AnimationSpec animation, float from, float to) {
+  const float remaining = std::clamp(std::abs(to - from), 0.0F, 1.0F);
+  if (remaining <= 0.0F) {
+    return SnapSpec{};
+  }
+  if (auto* tween = std::get_if<TweenSpec>(&animation)) {
+    tween->duration *= remaining;
+  } else if (const auto* keyframes = std::get_if<KeyframeSpec>(&animation)) {
+    animation = KeyframeSpec(keyframes->Duration() * remaining, keyframes->Keyframes());
+  }
+  return animation;
+}
+
+bool PageHasPlatformView(const MountedNode& node) {
+  return node.kind == NodeKind::PlatformView || std::any_of(node.children.begin(), node.children.end(),
+      [](const auto& child) { return PageHasPlatformView(*child); });
+}
+
+} // namespace
+
+class NavigationCoordinator {
+public:
+  explicit NavigationCoordinator(std::function<View()> root)
+      : owner_thread_(std::this_thread::get_id()), entries_{{1, std::move(root)}} {}
+
+  NavigationCoordinator(std::function<View()> root, std::vector<NavigationRouteDescriptor> routes,
+                        NavigationRouteBinding binding)
+      : owner_thread_(std::this_thread::get_id()), entries_{{1, std::move(root)}}, requested_routes_(std::move(routes)),
+        request_route_pop_(std::move(binding.request_pop)), route_type_(binding.route_type) {
+    ValidateRoutePath(requested_routes_);
+    realized_routes_.reserve(requested_routes_.size());
+    for (const NavigationRouteDescriptor& route : requested_routes_) {
+      const std::uint64_t id = next_entry_id_++;
+      entries_.push_back({id, route.factory});
+      realized_routes_.push_back({route, id});
+    }
+  }
+
+  void Connect(std::function<void()> invalidate) {
+    CheckThread();
+    invalidate_ = std::move(invalidate);
+  }
+
+  void UpdateRoot(std::function<View()> root) {
+    CheckThread();
+    const auto found = std::ranges::find(entries_, initial_root_id_, &NavigationEntry::id);
+    if (found != entries_.end()) {
+      found->factory = std::move(root);
+    }
+  }
+
+  void UpdateStyle(NavigationStyle style) {
+    CheckThread();
+    style_ = std::move(style);
+  }
+
+  void UpdateRouteBinding(NavigationRouteBinding binding) {
+    CheckThread();
+    if (!route_type_.has_value()) {
+      throw std::logic_error("PingCore factory navigation cannot accept a route binding");
+    }
+    if (binding.route_type != *route_type_) {
+      throw std::logic_error("PingCore routed NavigationStack route type changed without replacing the stack");
+    }
+    request_route_pop_ = std::move(binding.request_pop);
+  }
+
+  void SynchronizeRoutePath(std::vector<NavigationRouteDescriptor> routes) {
+    CheckThread();
+    if (!route_type_.has_value()) {
+      throw std::logic_error("PingCore factory navigation cannot synchronize a route path");
+    }
+    ValidateRoutePath(routes);
+
+    if (expected_route_pop_) {
+      if (IsSinglePop(requested_routes_, routes) && transition_.has_value() &&
+          transition_->kind == NavigationOperationKind::Pop) {
+        requested_routes_ = std::move(routes);
+        if (!realized_routes_.empty()) {
+          realized_routes_.pop_back();
+        }
+        expected_route_pop_ = false;
+        RefreshRealizedRouteFactories(requested_routes_);
+        return;
+      }
+      expected_route_pop_ = false;
+    }
+
+    if (SameRoutePath(requested_routes_, routes)) {
+      requested_routes_ = std::move(routes);
+      RefreshRealizedRouteFactories(requested_routes_);
+      return;
+    }
+
+    requested_routes_ = std::move(routes);
+    std::erase_if(pending_, [](const NavigationOperation& operation) {
+      return operation.kind == NavigationOperationKind::SetPath;
+    });
+    if (!SameRealizedRoutePath(realized_routes_, requested_routes_)) {
+      EnqueueOperation(NavigationOperationKind::SetPath, {}, requested_routes_);
+    }
+    RefreshRealizedRouteFactories(requested_routes_);
+    StartNextOperation();
+  }
+
+  void Push(std::function<View()> page) {
+    CheckThread();
+    EnsureFactoryMode();
+    ValidateFactory(page);
+    ++factory_depth_;
+    EnqueueOperation(NavigationOperationKind::Push, std::move(page), {});
+    StartNextOperation();
+    Invalidate();
+  }
+
+  bool Pop() {
+    CheckThread();
+    EnsureFactoryMode();
+    if (factory_depth_ <= 1) {
+      return false;
+    }
+    // Logical history changes when the command is accepted; render entries leave after their queued transition.
+    --factory_depth_;
+    EnqueueOperation(NavigationOperationKind::Pop, {}, {});
+    StartNextOperation();
+    Invalidate();
+    return true;
+  }
+
+  void Replace(std::function<View()> page) {
+    CheckThread();
+    EnsureFactoryMode();
+    ValidateFactory(page);
+    EnqueueOperation(NavigationOperationKind::Replace, std::move(page), {});
+    StartNextOperation();
+    Invalidate();
+  }
+
+  [[nodiscard]] bool CanPop() const {
+    CheckThread();
+    return factory_depth_ > 1;
+  }
+
+  [[nodiscard]] std::size_t Depth() const {
+    CheckThread();
+    return factory_depth_;
+  }
+
+  [[nodiscard]] const std::vector<NavigationEntry>& Entries() const noexcept {
+    return entries_;
+  }
+
+  [[nodiscard]] const std::optional<NavigationTransition>& Transition() const noexcept {
+    return transition_;
+  }
+
+  [[nodiscard]] const NavigationStyle& Style() const noexcept {
+    return style_;
+  }
+
+  [[nodiscard]] std::uint64_t Revision() const noexcept {
+    return revision_;
+  }
+
+  [[nodiscard]] std::uint64_t ActiveEntryId() const noexcept {
+    if (!transition_.has_value()) {
+      return entries_.empty() ? 0 : entries_.back().id;
+    }
+    if (transition_->interactive || !transition_->complete_operation) {
+      return transition_->source_id;
+    }
+    return transition_->destination_id;
+  }
+
+  [[nodiscard]] bool BeginPredictivePop() {
+    CheckThread();
+    if (route_type_.has_value()) {
+      return BeginRoutedPredictivePop();
+    }
+    if (factory_depth_ <= 1) {
+      return false;
+    }
+    // Reserve the logical Pop at Begin so later commands keep their order even before the gesture commits.
+    --factory_depth_;
+    if (transition_.has_value() || !pending_.empty()) {
+      queued_predictive_pop_id_ = EnqueueOperation(NavigationOperationKind::Pop, {}, {}, false);
+      Invalidate();
+      return true;
+    }
+    if (entries_.size() <= 1) {
+      ++factory_depth_;
+      return false;
+    }
+    transition_ = NavigationTransition{
+        .kind = NavigationOperationKind::Pop,
+        .source_id = entries_.back().id,
+        .destination_id = entries_[entries_.size() - 2].id,
+        .progress = 0.0F,
+        .target = 0.0F,
+        .interactive = true,
+        .complete_operation = false,
+        .retire_ids = {entries_.back().id},
+        .gesture_driven = true,
+    };
+    ++revision_;
+    Invalidate();
+    return true;
+  }
+
+  [[nodiscard]] bool UpdatePredictivePop(float progress) {
+    CheckThread();
+    if (route_type_.has_value() && queued_routed_predictive_pop_) {
+      return true;
+    }
+    if (queued_predictive_pop_id_.has_value()) {
+      return true;
+    }
+    if (!transition_.has_value() || !transition_->interactive) {
+      return false;
+    }
+    transition_->progress = std::clamp(progress, 0.0F, 1.0F);
+    return true;
+  }
+
+  [[nodiscard]] bool CancelPredictivePop() {
+    CheckThread();
+    if (route_type_.has_value()) {
+      if (queued_routed_predictive_pop_) {
+        queued_routed_predictive_pop_ = false;
+        return true;
+      }
+      if (!transition_.has_value() || !transition_->interactive) {
+        return false;
+      }
+      transition_->interactive = false;
+      transition_->target = 0.0F;
+      transition_->complete_operation = false;
+      ++revision_;
+      return true;
+    }
+    if (queued_predictive_pop_id_.has_value()) {
+      const auto operation = std::ranges::find(pending_, *queued_predictive_pop_id_, &NavigationOperation::id);
+      if (operation == pending_.end()) {
+        queued_predictive_pop_id_.reset();
+        return false;
+      }
+      pending_.erase(operation);
+      queued_predictive_pop_id_.reset();
+      ++factory_depth_;
+      StartNextOperation();
+      Invalidate();
+      return true;
+    }
+    if (!transition_.has_value() || !transition_->interactive) {
+      return false;
+    }
+    ++factory_depth_;
+    transition_->interactive = false;
+    transition_->target = 0.0F;
+    transition_->complete_operation = false;
+    ++revision_;
+    return true;
+  }
+
+  [[nodiscard]] bool CommitPredictivePop() {
+    CheckThread();
+    if (route_type_.has_value()) {
+      if (queued_routed_predictive_pop_) {
+        queued_routed_predictive_pop_ = false;
+        return RequestRoutedPop();
+      }
+      if (!transition_.has_value() || !transition_->interactive) {
+        return RequestRoutedPop();
+      }
+      expected_route_pop_ = true;
+      if (!RequestRoutedPop()) {
+        expected_route_pop_ = false;
+        return false;
+      }
+      transition_->interactive = false;
+      transition_->target = 1.0F;
+      transition_->complete_operation = true;
+      ++revision_;
+      Invalidate();
+      return true;
+    }
+    if (queued_predictive_pop_id_.has_value()) {
+      const auto operation = std::ranges::find(pending_, *queued_predictive_pop_id_, &NavigationOperation::id);
+      if (operation == pending_.end()) {
+        queued_predictive_pop_id_.reset();
+        return false;
+      }
+      operation->ready_to_start = true;
+      queued_predictive_pop_id_.reset();
+      StartNextOperation();
+      Invalidate();
+      return true;
+    }
+    if (!transition_.has_value() || !transition_->interactive) {
+      return Pop();
+    }
+    transition_->interactive = false;
+    transition_->target = 1.0F;
+    transition_->complete_operation = true;
+    ++revision_;
+    Invalidate();
+    return true;
+  }
+
+  void SetTransitionProgress(float progress) noexcept {
+    if (transition_.has_value()) {
+      transition_->progress = progress;
+    }
+  }
+
+  void SetTransitionSpec(TransitionSpec spec) {
+    if (transition_ && !transition_->spec) {
+      transition_->spec = std::move(spec);
+    }
+  }
+
+  void EvaluateTransition(pingcore::ViewNode& container, bool suppress_interactive_motion = false) {
+    if (transition_ && transition_->spec) {
+      const float progress = suppress_interactive_motion ? 0.0F : transition_->progress;
+      transition_->context = {progress, container.Bounds(), std::nullopt};
+      if (!transition_->native_fallback) {
+        transition_->frame = transition_->spec->Evaluate(transition_->context);
+        for (const pingcore::ViewNode& child : container.Children()) {
+          const auto id = child.LayoutValueOr<NavigationEntryIdValue>(0);
+          const bool fragmented =
+              (id == transition_->source_id && !transition_->frame.outgoing.fragments.empty()) ||
+              (id == transition_->destination_id && !transition_->frame.incoming.fragments.empty());
+          if (fragmented && PageHasPlatformView(static_cast<const MountedNode&>(child))) {
+            transition_->native_fallback = true;
+            break;
+          }
+        }
+      }
+      if (transition_->native_fallback) {
+        transition_->frame = FadeTransition{}.Evaluate(transition_->context);
+      }
+    }
+  }
+
+  void FinishTransition() {
+    CheckThread();
+    if (!transition_.has_value()) {
+      return;
+    }
+    const NavigationTransition completed = *transition_;
+    transition_.reset();
+    if (completed.complete_operation) {
+      for (const std::uint64_t id : completed.retire_ids) {
+        EraseEntry(id);
+      }
+    }
+    ++revision_;
+    StartNextOperation();
+    Invalidate();
+  }
+
+  void CheckAccess() const {
+    CheckThread();
+  }
+
+private:
+  static void ValidateFactory(const std::function<View()>& factory) {
+    if (!factory) {
+      throw std::invalid_argument("PingCore navigation page factory must not be empty");
+    }
+  }
+
+  static void ValidateRoutePath(const std::vector<NavigationRouteDescriptor>& routes) {
+    for (const NavigationRouteDescriptor& route : routes) {
+      if (!route.value || route.equals == nullptr || !route.factory) {
+        throw std::invalid_argument("PingCore navigation route descriptor is incomplete");
+      }
+    }
+  }
+
+  static bool SameRoute(const NavigationRouteDescriptor& first, const NavigationRouteDescriptor& second) {
+    return first.equals != nullptr && second.equals != nullptr && first.equals(first.value.get(), second.value.get());
+  }
+
+  static bool SameRoutePath(
+      const std::vector<NavigationRouteDescriptor>& first, const std::vector<NavigationRouteDescriptor>& second
+  ) {
+    return first.size() == second.size() && std::ranges::equal(first, second, [](const auto& left, const auto& right) {
+             return SameRoute(left, right);
+           });
+  }
+
+  static bool SameRealizedRoutePath(
+      const std::vector<RealizedNavigationRoute>& first, const std::vector<NavigationRouteDescriptor>& second
+  ) {
+    return first.size() == second.size() &&
+           std::ranges::equal(first, second, [](const RealizedNavigationRoute& left, const auto& right) {
+             return SameRoute(left.descriptor, right);
+           });
+  }
+
+  static bool IsSinglePop(
+      const std::vector<NavigationRouteDescriptor>& first, const std::vector<NavigationRouteDescriptor>& second
+  ) {
+    return first.size() == second.size() + 1 &&
+           std::ranges::equal(
+               first.begin(),
+               first.begin() + static_cast<std::ptrdiff_t>(second.size()),
+               second.begin(),
+               second.end(),
+               [](const auto& left, const auto& right) { return SameRoute(left, right); }
+           );
+  }
+
+  void EnsureFactoryMode() const {
+    if (route_type_.has_value()) {
+      throw std::logic_error("PingCore routed navigation cannot accept a page factory operation");
+    }
+  }
+
+  void CheckThread() const {
+    if (std::this_thread::get_id() != owner_thread_) {
+      throw std::logic_error("PingCore navigation must be accessed on its UI thread");
+    }
+  }
+
+  void Invalidate() {
+    if (invalidate_) {
+      invalidate_();
+    }
+  }
+
+  bool BeginRoutedPredictivePop() {
+    if (requested_routes_.empty()) {
+      return false;
+    }
+    if (transition_.has_value() || !pending_.empty()) {
+      queued_routed_predictive_pop_ = true;
+      return true;
+    }
+    if (realized_routes_.empty()) {
+      return false;
+    }
+    const std::uint64_t source_id = realized_routes_.back().entry_id;
+    const std::uint64_t destination_id =
+        realized_routes_.size() > 1 ? realized_routes_[realized_routes_.size() - 2].entry_id : initial_root_id_;
+    transition_ = NavigationTransition{
+        .kind = NavigationOperationKind::Pop,
+        .source_id = source_id,
+        .destination_id = destination_id,
+        .progress = 0.0F,
+        .target = 0.0F,
+        .interactive = true,
+        .complete_operation = false,
+        .retire_ids = {source_id},
+        .gesture_driven = true,
+    };
+    ++revision_;
+    Invalidate();
+    return true;
+  }
+
+  bool RequestRoutedPop() {
+    if (!request_route_pop_ || requested_routes_.empty()) {
+      return false;
+    }
+    return request_route_pop_();
+  }
+
+  void RefreshRealizedRouteFactories(const std::vector<NavigationRouteDescriptor>& routes) {
+    const std::size_t shared = std::min(realized_routes_.size(), routes.size());
+    for (std::size_t index = 0; index < shared; ++index) {
+      if (!SameRoute(realized_routes_[index].descriptor, routes[index])) {
+        break;
+      }
+      realized_routes_[index].descriptor = routes[index];
+      const auto entry = std::ranges::find(entries_, realized_routes_[index].entry_id, &NavigationEntry::id);
+      if (entry != entries_.end()) {
+        entry->factory = routes[index].factory;
+      }
+    }
+  }
+
+  std::uint64_t EnqueueOperation(
+      NavigationOperationKind kind,
+      std::function<View()> factory,
+      std::vector<NavigationRouteDescriptor> route_path,
+      bool ready_to_start = true
+  ) {
+    const std::uint64_t id = next_operation_id_++;
+    pending_.push_back({id, kind, std::move(factory), std::move(route_path), ready_to_start});
+    return id;
+  }
+
+  void StartNextOperation() {
+    while (!transition_.has_value() && !pending_.empty() && pending_.front().ready_to_start) {
+      NavigationOperation operation = std::move(pending_.front());
+      pending_.pop_front();
+      if (operation.kind == NavigationOperationKind::SetPath) {
+        StartRoutePath(std::move(operation.route_path));
+      } else {
+        StartFactoryOperation(std::move(operation));
+      }
+    }
+  }
+
+  void StartFactoryOperation(NavigationOperation operation) {
+    const std::uint64_t source_id = entries_.back().id;
+    std::uint64_t destination_id = 0;
+    std::vector<std::uint64_t> retire_ids;
+    if (operation.kind == NavigationOperationKind::Push || operation.kind == NavigationOperationKind::Replace) {
+      destination_id = next_entry_id_++;
+      entries_.push_back({destination_id, std::move(operation.factory)});
+      if (operation.kind == NavigationOperationKind::Replace) {
+        retire_ids.push_back(source_id);
+      }
+    } else {
+      destination_id = entries_[entries_.size() - 2].id;
+      retire_ids.push_back(source_id);
+    }
+    transition_ = NavigationTransition{
+        .kind = operation.kind,
+        .source_id = source_id,
+        .destination_id = destination_id,
+        .progress = 0.0F,
+        .target = 1.0F,
+        .interactive = false,
+        .complete_operation = true,
+        .retire_ids = std::move(retire_ids),
+    };
+    ++revision_;
+  }
+
+  void StartRoutePath(std::vector<NavigationRouteDescriptor> routes) {
+    if (SameRealizedRoutePath(realized_routes_, routes)) {
+      RefreshRealizedRouteFactories(routes);
+      return;
+    }
+
+    std::size_t shared = 0;
+    const std::size_t shared_limit = std::min(realized_routes_.size(), routes.size());
+    while (shared < shared_limit && SameRoute(realized_routes_[shared].descriptor, routes[shared])) {
+      ++shared;
+    }
+
+    RefreshRealizedRouteFactories(routes);
+    std::vector<RealizedNavigationRoute> next_routes(
+        realized_routes_.begin(),
+        realized_routes_.begin() + static_cast<std::ptrdiff_t>(shared)
+    );
+    std::vector<std::uint64_t> retire_ids;
+    retire_ids.reserve(realized_routes_.size() - shared);
+    for (auto route = realized_routes_.begin() + static_cast<std::ptrdiff_t>(shared); route != realized_routes_.end();
+         ++route) {
+      retire_ids.push_back(route->entry_id);
+    }
+    const std::uint64_t source_id = realized_routes_.empty() ? initial_root_id_ : realized_routes_.back().entry_id;
+
+    for (std::size_t index = shared; index < routes.size(); ++index) {
+      const std::uint64_t id = next_entry_id_++;
+      entries_.push_back({id, routes[index].factory});
+      next_routes.push_back({routes[index], id});
+    }
+
+    const std::uint64_t destination_id = next_routes.empty() ? initial_root_id_ : next_routes.back().entry_id;
+    NavigationOperationKind kind = NavigationOperationKind::Replace;
+    if (shared == realized_routes_.size() && routes.size() > realized_routes_.size()) {
+      kind = NavigationOperationKind::Push;
+    } else if (shared == routes.size() && routes.size() < realized_routes_.size()) {
+      kind = NavigationOperationKind::Pop;
+    }
+
+    realized_routes_ = std::move(next_routes);
+    transition_ = NavigationTransition{
+        .kind = kind,
+        .source_id = source_id,
+        .destination_id = destination_id,
+        .progress = 0.0F,
+        .target = 1.0F,
+        .interactive = false,
+        .complete_operation = true,
+        .retire_ids = std::move(retire_ids),
+    };
+    ++revision_;
+  }
+
+  void EraseEntry(std::uint64_t id) {
+    const auto found = std::ranges::find(entries_, id, &NavigationEntry::id);
+    if (found != entries_.end()) {
+      entries_.erase(found);
+    }
+  }
+
+  const std::thread::id owner_thread_;
+  const std::uint64_t initial_root_id_ = 1;
+  std::vector<NavigationEntry> entries_;
+  std::deque<NavigationOperation> pending_;
+  std::optional<NavigationTransition> transition_;
+  NavigationStyle style_;
+  std::function<void()> invalidate_;
+  std::size_t factory_depth_ = 1;
+  std::uint64_t next_entry_id_ = 2;
+  std::uint64_t next_operation_id_ = 1;
+  std::uint64_t revision_ = 1;
+  std::optional<std::uint64_t> queued_predictive_pop_id_;
+  // The controlled NavigationPath remains authoritative; these snapshots only reconcile retained visual entries.
+  std::vector<NavigationRouteDescriptor> requested_routes_;
+  std::vector<RealizedNavigationRoute> realized_routes_;
+  std::function<bool()> request_route_pop_;
+  std::optional<std::type_index> route_type_;
+  bool expected_route_pop_ = false;
+  bool queued_routed_predictive_pop_ = false;
+};
+
+namespace {
+
+class NavigationStackLayout final : public Layout<NavigationStackLayout> {
+public:
+  using Layout::Layout;
+
+  static LayoutResult Measure(LayoutContext& context, pingcore::ViewNode& node, Constraints constraints) {
+    LayoutResult result;
+    const auto* coordinator = node.LayoutValue<NavigationCoordinatorValue>();
+    if (coordinator == nullptr || !*coordinator) {
+      return result.SetSize(constraints.Constrain({}));
+    }
+
+    std::uint64_t source_id = 0;
+    std::uint64_t destination_id = (*coordinator)->ActiveEntryId();
+    if (const auto& transition = (*coordinator)->Transition()) {
+      source_id = transition->source_id;
+      destination_id = transition->destination_id;
+    }
+
+    Constraints child_constraints = constraints;
+    if (constraints.HasBoundedWidth()) {
+      child_constraints = child_constraints.TightWidth(constraints.max_width);
+    }
+    if (constraints.HasBoundedHeight()) {
+      child_constraints = child_constraints.TightHeight(constraints.max_height);
+    }
+
+    Size measured;
+    for (pingcore::ViewNode& child : node.Children()) {
+      const std::uint64_t id = child.LayoutValueOr<NavigationEntryIdValue>(0);
+      if (id != source_id && id != destination_id) {
+        continue;
+      }
+      const Size child_size = context.Measure(child, child_constraints);
+      measured.width = std::max(measured.width, child_size.width);
+      measured.height = std::max(measured.height, child_size.height);
+      result.Place(child, {});
+    }
+    if (constraints.HasBoundedWidth()) {
+      measured.width = constraints.max_width;
+    }
+    if (constraints.HasBoundedHeight()) {
+      measured.height = constraints.max_height;
+    }
+    return result.SetSize(constraints.Constrain(measured));
+  }
+};
+
+struct NavigationPageModifier {
+  std::shared_ptr<NavigationCoordinator> coordinator;
+  std::uint64_t entry_id = 0;
+
+  static const ModifierDescriptor& Descriptor();
+
+  bool operator==(const NavigationPageModifier&) const = default;
+};
+
+void ApplyNavigationPagePresentation(MountedNode& page, const NavigationCoordinator& coordinator,
+                                     std::uint64_t entry_id) {
+  page.presentation.local_opacity = entry_id == coordinator.ActiveEntryId() ? 1.0F : 0.0F;
+  const auto& transition = coordinator.Transition();
+  if (transition && transition->spec) {
+    if (entry_id != transition->source_id && entry_id != transition->destination_id) {
+      page.presentation.local_opacity = 0.0F;
+      return;
+    }
+    const bool outgoing = entry_id == transition->source_id;
+    const TransitionSample& sample = outgoing ? transition->frame.outgoing : transition->frame.incoming;
+    page.presentation.children_transform = sample.transform;
+    page.presentation.local_opacity = sample.opacity;
+    page.presentation.z_index = outgoing == (transition->frame.order == TransitionOrder::OutgoingAbove) ? 1 : 0;
+    page.presentation.children_fragments = sample.fragments;
+    if (sample.clip) { page.presentation.children_clips.push_back(*sample.clip); }
+  }
+}
+
+class NavigationPageExtension final : public NodeExtension {
+public:
+  NavigationPageExtension(pingcore::ViewNode& node, const NavigationPageModifier& modifier) {
+    Update(node, modifier);
+  }
+
+  void Update(pingcore::ViewNode&, const NavigationPageModifier& modifier) {
+    coordinator_ = modifier.coordinator;
+    entry_id_ = modifier.entry_id;
+  }
+
+  FrameResult OnFrame(pingcore::ViewNode& node, const FrameInfo&) override {
+    auto& mounted = static_cast<detail::MountedNode&>(node);
+    if (!coordinator_) {
+      mounted.presentation.local_opacity = 0.0F;
+      return {};
+    }
+    const auto& transition = coordinator_->Transition();
+    mounted.local_enabled = !transition && entry_id_ == coordinator_->ActiveEntryId();
+    ApplyNavigationPagePresentation(mounted, *coordinator_, entry_id_);
+    return {};
+  }
+
+private:
+  std::shared_ptr<NavigationCoordinator> coordinator_;
+  std::uint64_t entry_id_ = 0;
+};
+
+const ModifierDescriptor& NavigationPageModifier::Descriptor() {
+  static const ModifierDescriptor descriptor{
+      [](ViewSpec& spec,
+         ModifierSpec& compiled_modifier,
+         const std::shared_ptr<const Environment>&,
+         AppResources&) {
+        const auto& modifier = *static_cast<const NavigationPageModifier*>(compiled_modifier.value.get());
+        spec.local_enabled = modifier.coordinator && modifier.coordinator->ActiveEntryId() == modifier.entry_id;
+        // Page content cannot interact during motion; container-level Back and its cancellation remain available.
+        spec.properties.disabled_opacity = 1.0F;
+      },
+      [](pingcore::ViewNode& node, const void* value) -> std::unique_ptr<NodeExtension> {
+        return std::make_unique<NavigationPageExtension>(node, *static_cast<const NavigationPageModifier*>(value));
+      },
+      [](NodeExtension& extension, pingcore::ViewNode& node, const void* value) {
+        static_cast<NavigationPageExtension&>(extension).Update(
+            node,
+            *static_cast<const NavigationPageModifier*>(value)
+        );
+      },
+      false,
+      ErasedEqualsFor<NavigationPageModifier>(),
+      nullptr,
+  };
+  return descriptor;
+}
+
+struct NavigationContainerModifier {
+  std::shared_ptr<NavigationCoordinator> coordinator;
+  NavigationStyle style;
+  std::uint64_t revision = 0;
+
+  static const ModifierDescriptor& Descriptor();
+
+  bool operator==(const NavigationContainerModifier&) const = default;
+};
+
+// Retention only validates placement; PageTransition itself remains an immutable declaration.
+class PageTransitionRootCheck final : public NodeExtension {
+public:
+  PageTransitionRootCheck(pingcore::ViewNode&, const PageTransition&) {}
+  void Update(pingcore::ViewNode&, const PageTransition&) {}
+  void Accept() noexcept { accepted_ = true; }
+  FrameResult OnFrame(pingcore::ViewNode&, const FrameInfo&) override {
+    if (!accepted_) {
+      throw std::invalid_argument("PingCore PageTransition must be declared on a NavigationStack page root");
+    }
+    accepted_ = false;
+    return {};
+  }
+private:
+  bool accepted_ = false;
+};
+
+const PageTransition* ReadPageTransition(MountedNode& page) {
+  const PageTransition* result = nullptr;
+  MountedNode* current = page.children.empty() ? nullptr : page.children.front().get();
+  while (current != nullptr) {
+    for (NodeExtensionEntry& entry : current->extensions) {
+      if (entry.descriptor == &PageTransition::Descriptor()) {
+        static_cast<PageTransitionRootCheck&>(*entry.extension).Accept();
+        result = static_cast<const PageTransition*>(entry.value.get());
+      }
+    }
+    if ((current->kind != NodeKind::Scope && current->kind != NodeKind::Environment) || current->children.size() != 1) {
+      break;
+    }
+    current = current->children.front().get();
+  }
+  return result;
+}
+
+class NavigationContainerExtension final : public NodeExtension, public SharedTransitionSession {
+public:
+  NavigationContainerExtension(pingcore::ViewNode& node, const NavigationContainerModifier& modifier)
+      : SharedTransitionSession(true) {
+    Bind(static_cast<MountedNode&>(node));
+    Update(node, modifier);
+  }
+
+  void Update(pingcore::ViewNode&, const NavigationContainerModifier& modifier) {
+    coordinator_ = modifier.coordinator;
+    style_ = modifier.style;
+    if (revision_ != modifier.revision) {
+      revision_ = modifier.revision;
+      animation_initialized_ = false;
+    }
+  }
+
+  FrameResult OnFrame(pingcore::ViewNode& node, const FrameInfo& frame) override {
+    if (!coordinator_) {
+      return {};
+    }
+    const PageTransition* selected = nullptr;
+    const auto& active = coordinator_->Transition();
+    const std::uint64_t policy_id = active
+        ? (active->kind == NavigationOperationKind::Pop ? active->source_id : active->destination_id) : 0;
+    for (pingcore::ViewNode& child : node.Children()) {
+      const auto policy = ReadPageTransition(static_cast<MountedNode&>(child));
+      const auto id = child.LayoutValueOr<NavigationEntryIdValue>(0);
+      if (id == policy_id) { selected = policy; }
+    }
+    if (!active) {
+      Clear();
+      if (painted_) { InvalidatePaint(); }
+      painted_ = false;
+      animation_initialized_ = false;
+      return {};
+    }
+    if (!active->spec) {
+      const PageTransition policy = selected ? *selected : style_.motion.value_or(PageTransition{});
+      coordinator_->SetTransitionSpec(active->kind == NavigationOperationKind::Pop ? policy.pop
+          : active->kind == NavigationOperationKind::Push ? policy.push : policy.replace);
+    }
+    const NavigationTransition& transition = *active;
+    const TransitionSpec& spec = *transition.spec;
+    if (transition.interactive) {
+      progress_.Seek(transition.progress);
+      animation_initialized_ = false;
+    } else if (!animation_initialized_) {
+      progress_.Seek(transition.progress);
+      AnimationSpec animation = ContinuationAnimation(
+          spec.Animation(), transition.progress, transition.target);
+      const double delay = !transition.gesture_driven && transition.progress == 0.0F && transition.complete_operation
+          ? spec.Delay() : 0.0;
+      progress_.AnimateTo(transition.target, std::move(animation), AnimationPlayback{.delay = delay});
+      animation_initialized_ = true;
+    }
+    MotionAdvanceResult result;
+    if (!transition.interactive) {
+      result = progress_.Advance(frame);
+      coordinator_->SetTransitionProgress(progress_.Value());
+    }
+    try {
+      coordinator_->EvaluateTransition(node, transition.interactive &&
+          (frame.reduced_motion || spec.IsImmediate()));
+    } catch (...) {
+      Clear();
+      coordinator_->FinishTransition();
+      animation_initialized_ = false;
+      throw;
+    }
+    const bool paints = !frame.reduced_motion && !spec.IsImmediate() && !transition.native_fallback &&
+        InternalAccess::HasTransitionPaint(spec);
+    if (painted_ || paints) {
+      InvalidatePaint();
+    }
+    painted_ = paints;
+    std::uint64_t shared_source = 0;
+    std::uint64_t shared_destination = 0;
+    for (const ViewNode& child : node.Children()) {
+      const auto id = child.LayoutValueOr<NavigationEntryIdValue>(0);
+      if (id == transition.source_id) { shared_source = static_cast<const MountedNode&>(child).identity; }
+      if (id == transition.destination_id) { shared_destination = static_cast<const MountedNode&>(child).identity; }
+    }
+    Navigation(shared_source, shared_destination, transition.progress,
+               transition.kind == NavigationOperationKind::Pop, !frame.reduced_motion && !spec.IsImmediate());
+    if (!transition.interactive && !progress_.IsRunning()) {
+      Clear();
+      coordinator_->FinishTransition();
+      animation_initialized_ = false;
+      return {true, std::nullopt};
+    }
+    return {result.needs_frame, result.wake_after};
+  }
+
+  void PrepareRender(MountedNode& node) override {
+    try {
+      SharedTransitionSession::PrepareRender(node);
+    } catch (...) {
+      coordinator_->FinishTransition();
+      animation_initialized_ = false;
+      throw;
+    }
+  }
+
+  void PaintAboveContent(const pingcore::ViewNode& node, PaintContext& paint) const override {
+    if (!coordinator_) { return; }
+    const auto& transition = coordinator_->Transition();
+    if (!painted_ || !transition || !transition->spec || transition->native_fallback) { return; }
+    try {
+      paint.PushClip(node.Bounds());
+      transition->spec->Paint(paint, transition->context);
+      paint.PopClip();
+    } catch (...) {
+      coordinator_->FinishTransition();
+      throw;
+    }
+  }
+
+  bool OnBack(pingcore::ViewNode&, const BackEvent& event) override {
+    if (!coordinator_) {
+      return false;
+    }
+    switch (event.phase) {
+    case BackPhase::Begin:
+      animation_initialized_ = false;
+      return coordinator_->BeginPredictivePop();
+    case BackPhase::Update:
+      return coordinator_->UpdatePredictivePop(event.progress);
+    case BackPhase::Cancel:
+      animation_initialized_ = false;
+      return coordinator_->CancelPredictivePop();
+    case BackPhase::Commit:
+      animation_initialized_ = false;
+      return coordinator_->CommitPredictivePop();
+    }
+    return false;
+  }
+
+private:
+  std::shared_ptr<NavigationCoordinator> coordinator_;
+  NavigationStyle style_;
+  MotionController progress_;
+  std::uint64_t revision_ = 0;
+  bool animation_initialized_ = false;
+  bool painted_ = false;
+};
+
+const ModifierDescriptor& NavigationContainerModifier::Descriptor() {
+  return ModifierDescriptorFor<NavigationContainerModifier, NavigationContainerExtension, true>();
+}
+
+View BuildNavigationView(const std::shared_ptr<NavigationCoordinator>& coordinator, NavigationStyle style,
+                         NavigationEnvironmentEntry environment_entry) {
+  NavigationEnvironment environment = UseEnvironment<NavigationEnvironment>();
+  environment.current = std::make_shared<NavigationEnvironmentNode>(NavigationEnvironmentNode{
+      .entry = std::move(environment_entry),
+      .parent = std::move(environment.current),
+  });
+
+  std::vector<View> pages;
+  pages.reserve(coordinator->Entries().size());
+  for (const NavigationEntry& entry : coordinator->Entries()) {
+    View page = ProvideEnvironment(environment, Scope(entry.factory));
+    pages.push_back(
+        Stack{
+            std::move(page),
+        }
+            .LayoutValue<NavigationEntryIdValue>(entry.id)
+            .With(NavigationPageModifier{coordinator, entry.id})
+            .Key(entry.id)
+    );
+  }
+
+  NavigationContainerModifier container{coordinator, style, coordinator->Revision()};
+  return NavigationStackLayout {std::move(pages)}.LayoutValue<NavigationCoordinatorValue>(coordinator).With(
+      ClipChildren{},
+      std::move(container)
+  );
+}
+
+} // namespace
+
+View BuildRoutedNavigationStack(
+    std::function<View()> root, std::vector<NavigationRouteDescriptor> routes, NavigationRouteBinding binding
+) {
+  auto coordinator_state = UseState(std::make_shared<NavigationCoordinator>(root, routes, binding));
+  auto revision = UseState<std::uint64_t>(0);
+  const std::shared_ptr<NavigationCoordinator> coordinator = coordinator_state.Get();
+  PINGCORE_DISCARD(revision.Get());
+  coordinator->Connect([revision] { revision.Update([](std::uint64_t& value) { ++value; }); });
+  coordinator->UpdateRoot(std::move(root));
+  coordinator->UpdateRouteBinding(binding);
+  coordinator->SynchronizeRoutePath(std::move(routes));
+  NavigationStyle style = UseEnvironment<NavigationStyle>();
+  coordinator->UpdateStyle(style);
+  return BuildNavigationView(
+      coordinator,
+      std::move(style),
+      NavigationEnvironmentEntry{
+          .coordinator = coordinator,
+          .route_type = binding.route_type,
+          .path_state = std::move(binding.path_state),
+          .history_commit = std::move(binding.history_commit),
+      }
+  );
+}
+
+NavigationAccess FindNavigationAccess(std::optional<std::type_index> route_type, bool outermost) {
+  const NavigationEnvironment environment = UseEnvironment<NavigationEnvironment>();
+  const auto matches = [route_type](const NavigationEnvironmentEntry& entry) {
+    return entry.route_type == route_type && !entry.coordinator.expired();
+  };
+
+  NavigationAccess found;
+  for (auto node = environment.current; node; node = node->parent) {
+    if (matches(node->entry)) {
+      found = {node->entry.coordinator, node->entry.path_state, node->entry.history_commit};
+      if (!outermost) {
+        break;
+      }
+    }
+  }
+  return found;
+}
+
+bool CheckNavigationAccess(const std::weak_ptr<NavigationCoordinator>& weak_coordinator) {
+  const std::shared_ptr<NavigationCoordinator> shared = weak_coordinator.lock();
+  if (!shared) {
+    return false;
+  }
+  shared->CheckAccess();
+  return true;
+}
+
+} // namespace pingcore::detail
+
+namespace pingcore {
+
+const detail::ModifierDescriptor& PageTransition::Descriptor() {
+  return detail::ModifierDescriptorFor<PageTransition, detail::PageTransitionRootCheck>();
+}
+
+NavigationStyle NavigationStyle::Default() {
+  const TransitionSpec enter{SlideTransition{}, TweenSpec{0.3}};
+  return {PageTransition{enter, enter.Reversed(TweenSpec{0.25}), enter}};
+}
+
+void NavigationController::Push(std::function<View()> page) const {
+  if (auto coordinator = coordinator_.lock()) {
+    coordinator->Push(std::move(page));
+    return;
+  }
+  throw std::logic_error("PingCore navigation controller is disconnected");
+}
+
+bool NavigationController::Pop() const {
+  if (auto coordinator = coordinator_.lock()) {
+    return coordinator->Pop();
+  }
+  return false;
+}
+
+void NavigationController::Replace(std::function<View()> page) const {
+  if (auto coordinator = coordinator_.lock()) {
+    coordinator->Replace(std::move(page));
+    return;
+  }
+  throw std::logic_error("PingCore navigation controller is disconnected");
+}
+
+bool NavigationController::CanPop() const {
+  if (auto coordinator = coordinator_.lock()) {
+    return coordinator->CanPop();
+  }
+  return false;
+}
+
+std::size_t NavigationController::Depth() const {
+  if (auto coordinator = coordinator_.lock()) {
+    return coordinator->Depth();
+  }
+  return 0;
+}
+
+View NavigationStack(std::function<View()> root) {
+  if (!root) {
+    throw std::invalid_argument("PingCore navigation root factory must not be empty");
+  }
+  return Scope([root = std::move(root)]() mutable -> View {
+    auto coordinator_state = UseState(std::make_shared<detail::NavigationCoordinator>(root));
+    auto revision = UseState<std::uint64_t>(0);
+    const std::shared_ptr<detail::NavigationCoordinator> coordinator = coordinator_state.Get();
+    PINGCORE_DISCARD(revision.Get());
+    coordinator->Connect([revision] { revision.Update([](std::uint64_t& value) { ++value; }); });
+    coordinator->UpdateRoot(root);
+    NavigationStyle style = UseEnvironment<NavigationStyle>();
+    coordinator->UpdateStyle(style);
+    return detail::BuildNavigationView(
+        coordinator,
+        std::move(style),
+        detail::NavigationEnvironmentEntry{
+            .coordinator = coordinator,
+            .route_type = std::nullopt,
+            .path_state = nullptr,
+            .history_commit = nullptr,
+        }
+    );
+  });
+}
+
+NavigationController UseNavigation() {
+  detail::NavigationAccess access = detail::FindNavigationAccess(std::nullopt, false);
+  if (access.coordinator.expired()) {
+    throw std::logic_error("PingCore UseNavigation() requires an enclosing NavigationStack");
+  }
+  return NavigationController{std::move(access.coordinator)};
+}
+
+NavigationController UseRootNavigation() {
+  detail::NavigationAccess access = detail::FindNavigationAccess(std::nullopt, true);
+  if (access.coordinator.expired()) {
+    throw std::logic_error("PingCore UseRootNavigation() requires an enclosing NavigationStack");
+  }
+  return NavigationController{std::move(access.coordinator)};
+}
+
+} // namespace pingcore

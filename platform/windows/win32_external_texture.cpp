@@ -1,0 +1,473 @@
+#include <pingcore/windows/external_texture.h>
+
+#include <d3d11_1.h>
+#include <dxgi1_2.h>
+#include <windows.h>
+#include <wrl/client.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <mutex>
+#include <stdexcept>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include "graphics/bitmap_internal.h"
+#include "win32_external_texture_internal.h"
+#include "macros_internal.h"
+
+namespace pingcore::detail {
+namespace {
+
+using Microsoft::WRL::ComPtr;
+
+void ThrowIfFailed(HRESULT result, const char* message) {
+  if (FAILED(result)) {
+    throw std::runtime_error(message);
+  }
+}
+
+class SharedHandle final {
+public:
+  SharedHandle() noexcept = default;
+  ~SharedHandle() {
+    if (value_ != nullptr) {
+      CloseHandle(value_);
+    }
+  }
+
+  SharedHandle(const SharedHandle&) = delete;
+  SharedHandle& operator=(const SharedHandle&) = delete;
+
+  [[nodiscard]] HANDLE* Address() noexcept {
+    return &value_;
+  }
+
+  [[nodiscard]] HANDLE Release() noexcept {
+    return std::exchange(value_, nullptr);
+  }
+
+private:
+  HANDLE value_ = nullptr;
+};
+
+class KeyedMutexLease final {
+public:
+  explicit KeyedMutexLease(ComPtr<IDXGIKeyedMutex> mutex) : mutex_(std::move(mutex)) {}
+
+  ~KeyedMutexLease() {
+    if (mutex_) {
+      PINGCORE_DISCARD(mutex_->ReleaseSync(release_key_));
+    }
+  }
+
+  KeyedMutexLease(const KeyedMutexLease&) = delete;
+  KeyedMutexLease& operator=(const KeyedMutexLease&) = delete;
+
+  void SetReleaseKey(UINT64 key) noexcept {
+    release_key_ = key;
+  }
+
+  void Release() {
+    const HRESULT result = mutex_->ReleaseSync(release_key_);
+    mutex_.Reset();
+    ThrowIfFailed(result, "PingCore could not release a Windows D3D11 texture snapshot");
+  }
+
+private:
+  ComPtr<IDXGIKeyedMutex> mutex_;
+  UINT64 release_key_ = 0;
+};
+
+void WaitForCopy(ID3D11Device& device, ID3D11DeviceContext& context) {
+  D3D11_QUERY_DESC query_description{};
+  query_description.Query = D3D11_QUERY_EVENT;
+  ComPtr<ID3D11Query> query;
+  ThrowIfFailed(
+      device.CreateQuery(&query_description, query.GetAddressOf()),
+      "PingCore could not create a Windows D3D11 texture completion query"
+  );
+  context.End(query.Get());
+  context.Flush();
+  HRESULT result = context.GetData(query.Get(), nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH);
+  while (result == S_FALSE) {
+    std::this_thread::yield();
+    result = context.GetData(query.Get(), nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH);
+  }
+  ThrowIfFailed(result, "PingCore could not complete a Windows D3D11 texture snapshot");
+}
+
+Win32PixelFrame CopyFrame(const windows::PixelFrame& frame) {
+  if (frame.pixel_width <= 0 || frame.pixel_height <= 0) {
+    throw std::invalid_argument("PingCore Windows external texture frame dimensions must be positive");
+  }
+  switch (frame.format) {
+  case windows::PixelFormat::Rgba8888:
+  case windows::PixelFormat::Bgra8888:
+    break;
+  default:
+    throw std::invalid_argument("PingCore Windows external texture pixel format is not supported");
+  }
+
+  const std::size_t width = static_cast<std::size_t>(frame.pixel_width);
+  const std::size_t height = static_cast<std::size_t>(frame.pixel_height);
+  if (width > std::numeric_limits<std::size_t>::max() / 4U) {
+    throw std::invalid_argument("PingCore Windows external texture frame dimensions are too large");
+  }
+  const std::size_t row_bytes = width * 4U;
+  if (row_bytes > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+    throw std::invalid_argument("PingCore Windows external texture frame dimensions are too large");
+  }
+  if (frame.bytes_per_row < row_bytes) {
+    throw std::invalid_argument("PingCore Windows external texture row stride is too small");
+  }
+  if (height > 1U && frame.bytes_per_row > (std::numeric_limits<std::size_t>::max() - row_bytes) / (height - 1U)) {
+    throw std::invalid_argument("PingCore Windows external texture frame dimensions are too large");
+  }
+  const std::size_t required_bytes = (height - 1U) * frame.bytes_per_row + row_bytes;
+  if (frame.pixels.size() < required_bytes) {
+    throw std::invalid_argument("PingCore Windows external texture pixel buffer is too small");
+  }
+  if (height > std::numeric_limits<std::size_t>::max() / row_bytes) {
+    throw std::invalid_argument("PingCore Windows external texture frame dimensions are too large");
+  }
+
+  std::vector<std::byte> pixels(row_bytes * height);
+  for (std::size_t y = 0; y < height; ++y) {
+    const std::byte* source_row = frame.pixels.data() + y * frame.bytes_per_row;
+    std::byte* destination_row = pixels.data() + y * row_bytes;
+    for (std::size_t x = 0; x < width; ++x) {
+      const std::byte* source = source_row + x * 4U;
+      const auto first = static_cast<std::uint8_t>(source[0]);
+      const auto green = static_cast<std::uint8_t>(source[1]);
+      const auto third = static_cast<std::uint8_t>(source[2]);
+      const auto alpha = static_cast<std::uint8_t>(source[3]);
+      const std::uint8_t red = frame.format == windows::PixelFormat::Rgba8888 ? first : third;
+      const std::uint8_t blue = frame.format == windows::PixelFormat::Rgba8888 ? third : first;
+      const auto premultiply = [alpha](std::uint8_t channel) {
+        return static_cast<std::uint8_t>((static_cast<std::uint32_t>(channel) * alpha + 127U) / 255U);
+      };
+      std::byte* destination = destination_row + x * 4U;
+      destination[0] = static_cast<std::byte>(premultiply(blue));
+      destination[1] = static_cast<std::byte>(premultiply(green));
+      destination[2] = static_cast<std::byte>(premultiply(red));
+      destination[3] = static_cast<std::byte>(alpha);
+    }
+  }
+  return Win32PixelFrame(frame.pixel_width, frame.pixel_height, std::move(pixels));
+}
+
+} // namespace
+
+ComPtr<ID3D11Texture2D> D3D11FrameAccess::Open(const windows::D3D11Frame& frame, ID3D11Device& device) {
+#if defined(PINGCORE_WINDOWS_7_COMPAT)
+  PINGCORE_UNUSED(frame);
+  PINGCORE_UNUSED(device);
+  throw std::runtime_error("PingCore Windows D3D11 textures require Windows 10 or later");
+#else
+  ComPtr<ID3D11Device1> device1;
+  ThrowIfFailed(
+      device.QueryInterface(IID_PPV_ARGS(device1.GetAddressOf())),
+      "PingCore could not access the Windows D3D11.1 consumer device"
+  );
+  ComPtr<ID3D11Texture2D> texture;
+  ThrowIfFailed(
+      device1->OpenSharedResource1(frame.shared_handle_, IID_PPV_ARGS(texture.GetAddressOf())),
+      "PingCore could not open a Windows D3D11 texture; the devices must use the same adapter"
+  );
+  return texture;
+#endif
+}
+
+} // namespace pingcore::detail
+
+namespace pingcore::windows {
+
+using Microsoft::WRL::ComPtr;
+
+D3D11Frame::D3D11Frame(
+    int pixel_width, int pixel_height, D3D11Texture::Alpha alpha, void* shared_handle, ID3D11Texture2D* texture
+) noexcept
+    : pixel_width_(pixel_width), pixel_height_(pixel_height), alpha_(alpha), shared_handle_(shared_handle),
+      texture_(texture) {}
+
+D3D11Frame::~D3D11Frame() {
+  CloseHandle(shared_handle_);
+  texture_->Release();
+}
+
+std::shared_ptr<const D3D11Frame> D3D11Frame::Copy(D3D11Texture::Frame frame) {
+#if defined(PINGCORE_WINDOWS_7_COMPAT)
+  PINGCORE_UNUSED(frame);
+  throw std::runtime_error("PingCore Windows D3D11 textures require Windows 10 or later");
+#else
+  if (frame.texture == nullptr) {
+    throw std::invalid_argument("PingCore Windows D3D11 texture source must not be null");
+  }
+  switch (frame.alpha) {
+  case D3D11Texture::Alpha::Opaque:
+  case D3D11Texture::Alpha::Premultiplied:
+    break;
+  default:
+    throw std::invalid_argument("PingCore Windows D3D11 texture alpha mode is not supported");
+  }
+
+  D3D11_TEXTURE2D_DESC source_description{};
+  frame.texture->GetDesc(&source_description);
+  if (source_description.Width == 0 || source_description.Height == 0 || source_description.MipLevels != 1 ||
+      source_description.ArraySize != 1 || source_description.Format != DXGI_FORMAT_B8G8R8A8_UNORM ||
+      source_description.SampleDesc.Count != 1 || source_description.SampleDesc.Quality != 0 ||
+      source_description.Usage != D3D11_USAGE_DEFAULT || source_description.CPUAccessFlags != 0) {
+    throw std::invalid_argument(
+        "PingCore Windows D3D11 texture source must be a single-sampled, one-mip, one-slice "
+        "DXGI_FORMAT_B8G8R8A8_UNORM D3D11_USAGE_DEFAULT texture without CPU access"
+    );
+  }
+  if (source_description.Width > static_cast<UINT>(std::numeric_limits<int>::max()) ||
+      source_description.Height > static_cast<UINT>(std::numeric_limits<int>::max())) {
+    throw std::invalid_argument("PingCore Windows D3D11 texture dimensions are too large");
+  }
+
+  ComPtr<ID3D11Device> device;
+  frame.texture->GetDevice(device.GetAddressOf());
+  if (!device) {
+    throw std::runtime_error("PingCore could not access the Windows D3D11 texture device");
+  }
+  detail::ThrowIfFailed(
+      device->GetDeviceRemovedReason(),
+      "PingCore cannot publish a Windows D3D11 texture from a removed device"
+  );
+
+  D3D11_TEXTURE2D_DESC snapshot_description = source_description;
+  snapshot_description.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+  snapshot_description.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+  ComPtr<ID3D11Texture2D> snapshot;
+  detail::ThrowIfFailed(
+      device->CreateTexture2D(&snapshot_description, nullptr, snapshot.GetAddressOf()),
+      "PingCore could not create a shared Windows D3D11 texture snapshot"
+  );
+
+  ComPtr<IDXGIKeyedMutex> keyed_mutex;
+  detail::ThrowIfFailed(
+      snapshot.As(&keyed_mutex), "PingCore could not synchronize a shared Windows D3D11 texture snapshot"
+  );
+  detail::ThrowIfFailed(
+      keyed_mutex->AcquireSync(0, INFINITE),
+      "PingCore could not acquire a shared Windows D3D11 texture snapshot"
+  );
+  detail::KeyedMutexLease lease(std::move(keyed_mutex));
+
+  ComPtr<ID3D11DeviceContext> context;
+  device->GetImmediateContext(context.GetAddressOf());
+  if (!context) {
+    throw std::runtime_error("PingCore could not access the Windows D3D11 immediate context");
+  }
+  context->CopyResource(snapshot.Get(), frame.texture);
+  detail::WaitForCopy(*device.Get(), *context.Get());
+
+  ComPtr<IDXGIResource1> resource;
+  detail::ThrowIfFailed(snapshot.As(&resource), "PingCore could not share a Windows D3D11 texture snapshot");
+  detail::SharedHandle shared_handle;
+  detail::ThrowIfFailed(
+      resource->CreateSharedHandle(
+          nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, shared_handle.Address()
+      ),
+      "PingCore could not create a Windows D3D11 texture shared handle"
+  );
+
+  lease.SetReleaseKey(1);
+  lease.Release();
+  return std::shared_ptr<const D3D11Frame>(new D3D11Frame(
+      static_cast<int>(source_description.Width), static_cast<int>(source_description.Height), frame.alpha,
+      shared_handle.Release(), snapshot.Detach()
+  ));
+#endif
+}
+
+bool D3D11Frame::TryCopyTo(ID3D11DeviceContext& context, ID3D11Texture2D& destination) const {
+  ComPtr<ID3D11Device> device;
+  context.GetDevice(device.GetAddressOf());
+  ComPtr<ID3D11Device> destination_device;
+  destination.GetDevice(destination_device.GetAddressOf());
+  if (context.GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE || device.Get() != destination_device.Get()) {
+    throw std::invalid_argument("PingCore D3D11 frame copy requires the destination's immediate context");
+  }
+  D3D11_TEXTURE2D_DESC description{};
+  destination.GetDesc(&description);
+  if (description.Width != static_cast<UINT>(pixel_width_) || description.Height != static_cast<UINT>(pixel_height_) ||
+      description.MipLevels != 1 || description.ArraySize != 1 || description.Format != DXGI_FORMAT_B8G8R8A8_UNORM ||
+      description.SampleDesc.Count != 1 || description.SampleDesc.Quality != 0 ||
+      description.Usage != D3D11_USAGE_DEFAULT || description.CPUAccessFlags != 0) {
+    throw std::invalid_argument("PingCore D3D11 frame copy requires a matching BGRA8 default-usage destination");
+  }
+
+  const ComPtr<ID3D11Texture2D> source = detail::D3D11FrameAccess::Open(*this, *device.Get());
+  ComPtr<IDXGIKeyedMutex> mutex;
+  detail::ThrowIfFailed(source.As(&mutex), "PingCore could not synchronize a Windows D3D11 frame copy");
+  const HRESULT acquired = mutex->AcquireSync(1, 0);
+  if (acquired == WAIT_TIMEOUT) {
+    return false;
+  }
+  if (acquired != S_OK) {
+    throw std::runtime_error("PingCore could not acquire a Windows D3D11 frame for copying");
+  }
+  detail::KeyedMutexLease lease(std::move(mutex));
+  lease.SetReleaseKey(1);
+  context.CopyResource(&destination, source.Get());
+  lease.Release();
+  detail::ThrowIfFailed(device->GetDeviceRemovedReason(), "PingCore Windows D3D11 frame copy device was removed");
+  return true;
+}
+
+struct PixelTexture::Storage {
+  std::mutex mutex;
+  std::shared_ptr<const detail::Win32PixelFrame> frame;
+  bool finished = false;
+};
+
+struct D3D11Texture::Storage {
+  std::mutex mutex;
+  std::shared_ptr<const D3D11Frame> frame;
+  bool finished = false;
+};
+
+PixelTexture::PixelTexture(Size intrinsic_size)
+    : pingcore::ExternalTexture(intrinsic_size), storage_(std::make_unique<Storage>()) {}
+
+PixelTexture::~PixelTexture() {
+  Finish();
+}
+
+void PixelTexture::Publish(const PixelFrame& frame) {
+  auto copied = std::make_shared<const detail::Win32PixelFrame>(detail::CopyFrame(frame));
+  {
+    std::lock_guard lock(storage_->mutex);
+    if (storage_->finished) {
+      throw std::logic_error("PingCore Windows external texture is finished");
+    }
+    storage_->frame = std::move(copied);
+  }
+  NotifyFrameAvailable();
+}
+
+void PixelTexture::Finish() noexcept {
+  std::lock_guard lock(storage_->mutex);
+  storage_->finished = true;
+}
+
+std::shared_ptr<const detail::Win32PixelFrame> PixelTexture::AcquireFrame() const noexcept {
+  std::lock_guard lock(storage_->mutex);
+  return storage_->frame;
+}
+
+Task<std::optional<Bitmap>> PixelTexture::SnapshotAsync() const {
+  return RunWorker([](const std::shared_ptr<const detail::Win32PixelFrame>& frame) -> std::optional<Bitmap> {
+    if (!frame) return std::nullopt;
+    return detail::CopyBitmapRows(
+        frame->PixelWidth(), frame->PixelHeight(), frame->Pixels().data(), frame->BytesPerRow(),
+        Bitmap::PixelFormat::Bgra8888, detail::PixelAlpha::Premultiplied);
+  }, AcquireFrame());
+}
+
+D3D11Texture::D3D11Texture(Size intrinsic_size)
+    : pingcore::ExternalTexture(intrinsic_size), storage_(std::make_unique<Storage>()) {}
+
+D3D11Texture::~D3D11Texture() {
+  Finish();
+}
+
+void D3D11Texture::Publish(Frame frame) {
+  {
+    std::lock_guard lock(storage_->mutex);
+    if (storage_->finished) {
+      throw std::logic_error("PingCore Windows D3D11 texture is finished");
+    }
+  }
+  std::shared_ptr<const D3D11Frame> copied = D3D11Frame::Copy(frame);
+  {
+    std::lock_guard lock(storage_->mutex);
+    if (storage_->finished) {
+      throw std::logic_error("PingCore Windows D3D11 texture is finished");
+    }
+    storage_->frame = std::move(copied);
+  }
+  NotifyFrameAvailable();
+}
+
+void D3D11Texture::Finish() noexcept {
+  std::lock_guard lock(storage_->mutex);
+  storage_->finished = true;
+}
+
+std::shared_ptr<const D3D11Frame> D3D11Texture::AcquireFrame() const noexcept {
+  std::lock_guard lock(storage_->mutex);
+  return storage_->frame;
+}
+
+Task<std::optional<Bitmap>> D3D11Texture::SnapshotAsync() const {
+  return RunWorker([](const std::shared_ptr<const D3D11Frame>& frame) -> std::optional<Bitmap> {
+    if (!frame) return std::nullopt;
+    // Own the readback context so publishing and rendering can use their immediate contexts independently.
+    ComPtr<ID3D11Device> owner;
+    frame->texture_->GetDevice(owner.GetAddressOf());
+    ComPtr<IDXGIDevice> dxgi;
+    ComPtr<IDXGIAdapter> adapter;
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    detail::ThrowIfFailed(owner.As(&dxgi), "PingCore could not identify the D3D11 frame adapter");
+    detail::ThrowIfFailed(
+        dxgi->GetAdapter(adapter.GetAddressOf()), "PingCore could not identify the D3D11 frame adapter");
+    detail::ThrowIfFailed(D3D11CreateDevice(
+        adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        nullptr, 0, D3D11_SDK_VERSION,
+        device.GetAddressOf(), nullptr, context.GetAddressOf()
+    ), "PingCore could not create a D3D11 readback device");
+
+    const auto source = detail::D3D11FrameAccess::Open(*frame, *device.Get());
+    D3D11_TEXTURE2D_DESC description{};
+    source->GetDesc(&description);
+    description.Usage = D3D11_USAGE_STAGING;
+    description.BindFlags = 0;
+    description.MiscFlags = 0;
+    description.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ComPtr<ID3D11Texture2D> staging;
+    detail::ThrowIfFailed(device->CreateTexture2D(&description, nullptr, staging.GetAddressOf()),
+                          "PingCore could not allocate a D3D11 staging texture");
+
+    ComPtr<IDXGIKeyedMutex> mutex;
+    detail::ThrowIfFailed(source.As(&mutex), "PingCore could not synchronize a D3D11 frame readback");
+    if (mutex->AcquireSync(1, 1000) != S_OK) {
+      throw std::runtime_error("PingCore could not acquire the D3D11 frame for readback");
+    }
+    detail::KeyedMutexLease lease(std::move(mutex));
+    lease.SetReleaseKey(1);
+    context->CopyResource(staging.Get(), source.Get());
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    detail::ThrowIfFailed(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped),
+                          "PingCore could not map the D3D11 frame pixels");
+    struct UnmapOnExit {
+      ID3D11DeviceContext& context;
+      ID3D11Texture2D& texture;
+      ~UnmapOnExit() { context.Unmap(&texture, 0); }
+    } unmap{*context.Get(), *staging.Get()};
+    lease.Release();
+
+    const auto alpha = frame->Alpha() == Alpha::Opaque ? detail::PixelAlpha::Opaque : detail::PixelAlpha::Premultiplied;
+    return detail::CopyBitmapRows(
+        description.Width, description.Height, static_cast<const std::byte*>(mapped.pData), mapped.RowPitch,
+        Bitmap::PixelFormat::Bgra8888, alpha
+    );
+  }, AcquireFrame());
+}
+
+} // namespace pingcore::windows
+
+namespace pingcore::detail {
+
+std::shared_ptr<const Win32PixelFrame> GetPixelFrame(const windows::PixelTexture& texture) noexcept {
+  return texture.AcquireFrame();
+}
+
+} // namespace pingcore::detail

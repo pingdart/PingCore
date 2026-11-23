@@ -1,0 +1,9 @@
+// The build program: pingcore.rules arrives through the pingcore dependency and schedules the composable transform
+// and the resource compiler as build-graph edges.
+
+import mcpp;
+import pingcore.rules;
+
+int main() {
+    return pingcore::rules::configure({ .resources = "resources" }) ? 0 : 1;
+}

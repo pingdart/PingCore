@@ -1,0 +1,5 @@
+target/
+.pingcore/
+mcpp.lock
+build/
+/platform/

@@ -1,0 +1,124 @@
+import com.android.build.api.artifact.SingleArtifact
+import java.util.zip.ZipFile
+import javax.inject.Inject
+
+plugins {
+    alias(libs.plugins.android.library)
+}
+
+dependencies {
+    androidTestImplementation project(":PingCore")
+}
+
+abstract class StageUiTestingAssets extends DefaultTask {
+    @InputFiles
+    @PathSensitive(PathSensitivity.RELATIVE)
+    abstract ConfigurableFileCollection getPackageDirectories()
+
+    @OutputDirectory
+    abstract DirectoryProperty getOutputDirectory()
+
+    @Inject
+    abstract FileSystemOperations getFileSystemOperations()
+
+    @TaskAction
+    void stage() {
+        def resourcePackage = packageDirectories.files.find { new File(it, "pingcore/resources.bin").isFile() }
+        if (resourcePackage == null) {
+            throw new GradleException("PingCore UI testing resource package is missing")
+        }
+        fileSystemOperations.sync {
+            from resourcePackage
+            into outputDirectory.dir("package")
+        }
+    }
+}
+
+def pingcoreTestingSdk = providers.gradleProperty("pingcoreTestingSdk").orElse("").get()
+
+android {
+    namespace = "org.pingcore.testing"
+    compileSdk = providers.gradleProperty("pingcoreCompileSdk").get().toInteger()
+    ndkVersion = providers.gradleProperty("pingcoreNdkVersion").get()
+
+    defaultConfig {
+        minSdk = providers.gradleProperty("pingcoreMinSdk").get().toInteger()
+        testInstrumentationRunner "org.pingcore.PingCoreUiTestingTest"
+        externalNativeBuild {
+            cmake {
+                targets "pingcore_ui_testing_smoke"
+                arguments "-DANDROID_STL=${providers.gradleProperty('pingcoreStl').get()}",
+                        "-DPINGCORE_TESTING_SDK=${pingcoreTestingSdk}"
+            }
+        }
+        ndk {
+            abiFilters(*providers.gradleProperty("pingcoreAbis").get().split(","))
+        }
+    }
+
+    sourceSets {
+        androidTest.java.srcDir "../../../tests/platform/android/ui_testing"
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_1_8
+        targetCompatibility = JavaVersion.VERSION_1_8
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("../../../tests/platform/android/ui_testing/CMakeLists.txt")
+        }
+    }
+}
+
+androidComponents.onVariants(androidComponents.selector().all()) { variant ->
+    def resourceRoot = layout.buildDirectory.dir("generated/resources/${variant.name}").get().asFile
+    variant.externalNativeBuild.arguments.add("-DPINGCORE_TESTING_RESOURCE_OUTPUT=${resourceRoot.absolutePath}")
+    def nativeLibraries = variant.artifacts.get(SingleArtifact.MERGED_NATIVE_LIBS.INSTANCE)
+    def stageAssets = tasks.register("stage${variant.name.capitalize()}UiTestingAssets", StageUiTestingAssets) {
+        packageDirectories.from(nativeLibraries.map { directory ->
+            new File(directory.asFile, "lib").listFiles()?.findAll { it.isDirectory() }?.collect {
+                new File(resourceRoot, "${it.name}/package")
+            } ?: []
+        })
+        outputDirectory.set(layout.buildDirectory.dir("generated/assets/${variant.name}"))
+    }
+    if (variant.androidTest != null) {
+        variant.androidTest.sources.assets.addGeneratedSourceDirectory(stageAssets) { it.outputDirectory }
+        def testApks = variant.androidTest.artifacts.get(SingleArtifact.APK.INSTANCE)
+        def verifyApk = tasks.register("verify${variant.name.capitalize()}Apk") {
+            inputs.dir(testApks)
+            doLast {
+                def apks = testApks.get().asFile.listFiles().findAll { it.name.endsWith(".apk") }
+                if (apks.empty) throw new GradleException("PingCore UI testing APK is missing")
+                apks.each { apk ->
+                    new ZipFile(apk).withCloseable { archive ->
+                        def entries = archive.entries().collect { it.name }
+                        if (entries.size() != entries.toSet().size()) {
+                            throw new GradleException("PingCore UI testing APK contains duplicate entries")
+                        }
+                        def libraries = entries.findAll { it.startsWith("lib/") && it.endsWith(".so") }
+                        def abis = libraries.collect { it.tokenize("/")[1] }.toSet()
+                        if (abis.empty) throw new GradleException("PingCore UI testing APK has no native libraries")
+                        abis.each { abi ->
+                            if (!entries.contains("lib/${abi}/libpingcore_ui_testing_smoke.so".toString())) {
+                                throw new GradleException("PingCore UI testing APK is missing ${abi}/libpingcore_ui_testing_smoke.so")
+                            }
+                            if (entries.contains("lib/${abi}/libpingcore.so".toString()) ||
+                                    entries.contains("lib/${abi}/libpingcore_testing.so".toString())) {
+                                throw new GradleException("PingCore UI testing APK must statically link the framework")
+                            }
+                        }
+                        if (!entries.contains("assets/package/pingcore/resources.bin")) {
+                            throw new GradleException("PingCore UI testing APK is missing its resource package")
+                        }
+                    }
+                }
+            }
+        }
+        tasks.matching { it.name == "connected${variant.name.capitalize()}AndroidTest" }.configureEach {
+            dependsOn(verifyApk)
+        }
+    }
+}

@@ -1,0 +1,59 @@
+# Design Documents
+
+These documents describe the current implementation, including ownership, invariants, platform boundaries, and extension contracts. Draft proposals and deferred behavior are marked explicitly.
+
+## Runtime and composition
+
+- [Architecture](architecture.md) describes the application, window, and host ownership boundaries.
+- [UI Testing](ui-testing.md): windowless Runtime ownership, observation lifetime, captures, distribution, and carriers.
+- [View Composition and Environment](view-composition.md): declaration, compilation, reconciliation, and composition boundaries.
+- [Composable Code Generation](composable-codegen.md): marker transformation, diagnostics, and CMake integration.
+- [Layout and Virtualization](layout.md): constraints, placement, layout metadata, and virtual item lifetime.
+- [Incremental Layout and Rendering](incremental-rendering.md): retained geometry, invalidation, scene construction, and damage.
+- [Interaction and Indication](interaction-indication.md): interaction facts, visuals, paint ordering, and customization.
+- [Gesture Recognition and Arbitration](gestures.md): recognition, competition, ownership, velocity, and cancellation.
+- [Scrolling](scrolling.md): input consumption, nested coordination, offsets, momentum, overscroll, and observation.
+- [RefreshBox](refresh-box.md): controlled refresh requests, overscroll handoff, retained presentation, and semantics.
+- [Typed Drag-and-Drop](drag-drop.md): typed payloads, targets, previews, auto-scroll, and cancellation.
+- [External File Drop](file-drop.md): host file offers, hover targets, asynchronous delivery, and retained file access.
+- [Animation and Scene Transitions](animation.md): timing, controllers, synchronized transitions, frozen scenes, custom effects through TransitionSpec, and [shared transitions](animation.md#shared-transitions) across pages and local changes.
+- [Platform Content Integration](platform-content.md) covers factories, bridge lifetimes, PlatformView composition, and ExternalTexture publication.
+
+## Application structure
+
+- [Application Activation and Lifecycle](application.md): cold start, later activation, lifecycle, and platform delivery.
+- [Window Presentation](window-presentation.md) covers layer ordering, captured Environment, focus, and dismissal.
+- [Navigation](navigation.md): stacks, typed routes, Back, URL history, activation integration, custom page transitions, and [shared-element transitions](navigation.md#shared-element-transitions).
+- [Indexed Pages](indexed-pages.md): retained peer pages and controlled selection.
+- [Pager](pager.md): controlled animated and directly draggable paging across retained peer pages.
+- [Split and Docking Layouts](split-and-docking.md): shared pane sizing, controlled resizing, docking, and panel retention.
+- [Window Insets and System Bars](window-insets.md): safe area, edge-to-edge content, and system-bar appearance.
+- [Window Chrome](window-chrome.md): system and custom desktop chrome.
+- [System Tray and Window Visibility](system-tray.md): tray presentation, window request handling, visibility, and application termination.
+- [Application Permissions](permissions.md): typed authorization, Task delivery, native policy, and platform mapping.
+- [Local Notifications](local-notifications.md): shared authorization, presentation, scheduling, activation, and target platform boundaries.
+- [Task and Structured Concurrency](tasks.md): task ownership, cancellation, and UI-thread resumption.
+- [System Tasks](system-tasks.md) defines BackgroundTask, ContinuedTask, and OngoingTask ownership, platform execution, stopping, and observation.
+
+## Content and services
+
+- [URI and Local File URI](uri.md): immutable syntax, retained serialization, file conversion, and activation boundaries.
+- [Text and Fonts](text.md): attributed paragraphs, links, logical selection, streaming, measurement, and platform caches.
+- [Text Input and TextField](text-input.md): editing values, sessions, geometry, IME, and secure input.
+- [Select](select.md): controlled finite choices, popup ownership, item identity, focus, and semantics.
+- [ComboBox](combo-box.md): controlled editable suggestions, TextField reuse, popup coordination, and semantics.
+- [Date and Time Pickers](date-time-pickers.md): chrono values, localized calendar and clock presentation, retained browsing, and semantics.
+- [Canvas and Path](canvas.md): vector paths, drawing, retention, and renderer mapping.
+- [Resources, Images, and Localization](resources.md): typed resources, packages, variants, and locale.
+- [Semantics and Accessibility](semantics.md): semantic frames, actions, identity, and platform bridges.
+- [Files and Application Storage](files.md): storage, external references, pickers, and platform mapping.
+- [HTTP Client](http.md): streaming, progress, cancellation, and platform transport ownership.
+
+## SDK and platforms
+
+- [SDK, CLI, Platform Shell, and Library](sdk-cli.md) covers SDK selection, project ownership, environment planning, builds, and library integration.
+- [mcpp Build System](mcpp-build-system.md) covers the mcpp build of the framework and applications on every supported platform and its relationship to CMake.
+- [Build System Integration (Draft)](../../buildtools/specs/build-system-integration.md) proposes a common contract for build-system integrations, which the [conformance suite](../../buildtools/cts/README.md) checks.
+- [Web Platform](web.md): browser lifecycle, rendering, input, resources, services, and integration limits.
+
+See the [documentation index](../README.md) for application and contributor workflows.

@@ -1,0 +1,39 @@
+---
+name: pingcore-app-development
+description: Develop, review, and troubleshoot PingCore apps and app-side libraries using the public SDK or mcpp package.
+---
+
+# PingCore App Development
+
+Use this skill for consumer projects. For framework development, follow the framework repository's own instructions.
+
+## Identify the build
+
+Use the selected SDK or resolved package revision as the authority for public APIs and build behavior. For an explicit source dependency, use that checkout's public contracts. Inspect the existing entry point, target, state ownership, and affected platform configuration before editing.
+
+Identify the project style first, then its build system:
+
+- A headers project writes `#include <pingcore/pingcore.h>` and carries `CMakeLists.txt`, an `mcpp.toml`, or both. Use the [project workflow](references/project-workflow.md) for SDK discovery, scaffolding, ABI selection, packaging, and windowless UI tests.
+- A C++ modules project writes `import pingcore;` in module units, carries `mcpp.toml` and a `build.mcpp` that imports `pingcore.rules`, and is built with mcpp. Use [C++ Modules and mcpp](references/cpp-modules-and-mcpp.md).
+- Use the [manual SDK workflow](references/mcpp-build.md) for existing mcpp projects that link SDK binaries directly.
+
+Keep the project's build system and compatible toolchain. Report build and run results for the host and affected platforms actually validated.
+
+Create a library with both declarations, `--build-system cmake,mcpp`, which is a library's default. Other libraries and applications consume a library, and both declarations let each of them include its headers or import it as a C++ module, while only the headers are maintained: the mcpp build generates the module interface from them. To give an existing headers library that interface, follow [Add C++ modules to an existing headers library](references/cpp-modules-and-mcpp.md#add-c-modules-to-an-existing-headers-library). An application has no consumer, so it keeps its single build system, headers with CMake by default.
+
+## Shared rules
+
+- Compose ordinary functions returning `View` by value. Mark reusable functions that call composition-bound hooks or need their own recomposition scope with `[[pingcore::composable]]`. Leave the application root unannotated.
+- Keep controlled values in app state, including the complete `TextEditingValue` for `TextField`. Use stable semantic keys for dynamic stateful siblings. Read `State<T>` through conversion or `state->member` where supported. See [State](references/fundamentals.md#state) for deduction and overload cases.
+- Follow [DSL style](references/dsl-style.md) in UI declarations and snippets. Use built-in layouts, themes, events, modifiers, and services before extending them. Prefer generated `ImageResource` values for static artwork and SVG for scalable in-UI assets.
+- Use `platform` for platform implementations, windows, objects, capabilities, and bridges. Use `system` for operating-system scheduling, tasks, requests, and assigned identifiers. Omit qualifiers when the context suffices. Preserve JNI/NDK, Java `native`, native handles to C++ objects, native libraries, and fixed external names.
+- Confirm public renames before changing them, then migrate callers, tests, examples, documentation, and affected bindings or exports together. Preserve threading, ownership, and lifetime. Omit unused callback parameter names.
+
+## Read by task
+
+- For component and state work, read [composition, state, and tasks](references/fundamentals.md), [built-in controls](references/components.md), or [layout and virtualization](references/layout-and-ui.md).
+- For interaction, read [modifiers and mounted View targets](references/modifiers.md), [gestures and drag-and-drop](references/gestures-and-drag-drop.md), or [retained node extensions](references/node-extensions.md).
+- For appearance and rendering, read [theme, animation, and presentation](references/theme-animation-presentation.md), [text editing and accessibility](references/text-input-and-semantics.md), or [Canvas and external textures](references/canvas-paint-and-images.md).
+- For app services, read [navigation and windows](references/navigation-and-window.md), [resources, files, and network](references/resources-files-network.md), [local notifications](references/local-notifications.md), or [system tasks](references/fundamentals.md#system-tasks).
+- For platform integration, read [platform modules](references/platform-modules.md) for services and [platform views](references/platform-views.md) for embedded controls.
+- Use the [public API index](references/api-index.md) to find headers and focused references.

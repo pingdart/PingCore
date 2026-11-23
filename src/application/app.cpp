@@ -1,0 +1,70 @@
+#include <pingcore/app.h>
+
+#include <algorithm>
+#include <cmath>
+#include <stdexcept>
+#include <utility>
+#include <vector>
+
+namespace pingcore {
+
+namespace {
+
+std::vector<const Application*>& Applications() {
+  static std::vector<const Application*> applications;
+  return applications;
+}
+
+} // namespace
+
+namespace detail {
+
+#if defined(__EMSCRIPTEN__)
+void EnsureWebPlatformLinked();
+#endif
+
+const Application& CurrentApplication() {
+  const auto& applications = Applications();
+  if (applications.empty()) {
+    throw std::logic_error("PingCore application has not been declared");
+  }
+  if (applications.size() != 1) {
+    throw std::logic_error("PingCore application declaration is not unique");
+  }
+  return *applications.front();
+}
+
+} // namespace detail
+
+Application::Application(RootFactory root_factory, AppOptions options)
+    : root_factory(root_factory), options(std::move(options)) {
+  if (root_factory == nullptr) {
+    throw std::invalid_argument("PingCore application requires a root factory");
+  }
+  const double stop_timeout = this->options.system_task_stop_timeout.count();
+  if (!std::isfinite(stop_timeout) || stop_timeout <= 0.0) {
+    throw std::invalid_argument("PingCore system task stop timeout must be positive and finite");
+  }
+#if defined(__EMSCRIPTEN__)
+  detail::EnsureWebPlatformLinked();
+#endif
+  Applications().push_back(this);
+}
+
+Application::~Application() {
+  auto& applications = Applications();
+  const auto found = std::find(applications.begin(), applications.end(), this);
+  if (found != applications.end()) {
+    applications.erase(found);
+  }
+}
+
+int RunApplication() {
+#if defined(__ANDROID__) || defined(__EMSCRIPTEN__)
+  throw std::runtime_error("RunApplication() is not available on Android or Web");
+#else
+  return detail::RunPlatformApplication(detail::CurrentApplication());
+#endif
+}
+
+} // namespace pingcore

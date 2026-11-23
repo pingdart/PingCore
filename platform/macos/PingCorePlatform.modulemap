@@ -1,0 +1,5 @@
+module PingCorePlatform {
+  header "pingcore/macos/platform_registry.h"
+  header "pingcore/macos/external_texture.h"
+  export *
+}

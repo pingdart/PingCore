@@ -1,0 +1,1175 @@
+#include <catch2/catch_amalgamated.hpp>
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <future>
+#include <iterator>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <pingcore/file.h>
+#include <pingcore/paint.h>
+#include <pingcore/resource.h>
+
+#include "compiler.h"
+#include "image_test_support.h"
+#include "graphics/path_internal.h"
+#include "resources/resource_internal.h"
+#include "runtime_test_support.h"
+#include "internal_access.h"
+
+namespace {
+
+class TemporaryDirectory {
+public:
+  TemporaryDirectory() {
+    path_ = std::filesystem::temp_directory_path() /
+            ("hrc-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(path_);
+  }
+
+  ~TemporaryDirectory() {
+    std::error_code error;
+    std::filesystem::remove_all(path_, error);
+  }
+
+  [[nodiscard]] const std::filesystem::path& Path() const noexcept {
+    return path_;
+  }
+
+private:
+  std::filesystem::path path_;
+};
+
+void Write(const std::filesystem::path& path, std::string_view value) {
+  std::filesystem::create_directories(path.parent_path());
+  std::ofstream stream(path, std::ios::binary);
+  REQUIRE(stream);
+  stream << value;
+  REQUIRE(stream);
+}
+
+void Write(const std::filesystem::path& path, std::span<const std::byte> value) {
+  std::filesystem::create_directories(path.parent_path());
+  std::ofstream stream(path, std::ios::binary);
+  REQUIRE(stream);
+  if (!value.empty()) {
+    stream.write(reinterpret_cast<const char*>(value.data()), static_cast<std::streamsize>(value.size()));
+  }
+  REQUIRE(stream);
+}
+
+std::string Read(const std::filesystem::path& path) {
+  std::ifstream stream(path, std::ios::binary);
+  REQUIRE(stream);
+  return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+}
+
+std::filesystem::path PathFromUtf8(std::string_view value) {
+  std::u8string utf8(value.size(), u8'\0');
+  if (!value.empty()) {
+    std::memcpy(utf8.data(), value.data(), value.size());
+  }
+  return std::filesystem::path(std::move(utf8));
+}
+
+class DirectoryResources final : public pingcore::PlatformResources {
+public:
+  explicit DirectoryResources(std::filesystem::path root) : root_(std::move(root)) {}
+
+  pingcore::ResourceConfiguration Configuration() const override {
+    return {};
+  }
+
+  std::optional<pingcore::InputStream> OpenRead(std::string_view package_path) override {
+    const std::filesystem::path path = root_ / PathFromUtf8(package_path);
+    return pingcore::detail::OpenPackageFile(path);
+  }
+
+private:
+  std::filesystem::path root_;
+};
+
+pingcore::View VectorResourceApp() {
+  return pingcore::Image(pingcore::ImageResource("test_app", "images/mark"));
+}
+
+pingcore::VectorAsset CompileVectorResource(
+    const std::filesystem::path& temporary, std::string_view svg, std::string_view output_name = "vector-output"
+) {
+  const std::filesystem::path root = temporary / "vector-assets";
+  const std::filesystem::path output = temporary / output_name;
+  Write(root / "images" / "mark.svg", svg);
+  pingcore::resource_compiler::Compile({root, output, "test_app"});
+  DirectoryResources resources(output / "package");
+  auto app_resources_owner = std::make_shared<pingcore::detail::AppResources>(&resources);
+  auto& app_resources = *app_resources_owner;
+  return app_resources.ResolveVector(pingcore::ImageResource("test_app", "images/mark"), pingcore::Locale::Default());
+}
+
+TEST_CASE("ResourceCompilerGeneratesTypedKeysIndexAndPayloads") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "assets";
+  const std::filesystem::path output = temporary.Path() / "output";
+  Write(root / "raw" / "config.json", "{\"enabled\":true}\n");
+  Write(root / "strings" / "default.properties", "title = \"Hello {0}\"\n");
+  Write(root / "strings" / "zh.properties", "title = \"你好，{0}\"\n");
+
+  pingcore::resource_compiler::Compile({root, output, "test_app"});
+
+  const std::string header = Read(output / "include" / "test_app_resources.h");
+  REQUIRE(header.find("namespace test_app {") != std::string::npos);
+  REQUIRE(header.find("namespace test_app_resources") == std::string::npos);
+  REQUIRE(header.find("pingcore::RawResource config_json") != std::string::npos);
+  REQUIRE(header.find("pingcore::StringResource title") != std::string::npos);
+  REQUIRE(Read(output / "package" / "pingcore" / "test_app" / "raw" / "config.json") == "{\"enabled\":true}\n");
+  const std::string index = Read(output / "package" / "pingcore" / "resources.bin");
+  REQUIRE(index.size() > 16);
+  REQUIRE(std::string_view(index.data(), 8) == std::string_view("HUXRES\0\0", 8));
+  REQUIRE(static_cast<unsigned char>(index[8]) == 1);
+  REQUIRE(index[9] == 0);
+  REQUIRE(index[10] == 0);
+  REQUIRE(index[11] == 0);
+  REQUIRE_FALSE(std::filesystem::exists(output / "resources.stamp"));
+}
+
+TEST_CASE("IndependentResourcePackagesResolveTheirOwnKeysWithoutARuntime") {
+  using namespace pingcore;
+  TemporaryDirectory temporary;
+  const auto root = temporary.Path() / "assets";
+  const auto output = temporary.Path() / "first";
+  Write(root / "strings" / "default.properties", "title = Hello {0}\n");
+  Write(root / "strings" / "fr.properties", "title = Bonjour {0}\n");
+  Write(root / "images" / "icon.png", test::MakeTestPng(8, 4));
+  Write(root / "images" / "icon@2x.png", test::MakeTestPng(16, 8));
+  Write(root / "images" / "mark.svg", R"svg(<svg viewBox="0 0 8 4"><path d="M0 0 L8 0 L0 4 Z"/></svg>)svg");
+  resource_compiler::Compile({root, output, "test_app"});
+  const auto package = Resources::OpenPackage(File((output / "package").generic_u8string()));
+  const auto title = StringVariant::Format(StringResource("test_app", "strings/title"), "Ada");
+  const ResourceConfiguration configuration{Locale::FromLanguageTag("fr-CA"), 2.0F};
+  const ImageResource icon("test_app", "images/icon");
+  REQUIRE(package.Configuration() == ResourceConfiguration{});
+  REQUIRE(package.GetString(title) == "Hello Ada");
+  REQUIRE(package.GetString(title, configuration) == "Bonjour Ada");
+  REQUIRE(package.GetImage(icon).PixelWidth() == 8);
+  REQUIRE(package.GetImage(icon, configuration).PixelWidth() == 16);
+  REQUIRE(package.GetVectorImage(ImageResource("test_app", "images/mark")).IntrinsicSize() == Size{8.0F, 4.0F});
+
+  const auto other_output = temporary.Path() / "second";
+  Write(root / "strings" / "default.properties", "title = Welcome {0}\n");
+  resource_compiler::Compile({root, other_output, "test_app"});
+  const auto other = Resources::OpenPackage(File((other_output / "package").generic_u8string()));
+  REQUIRE(other.GetString(title) == "Welcome Ada");
+  REQUIRE(package.GetString(title) == "Hello Ada");
+  REQUIRE_THROWS_AS(package.GetString(StringResource("test_app", "strings/missing")), std::logic_error);
+}
+
+TEST_CASE("IndependentRawResourceReadsFollowThePackageLifetime") {
+  using namespace pingcore;
+  TemporaryDirectory temporary;
+  const auto root = temporary.Path() / "assets";
+  const auto output = temporary.Path() / "output";
+  Write(root / "raw" / "data.txt", "payload");
+  resource_compiler::Compile({root, output, "test_app"});
+  const RawResource key("test_app", "raw/data.txt");
+  RawAsset asset;
+  auto opened = [&] {
+    const auto package = Resources::OpenPackage(File((output / "package").generic_u8string()));
+    asset = package.GetRawResource(key);
+    REQUIRE(asset.HasValue());
+    return asset.OpenRead();
+  }();
+  REQUIRE_THROWS_AS(asset.OpenRead(), std::logic_error);
+  std::array<std::byte, 7> bytes{};
+  const auto read = opened.Read(bytes);
+  REQUIRE(read.Succeeded());
+  REQUIRE(read.Value() == bytes.size());
+  REQUIRE(std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()) == "payload");
+}
+
+#if !defined(__EMSCRIPTEN__)
+TEST_CASE("IndependentResourcePackagesSupportConcurrentLookup") {
+  using namespace pingcore;
+  TemporaryDirectory temporary;
+  const auto root = temporary.Path() / "assets";
+  const auto output = temporary.Path() / "output";
+  Write(root / "raw" / "data.txt", "payload");
+  Write(root / "images" / "icon.png", test::MakeTestPng(8, 4));
+  resource_compiler::Compile({root, output, "test_app"});
+  const auto package = Resources::OpenPackage(File((output / "package").generic_u8string()));
+  const RawResource raw("test_app", "raw/data.txt");
+  const ImageResource icon("test_app", "images/icon");
+
+  std::promise<void> ready;
+  const auto start = ready.get_future().share();
+  auto lookup = [&] {
+    start.wait();
+    return std::pair{package.GetRawResource(raw), package.GetImage(icon)};
+  };
+  auto first = std::async(std::launch::async, lookup);
+  ready.set_value();
+
+  const auto [second_raw, second_image] = lookup();
+  const auto [first_raw, first_image] = first.get();
+  REQUIRE(first_raw.ReadString() == "payload");
+  REQUIRE(second_raw == first_raw);
+  REQUIRE(first_image.PixelWidth() == 8);
+  REQUIRE(second_image.EncodedBytes().data() == first_image.EncodedBytes().data());
+  REQUIRE(package.GetImage(icon).EncodedBytes().data() == first_image.EncodedBytes().data());
+}
+#endif
+
+TEST_CASE("IndependentResourcePackagesRequireAValidIndex") {
+  using namespace pingcore;
+  TemporaryDirectory temporary;
+  const File directory(temporary.Path().generic_u8string());
+  const auto index = temporary.Path() / "pingcore" / "resources.bin";
+  SECTION("Missing") {}
+  SECTION("Empty") { Write(index, std::string_view{}); }
+  SECTION("Invalid signature") { Write(index, "invalid"); }
+  SECTION("Truncated entry table") {
+    const std::string_view truncated("HUXRES\0\0\1\0\0\0\xff\xff\xff\xff", 16);
+    Write(index, truncated);
+  }
+  REQUIRE_THROWS_AS(Resources::OpenPackage(directory), std::logic_error);
+}
+
+TEST_CASE("ResourceCompilerRejectsAnEmptyResourceRoot") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "assets";
+  const std::filesystem::path output = temporary.Path() / "output";
+  Write(root / "strings" / "default.properties", "");
+
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, output, "test_app"}),
+      Catch::Matchers::ContainsSubstring("resource root does not contain any supported resources")
+  );
+}
+
+TEST_CASE("ResourceCompilerAcceptsACustomGeneratedHeaderName") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "assets";
+  const std::filesystem::path output = temporary.Path() / "output";
+  Write(root / "strings" / "default.properties", "title = Hello\n");
+
+  pingcore::resource_compiler::Compile({root, output, "test_app", "builtin_resources.h"});
+
+  const std::string header = Read(output / "include" / "builtin_resources.h");
+  REQUIRE(header.find("namespace test_app {") != std::string::npos);
+  REQUIRE_FALSE(std::filesystem::exists(output / "include" / "test_app_resources.h"));
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, output, "test_app", "nested/builtin_resources.h"}),
+      "resource header name must be a .h filename without a directory"
+  );
+}
+
+TEST_CASE("ResourceCompilerRejectsInvalidMessagePlaceholders") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "assets";
+  Write(root / "strings" / "default.properties", "title = \"Hello {name}\"\n");
+
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "output", "test_app"}),
+      "localized string contains an invalid positional placeholder"
+  );
+}
+
+TEST_CASE("ResourceCompilerRejectsLegacyTextCatalogs") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "assets";
+  Write(root / "strings" / "default.txt", "title = Legacy\n");
+
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "output", "test_app"}),
+      Catch::Matchers::ContainsSubstring("string catalog must use the .properties extension")
+  );
+}
+
+TEST_CASE("ResourceCompilerRejectsGeneratedIdentifierCollisions") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "assets";
+  Write(root / "raw" / "a-b.txt", "first");
+  Write(root / "raw" / "a_b.txt", "second");
+
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "output", "test_app"}),
+      "resource keys generate the same C++ identifier: raw/a-b.txt and raw/a_b.txt"
+  );
+}
+
+TEST_CASE("ResourceCompilerEscapesReservedGeneratedIdentifiers") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "assets";
+  const std::filesystem::path output = temporary.Path() / "output";
+  Write(root / "raw" / "class", "reserved");
+
+  pingcore::resource_compiler::Compile({root, output, "test_app"});
+
+  REQUIRE(Read(output / "include" / "test_app_resources.h").find("resource_class") != std::string::npos);
+}
+
+TEST_CASE("ResourceCompilerRejectsReservedNamespacesAndInvalidKeys") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "assets";
+  Write(root / "raw" / "config.txt", "value");
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "reserved", "class"}),
+      "resource namespace must be a non-reserved C++ identifier"
+  );
+
+  Write(root / "strings" / "default.properties", "bad:key = value\n");
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "invalid-key", "test_app"}),
+      Catch::Matchers::ContainsSubstring("resource path is not package-relative")
+  );
+
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "invalid-namespace", "test_app_"}),
+      "resource namespace must be a non-reserved C++ identifier"
+  );
+}
+
+TEST_CASE("ResourceCompilerRemovesStalePackagedPayloads") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "assets";
+  const std::filesystem::path output = temporary.Path() / "output";
+  const std::filesystem::path old_source = root / "raw" / "old.txt";
+  const std::filesystem::path old_output = output / "package" / "pingcore" / "test_app" / "raw" / "old.txt";
+  Write(old_source, "old");
+  pingcore::resource_compiler::Compile({root, output, "test_app"});
+  REQUIRE(std::filesystem::exists(old_output));
+
+  REQUIRE(std::filesystem::remove(old_source));
+  Write(root / "raw" / "new.txt", "new");
+  pingcore::resource_compiler::Compile({root, output, "test_app"});
+
+  REQUIRE_FALSE(std::filesystem::exists(old_output));
+  REQUIRE(Read(output / "package" / "pingcore" / "test_app" / "raw" / "new.txt") == "new");
+}
+
+TEST_CASE("ResourceCompilerRemovesOutputsFromThePreviousNamespace") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "assets";
+  const std::filesystem::path output = temporary.Path() / "output";
+  Write(root / "raw" / "value.txt", "value");
+
+  pingcore::resource_compiler::Compile({root, output, "old_app"});
+  REQUIRE(std::filesystem::exists(output / "include" / "old_app_resources.h"));
+  REQUIRE(std::filesystem::exists(output / "package" / "pingcore" / "old_app"));
+
+  pingcore::resource_compiler::Compile({root, output, "new_app"});
+  REQUIRE_FALSE(std::filesystem::exists(output / "include" / "old_app_resources.h"));
+  REQUIRE_FALSE(std::filesystem::exists(output / "package" / "pingcore" / "old_app"));
+  REQUIRE(std::filesystem::exists(output / "include" / "new_app_resources.h"));
+}
+
+TEST_CASE("ResourceCompilerMergesPackagesInDeclarationOrder") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path base_root = temporary.Path() / "base";
+  const std::filesystem::path library_root = temporary.Path() / "library";
+  const std::filesystem::path override_root = temporary.Path() / "override";
+  const std::filesystem::path base_output = temporary.Path() / "base-output";
+  const std::filesystem::path library_output = temporary.Path() / "library-output";
+  const std::filesystem::path override_output = temporary.Path() / "override-output";
+  const std::filesystem::path merged_output = temporary.Path() / "merged-output";
+
+  Write(base_root / "raw" / "config.txt", "base");
+  Write(base_root / "raw" / "kept.txt", "kept");
+  Write(base_root / "strings" / "default.properties", "title = Hello {0}\n");
+  Write(base_root / "strings" / "zh.properties", "title = 你好，{0}\n");
+  Write(base_root / "images" / "icon.png", pingcore::test::MakeTestPng(8, 4));
+  Write(base_root / "images" / "mark.svg", R"(<svg viewBox="0 0 8 4"><path d="M0 0L8 4"/></svg>)");
+  Write(library_root / "raw" / "tool.txt", "library");
+  Write(override_root / "raw" / "config.txt", "override");
+  Write(override_root / "strings" / "default.properties", "title = Welcome {0}\n");
+  Write(override_root / "images" / "icon@2x.png", pingcore::test::MakeTestPng(16, 8));
+  Write(override_root / "images" / "mark.png", pingcore::test::MakeTestPng(8, 4));
+
+  pingcore::resource_compiler::Compile({base_root, base_output, "app"});
+  pingcore::resource_compiler::Compile({library_root, library_output, "editor"});
+  pingcore::resource_compiler::Compile({override_root, override_output, "app"});
+  pingcore::resource_compiler::Merge(
+      {{base_output / "package", library_output / "package", override_output / "package"}, merged_output}
+  );
+
+  REQUIRE(std::filesystem::exists(merged_output / "include" / "app_resources.h"));
+  REQUIRE(std::filesystem::exists(merged_output / "include" / "editor_resources.h"));
+  REQUIRE_FALSE(std::filesystem::exists(merged_output / "package" / "pingcore" / "app" / "images" / "mark.huxv"));
+  REQUIRE(std::filesystem::exists(merged_output / "package" / "pingcore" / "app" / "images" / "mark.png"));
+  REQUIRE(std::filesystem::exists(merged_output / "package" / "pingcore" / "app" / "images" / "icon.png"));
+  REQUIRE(std::filesystem::exists(merged_output / "package" / "pingcore" / "app" / "images" / "icon@2x.png"));
+
+  DirectoryResources platform(merged_output / "package");
+  auto resources_owner = std::make_shared<pingcore::detail::AppResources>(&platform);
+  auto& resources = *resources_owner;
+  REQUIRE(resources.Resolve(pingcore::RawResource("app", "raw/config.txt")).ReadString() == "override");
+  REQUIRE(resources.Resolve(pingcore::RawResource("app", "raw/kept.txt")).ReadString() == "kept");
+  REQUIRE(resources.Resolve(pingcore::RawResource("editor", "raw/tool.txt")).ReadString() == "library");
+  REQUIRE(
+      resources.Resolve(pingcore::StringResource("app", "strings/title"), pingcore::Locale::Default()).value ==
+      "Welcome {0}"
+  );
+  REQUIRE(
+      resources.Resolve(pingcore::StringResource("app", "strings/title"), pingcore::Locale::FromLanguageTag("zh"))
+          .value == "你好，{0}"
+  );
+  const pingcore::ImageAsset image =
+      resources.Resolve(pingcore::ImageResource("app", "images/mark"), pingcore::Locale::Default());
+  REQUIRE(image.PixelWidth() == 8);
+  REQUIRE(image.PixelHeight() == 4);
+
+  const std::filesystem::path reversed_output = temporary.Path() / "reversed-output";
+  pingcore::resource_compiler::Merge({{override_output / "package", base_output / "package"}, reversed_output});
+  DirectoryResources reversed_platform(reversed_output / "package");
+  auto reversed_resources_owner = std::make_shared<pingcore::detail::AppResources>(&reversed_platform);
+  auto& reversed_resources = *reversed_resources_owner;
+  REQUIRE(reversed_resources.Resolve(pingcore::RawResource("app", "raw/config.txt")).ReadString() == "base");
+  REQUIRE(std::filesystem::exists(reversed_output / "package" / "pingcore" / "app" / "images" / "mark.huxv"));
+  REQUIRE_FALSE(std::filesystem::exists(reversed_output / "package" / "pingcore" / "app" / "images" / "mark.png"));
+}
+
+TEST_CASE("ResourceCompilerValidatesMergedResourceFamilies") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path first_root = temporary.Path() / "first";
+  const std::filesystem::path second_root = temporary.Path() / "second";
+  const std::filesystem::path first_output = temporary.Path() / "first-output";
+  const std::filesystem::path second_output = temporary.Path() / "second-output";
+  Write(first_root / "images" / "logo.png", pingcore::test::MakeTestPng(8, 4));
+  Write(second_root / "images" / "logo@2x.png", pingcore::test::MakeTestPng(18, 8));
+  Write(first_root / "strings" / "default.properties", "title = {0} {1}\n");
+  Write(first_root / "strings" / "zh.properties", "title = {1}\n");
+  Write(second_root / "strings" / "default.properties", "title = {0}\n");
+  pingcore::resource_compiler::Compile({first_root, first_output, "app"});
+  pingcore::resource_compiler::Compile({second_root, second_output, "app"});
+
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Merge(
+          {{first_output / "package", second_output / "package"}, temporary.Path() / "merged"}
+      ),
+      Catch::Matchers::ContainsSubstring("image scale variants must have the same intrinsic logical size")
+  );
+
+  REQUIRE(std::filesystem::remove(second_root / "images" / "logo@2x.png"));
+  pingcore::resource_compiler::Compile({second_root, second_output, "app"});
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Merge(
+          {{first_output / "package", second_output / "package"}, temporary.Path() / "merged"}
+      ),
+      Catch::Matchers::ContainsSubstring("localized string references an undeclared argument")
+  );
+}
+
+TEST_CASE("ResourceCompilerRejectsMergedPayloadHashMismatches") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "resources";
+  const std::filesystem::path generated = temporary.Path() / "generated";
+  Write(root / "raw" / "config.txt", "original");
+  pingcore::resource_compiler::Compile({root, generated, "app"});
+  Write(generated / "package" / "pingcore" / "app" / "raw" / "config.txt", "modified");
+
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Merge({{generated / "package"}, temporary.Path() / "merged"}),
+      Catch::Matchers::ContainsSubstring("payload hash does not match")
+  );
+}
+
+TEST_CASE("ResourceCompilerMergeRejectsUnsupportedIndexVersions") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "resources";
+  const std::filesystem::path generated = temporary.Path() / "generated";
+  Write(root / "raw" / "config.txt", "value");
+  pingcore::resource_compiler::Compile({root, generated, "app"});
+
+  const std::filesystem::path index_path = generated / "package" / "pingcore" / "resources.bin";
+  std::string index = Read(index_path);
+  index[8] = 2;
+  Write(index_path, index);
+
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Merge({{generated / "package"}, temporary.Path() / "merged"}),
+      Catch::Matchers::ContainsSubstring("resource index version is unsupported: 2")
+  );
+}
+
+TEST_CASE("ResourceCompilerRejectsUnsafeGeneratedStringLiteralsAndTruncatedImages") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "assets";
+  Write(root / "strings" / "default.properties", "bad\"key = value\n");
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "unsafe", "test_app"}),
+      Catch::Matchers::ContainsSubstring("resource path is not package-relative")
+  );
+
+  REQUIRE(std::filesystem::remove(root / "strings" / "default.properties"));
+  std::vector<std::byte> truncated = pingcore::test::MakeTestPng(2, 2);
+  truncated.resize(24);
+  Write(root / "images" / "broken.png", truncated);
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "truncated", "test_app"}),
+      Catch::Matchers::ContainsSubstring("invalid IHDR")
+  );
+}
+
+TEST_CASE("GeneratedPackagesRoundTripThroughRuntimeResolution") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "assets";
+  const std::filesystem::path output = temporary.Path() / "output";
+  Write(root / "raw" / "config.txt", "enabled");
+  const std::string unicode_name = "\xE9\x85\x8D\xE7\xBD\xAE.txt";
+  Write(root / "raw" / PathFromUtf8(unicode_name), "unicode");
+  Write(root / "strings" / "default.properties", "title = Hello {0}\n");
+  const std::vector<std::byte> image = pingcore::test::MakeTestPng(8, 4);
+  Write(root / "images" / "logo.png", image);
+
+  pingcore::resource_compiler::Compile({root, output, "test_app"});
+
+  DirectoryResources platform(output / "package");
+  auto resources_owner = std::make_shared<pingcore::detail::AppResources>(&platform);
+  auto& resources = *resources_owner;
+  REQUIRE(resources.Resolve(pingcore::RawResource("test_app", "raw/config.txt")).ReadString() == "enabled");
+  REQUIRE(resources.Resolve(pingcore::RawResource("test_app", "raw/" + unicode_name)).ReadString() == "unicode");
+  const pingcore::detail::ResolvedStringResource title =
+      resources.Resolve(pingcore::StringResource("test_app", "strings/title"), pingcore::Locale::Default());
+  REQUIRE(title.value == "Hello {0}");
+  REQUIRE(title.argument_count == 1);
+  const pingcore::ImageAsset logo =
+      resources.Resolve(pingcore::ImageResource("test_app", "images/logo"), pingcore::Locale::Default());
+  REQUIRE(logo.PixelWidth() == 8);
+  REQUIRE(logo.PixelHeight() == 4);
+  REQUIRE_THROWS_AS(
+      resources.ResolveVector(pingcore::ImageResource("test_app", "images/logo"), pingcore::Locale::Default()),
+      std::invalid_argument
+  );
+}
+
+TEST_CASE("SvgResourcesCompileToTypedVectorPayloads") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "assets";
+  const std::filesystem::path output = temporary.Path() / "output";
+  Write(
+      root / "images" / "mark.svg",
+      R"(<svg width="24" height="16" viewBox="0 0 24 16" xmlns="http://www.w3.org/2000/svg">
+  <path d="M 2 2 L 22 2 L 12 14 Z" fill="#336699"/>
+</svg>)"
+  );
+
+  pingcore::resource_compiler::Compile({root, output, "test_app"});
+
+  const std::string header = Read(output / "include" / "test_app_resources.h");
+  REQUIRE(header.find("pingcore::ImageResource mark") != std::string::npos);
+  const std::string payload = Read(output / "package" / "pingcore" / "test_app" / "images" / "mark.huxv");
+  REQUIRE(payload.starts_with("HUXVEC"));
+  REQUIRE(payload.size() >= 12);
+  REQUIRE(static_cast<unsigned char>(payload[8]) == 1U);
+
+  DirectoryResources platform_resources(output / "package");
+  auto resources_owner = std::make_shared<pingcore::detail::AppResources>(&platform_resources);
+  auto& resources = *resources_owner;
+  const pingcore::ImageResource resource("test_app", "images/mark");
+  const pingcore::VectorAsset vector = resources.ResolveVector(resource, pingcore::Locale::Default());
+  REQUIRE(vector.IntrinsicSize() == pingcore::Size{24.0F, 16.0F});
+  REQUIRE_THROWS_AS(resources.Resolve(resource, pingcore::Locale::Default()), std::invalid_argument);
+
+  pingcore::test::TestPlatform platform;
+  platform.platform_resources = &platform_resources;
+  pingcore::test::UiWindow runtime{VectorResourceApp, platform};
+  runtime.SetWindowMetrics({.viewport = {100.0F, 100.0F}});
+  const pingcore::test::FlattenedScene& scene = runtime.BuildFrame();
+  REQUIRE(std::ranges::any_of(scene.Commands(), [](const pingcore::PaintCommand& command) {
+    return std::holds_alternative<pingcore::FillPathCommand>(command);
+  }));
+  REQUIRE(std::ranges::none_of(scene.Commands(), [](const pingcore::PaintCommand& command) {
+    return std::holds_alternative<pingcore::DrawImageCommand>(command);
+  }));
+}
+
+TEST_CASE("SvgResourcesPreserveNormalizedDashStyles") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "assets";
+  const std::filesystem::path output = temporary.Path() / "output";
+  Write(
+      root / "images" / "dashed.svg",
+      R"(<svg width="24" height="16" viewBox="0 0 24 16" xmlns="http://www.w3.org/2000/svg">
+  <g fill="none" stroke="#336699" stroke-width="2" stroke-linecap="round" stroke-linejoin="bevel"
+     stroke-miterlimit="1" stroke-dasharray="3px, 1 2px" stroke-dashoffset="-2">
+    <path d="M 2 8 L 22 8"/>
+  </g>
+</svg>)"
+  );
+
+  pingcore::resource_compiler::Compile({root, output, "test_app"});
+  DirectoryResources platform(output / "package");
+  auto resources_owner = std::make_shared<pingcore::detail::AppResources>(&platform);
+  auto& resources = *resources_owner;
+  const pingcore::VectorAsset vector =
+      resources.ResolveVector(pingcore::ImageResource("test_app", "images/dashed"), pingcore::Locale::Default());
+  pingcore::PaintSequence sequence;
+  pingcore::PaintContext context(sequence, {0.0F, 0.0F, 24.0F, 16.0F});
+  context.DrawImage(vector, {0.0F, 0.0F, 24.0F, 16.0F});
+  context.Finish();
+
+  const auto stroke = std::ranges::find_if(sequence.Commands(), [](const pingcore::PaintCommand& command) {
+    return std::holds_alternative<pingcore::StrokePathCommand>(command);
+  });
+  REQUIRE(stroke != sequence.Commands().end());
+  const pingcore::StrokeStyle& style = std::get<pingcore::StrokePathCommand>(*stroke).style;
+  REQUIRE(style.width == 2.0F);
+  REQUIRE(style.cap == pingcore::StrokeCap::Round);
+  REQUIRE(style.join == pingcore::StrokeJoin::Bevel);
+  REQUIRE(style.miter_limit == 1.0F);
+  REQUIRE(style.dash_pattern == std::vector<float>{3.0F, 1.0F, 2.0F, 3.0F, 1.0F, 2.0F});
+  REQUIRE(style.dash_offset == 10.0F);
+}
+
+TEST_CASE("SvgResourcesRejectMalformedStrokeStyles") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "assets";
+  const std::filesystem::path source = root / "images" / "dashed.svg";
+
+  Write(source, R"(<svg viewBox="0 0 10 10"><path stroke="#000" stroke-dasharray="1px2px" d="M0 0L10 10"/></svg>)");
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "joined", "test_app"}),
+      Catch::Matchers::ContainsSubstring("stroke-dasharray lengths must be separated")
+  );
+
+  Write(source, R"(<svg viewBox="0 0 10 10"><path stroke="#000" stroke-dasharray="2 -1" d="M0 0L10 10"/></svg>)");
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "negative", "test_app"}),
+      Catch::Matchers::ContainsSubstring("stroke-dasharray lengths must be non-negative")
+  );
+
+  Write(source, R"(<svg viewBox="0 0 10 10"><path stroke="#000" stroke-dasharray=",1 2" d="M0 0L10 10"/></svg>)");
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "leading-empty", "test_app"}),
+      Catch::Matchers::ContainsSubstring("stroke-dasharray must not contain empty lengths")
+  );
+
+  Write(source, R"(<svg viewBox="0 0 10 10"><path stroke="#000" stroke-dasharray="1,,2" d="M0 0L10 10"/></svg>)");
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "middle-empty", "test_app"}),
+      Catch::Matchers::ContainsSubstring("stroke-dasharray must not contain empty lengths")
+  );
+
+  Write(source, R"(<svg viewBox="0 0 10 10"><path stroke="#000" stroke-dasharray="1 2," d="M0 0L10 10"/></svg>)");
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "trailing-empty", "test_app"}),
+      Catch::Matchers::ContainsSubstring("stroke-dasharray must not contain empty lengths")
+  );
+
+  Write(source, R"(<svg viewBox="0 0 10 10"><path stroke="#000" stroke-miterlimit="0.5" d="M0 0L10 10"/></svg>)");
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "small-miter", "test_app"}),
+      Catch::Matchers::ContainsSubstring("stroke-miterlimit must be at least one")
+  );
+}
+
+TEST_CASE("SvgResourcesRejectElementsOutsideTheRootAndCompileStaticPresentationSemantics") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "assets";
+  const std::filesystem::path source = root / "images" / "mark.svg";
+
+  Write(source, R"(<path d="M0 0L1 1"/><svg viewBox="0 0 10 10"/>)");
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "outside", "test_app"}),
+      Catch::Matchers::ContainsSubstring("inside the root svg element")
+  );
+
+  Write(source, R"(<svg viewBox="0 0 10 10" preserveAspectRatio="none"/>)");
+  REQUIRE_NOTHROW(pingcore::resource_compiler::Compile({root, temporary.Path() / "aspect", "test_app"}));
+
+  Write(source, R"(<svg viewBox="0 0 10 10"><g visibility="hidden"/></svg>)");
+  REQUIRE_NOTHROW(pingcore::resource_compiler::Compile({root, temporary.Path() / "visibility", "test_app"}));
+
+  Write(source, R"(<svg viewBox="0 0 10 10"><g style="display: none"/></svg>)");
+  REQUIRE_NOTHROW(pingcore::resource_compiler::Compile({root, temporary.Path() / "display", "test_app"}));
+
+  Write(source, R"(<svg viewBox="0 0 10 10"><g opacity="0.5"/></svg>)");
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "opacity", "test_app"}),
+      Catch::Matchers::ContainsSubstring("opacity must be exactly zero or one")
+  );
+}
+
+TEST_CASE("SvgStylesAllowTrailingWhitespaceAndSmoothCurvesDoNotReflectArcControls") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "assets";
+  const std::filesystem::path output = temporary.Path() / "output";
+  Write(
+      root / "images" / "mark.svg",
+      R"(<svg width="40" height="20" viewBox="0 0 40 20"><path style="fill: #fff; " d="M0 10A10 10 0 0 1 20 10S30 20 40 10"/></svg>)"
+  );
+
+  pingcore::resource_compiler::Compile({root, output, "test_app"});
+  DirectoryResources platform(output / "package");
+  auto resources_owner = std::make_shared<pingcore::detail::AppResources>(&platform);
+  auto& resources = *resources_owner;
+  const pingcore::VectorAsset vector =
+      resources.ResolveVector(pingcore::ImageResource("test_app", "images/mark"), pingcore::Locale::Default());
+  pingcore::PaintSequence sequence;
+  pingcore::PaintContext context(sequence, {0.0F, 0.0F, 40.0F, 20.0F});
+  context.DrawImage(vector, {0.0F, 0.0F, 40.0F, 20.0F});
+  context.Finish();
+
+  const auto fill = std::ranges::find_if(sequence.Commands(), [](const pingcore::PaintCommand& command) {
+    return std::holds_alternative<pingcore::FillPathCommand>(command);
+  });
+  REQUIRE(fill != sequence.Commands().end());
+  const std::span<const pingcore::detail::PathElement> elements =
+      pingcore::detail::InternalAccess::Elements(std::get<pingcore::FillPathCommand>(*fill).path);
+  REQUIRE_FALSE(elements.empty());
+  REQUIRE(elements.back().verb == pingcore::detail::PathVerb::CubicTo);
+  REQUIRE(elements.back().points[0] == pingcore::Point{20.0F, 10.0F});
+}
+
+TEST_CASE("SvgResourcesExpandForwardUseReferencesAndCompilePathClips") {
+  TemporaryDirectory temporary;
+  const pingcore::VectorAsset vector = CompileVectorResource(
+      temporary.Path(),
+      R"svg(<svg width="20" height="10" viewBox="0 0 20 10" color="#336699" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <defs>
+    <clipPath id="bounds" clip-rule="nonzero"><rect x="0" y="0" width="8" height="8"/></clipPath>
+  </defs>
+  <use href="#mark" x="2" clip-path="url(#bounds)"/>
+  <use xlink:href="#mark" x="4"/>
+  <path id="mark" d="M0 0L10 0L10 10Z" fill="red" style="fill: currentColor; fill-rule: evenodd"/>
+</svg>)svg"
+  );
+
+  const std::vector<pingcore::PaintCommand>& commands = pingcore::detail::InternalAccess::Sequence(vector).Commands();
+  REQUIRE(std::ranges::count_if(commands, [](const pingcore::PaintCommand& command) {
+    return std::holds_alternative<pingcore::FillPathCommand>(command);
+  }) == 3);
+  REQUIRE(std::ranges::count_if(commands, [](const pingcore::PaintCommand& command) {
+    return std::holds_alternative<pingcore::PushPathClipCommand>(command);
+  }) == 1);
+  const auto fill = std::ranges::find_if(commands, [](const pingcore::PaintCommand& command) {
+    return std::holds_alternative<pingcore::FillPathCommand>(command);
+  });
+  REQUIRE(fill != commands.end());
+  const auto& fill_command = std::get<pingcore::FillPathCommand>(*fill);
+  REQUIRE(std::get<pingcore::Color>(fill_command.brush.Get()) == pingcore::Color::Rgb(51, 102, 153));
+  REQUIRE(fill_command.fill_rule == pingcore::PathFillRule::EvenOdd);
+  const auto clip = std::ranges::find_if(commands, [](const pingcore::PaintCommand& command) {
+    return std::holds_alternative<pingcore::PushPathClipCommand>(command);
+  });
+  REQUIRE(clip != commands.end());
+  REQUIRE(std::get<pingcore::PushPathClipCommand>(*clip).fill_rule == pingcore::PathFillRule::NonZero);
+}
+
+TEST_CASE("SvgResourcesValidateFileLocalReferenceIdentity") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "assets";
+  const std::filesystem::path source = root / "images" / "mark.svg";
+
+  Write(source, R"(<svg viewBox="0 0 10 10"><use href="#missing"/></svg>)");
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "missing", "test_app"}),
+      Catch::Matchers::ContainsSubstring("references a missing id: missing")
+  );
+
+  Write(source, R"(<svg viewBox="0 0 10 10"><path id="same" d="M0 0"/><g id="same"/></svg>)");
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "duplicate", "test_app"}),
+      Catch::Matchers::ContainsSubstring("duplicate id: same")
+  );
+
+  Write(
+      source,
+      R"(<svg viewBox="0 0 10 10"><g id="a"><use href="#b"/></g><g id="b"><use href="#a"/></g><use href="#a"/></svg>)"
+  );
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "cycle", "test_app"}),
+      Catch::Matchers::ContainsSubstring("references form a cycle")
+  );
+
+  Write(
+      source,
+      R"svg(<svg viewBox="0 0 10 10"><clipPath id="clip"><rect width="2" height="2"/></clipPath>
+  <path clip-path="url(#missing)" d="M0 0L1 1"/>
+</svg>)svg"
+  );
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "missing-clip", "test_app"}),
+      Catch::Matchers::ContainsSubstring("clip-path references a missing id")
+  );
+}
+
+TEST_CASE("SvgResourcesCompileAspectRatioVisibilityUnitsColorsAndSkew") {
+  TemporaryDirectory temporary;
+  const pingcore::VectorAsset vector = CompileVectorResource(
+      temporary.Path(),
+      R"svg(<svg width="1in" height="2.54cm" viewBox="0 0 10 5">
+  <g visibility="hidden"><rect width="1" height="1"/><rect visibility="visible" width="2" height="2" fill="#0f08"/></g>
+  <path display="none" d="M0 0L1 1"/>
+  <path transform="skewX(45)" fill="rgba(255, 0, 0, 50%)" d="M0 0L1 0L1 1Z"/>
+</svg>)svg"
+  );
+
+  REQUIRE(vector.IntrinsicSize() == pingcore::Size{96.0F, 96.0F});
+  const std::vector<pingcore::PaintCommand>& commands = pingcore::detail::InternalAccess::Sequence(vector).Commands();
+  REQUIRE(std::ranges::count_if(commands, [](const pingcore::PaintCommand& command) {
+    return std::holds_alternative<pingcore::FillPathCommand>(command);
+  }) == 2);
+  const auto skew = std::ranges::find_if(commands, [](const pingcore::PaintCommand& command) {
+    return std::holds_alternative<pingcore::PushTransformCommand>(command) &&
+           std::get<pingcore::PushTransformCommand>(command).transform.m21 > 0.99F;
+  });
+  REQUIRE(skew != commands.end());
+  const auto aspect = std::ranges::find_if(commands, [](const pingcore::PaintCommand& command) {
+    if (!std::holds_alternative<pingcore::PushTransformCommand>(command)) {
+      return false;
+    }
+    const pingcore::Transform2D transform = std::get<pingcore::PushTransformCommand>(command).transform;
+    return std::abs(transform.m11 - 1.0F) < 0.001F && std::abs(transform.m22 - 0.5F) < 0.001F;
+  });
+  REQUIRE(aspect != commands.end());
+}
+
+TEST_CASE("SvgResourcesCompileNoneAndSliceAspectRatioModes") {
+  TemporaryDirectory temporary;
+  const pingcore::VectorAsset unscaled = CompileVectorResource(
+      temporary.Path(),
+      R"svg(<svg width="20" height="20" viewBox="0 0 10 5" preserveAspectRatio="none">
+  <rect width="10" height="5"/>
+</svg>)svg",
+      "aspect-none"
+  );
+  REQUIRE(std::ranges::none_of(
+      pingcore::detail::InternalAccess::Sequence(unscaled).Commands(),
+      [](const pingcore::PaintCommand& command) {
+        return std::holds_alternative<pingcore::PushTransformCommand>(command);
+      }
+  ));
+
+  const pingcore::VectorAsset sliced = CompileVectorResource(
+      temporary.Path(),
+      R"svg(<svg width="20" height="20" viewBox="0 0 10 5" preserveAspectRatio="xMidYMid slice">
+  <rect width="10" height="5"/>
+</svg>)svg",
+      "aspect-slice"
+  );
+  const auto transform = std::ranges::find_if(
+      pingcore::detail::InternalAccess::Sequence(sliced).Commands(),
+      [](const pingcore::PaintCommand& command) {
+        if (!std::holds_alternative<pingcore::PushTransformCommand>(command)) {
+          return false;
+        }
+        const pingcore::Transform2D value = std::get<pingcore::PushTransformCommand>(command).transform;
+        return value.m11 == 2.0F && value.m22 == 1.0F && value.translate_x == -5.0F;
+      }
+  );
+  REQUIRE(transform != pingcore::detail::InternalAccess::Sequence(sliced).Commands().end());
+}
+
+TEST_CASE("SvgResourcesCompileGradientPathFillsInHuxvecVersionOne") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "resources";
+  const std::filesystem::path output = temporary.Path() / "output";
+  Write(
+      root / "images" / "gradient.svg",
+      R"svg(<svg width="40" height="20" viewBox="0 0 40 20" color="#00ff00" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <defs>
+    <linearGradient id="linear" xlink:href="#base" x1="25%" x2="75%"/>
+    <linearGradient id="base"><stop offset="0" stop-color="currentColor" stop-opacity="0.5"/>
+      <stop offset="100%" style="stop-color: #0000ff"/></linearGradient>
+    <radialGradient id="radial" gradientUnits="userSpaceOnUse" cx="20" cy="10" r="5">
+      <stop stop-color="white"/><stop offset="1" stop-color="black"/>
+    </radialGradient>
+  </defs>
+  <path fill="url(#linear)" fill-opacity="0.5" fill-rule="evenodd" d="M5 2C5 18 25 18 25 2Z"/>
+  <rect x="28" y="2" width="10" height="16" fill="url(#radial)"/>
+</svg>)svg"
+  );
+
+  pingcore::resource_compiler::Compile({root, output, "test_app"});
+  const std::string payload = Read(output / "package" / "pingcore" / "test_app" / "images" / "gradient.huxv");
+  REQUIRE(payload.starts_with("HUXVEC"));
+  REQUIRE(static_cast<unsigned char>(payload[8]) == 1U);
+  REQUIRE(static_cast<unsigned char>(payload[40]) == 1U);
+  REQUIRE(static_cast<unsigned char>(payload[42]) == 2U);
+  std::vector<std::byte> truncated(payload.size() - 1);
+  std::memcpy(truncated.data(), payload.data(), truncated.size());
+  REQUIRE_THROWS_AS(
+      pingcore::detail::InternalAccess::VectorFromRaw(pingcore::RawAsset::FromBytes(std::move(truncated))),
+      std::logic_error
+  );
+
+  DirectoryResources platform(output / "package");
+  auto resources_owner = std::make_shared<pingcore::detail::AppResources>(&platform);
+  auto& resources = *resources_owner;
+  const pingcore::VectorAsset vector =
+      resources.ResolveVector(pingcore::ImageResource("test_app", "images/gradient"), pingcore::Locale::Default());
+  const std::vector<pingcore::PaintCommand>& commands = pingcore::detail::InternalAccess::Sequence(vector).Commands();
+  const auto linear = std::ranges::find_if(commands, [](const pingcore::PaintCommand& command) {
+    const auto* fill = std::get_if<pingcore::FillPathCommand>(&command);
+    return fill != nullptr && std::holds_alternative<pingcore::LinearGradient>(fill->brush.Get());
+  });
+  const auto radial = std::ranges::find_if(commands, [](const pingcore::PaintCommand& command) {
+    const auto* fill = std::get_if<pingcore::FillPathCommand>(&command);
+    return fill != nullptr && std::holds_alternative<pingcore::RadialGradient>(fill->brush.Get());
+  });
+  REQUIRE(linear != commands.end());
+  REQUIRE(radial != commands.end());
+  const auto& linear_fill = std::get<pingcore::FillPathCommand>(*linear);
+  const auto& linear_gradient = std::get<pingcore::LinearGradient>(linear_fill.brush.Get());
+  REQUIRE(linear_fill.fill_rule == pingcore::PathFillRule::EvenOdd);
+  REQUIRE(linear_fill.brush_bounds == pingcore::Rect{5.0F, 2.0F, 20.0F, 12.0F});
+  REQUIRE(linear_gradient.start == pingcore::Point{0.25F, 0.0F});
+  REQUIRE(linear_gradient.end == pingcore::Point{0.75F, 0.0F});
+  REQUIRE(linear_gradient.transform.IsIdentity());
+  REQUIRE(linear_gradient.stops[0].color == pingcore::Color::Rgb(0, 255, 0, 0.25F));
+  const auto& radial_fill = std::get<pingcore::FillPathCommand>(*radial);
+  const auto& radial_gradient = std::get<pingcore::RadialGradient>(radial_fill.brush.Get());
+  REQUIRE(radial_fill.brush_bounds == pingcore::Rect{0.0F, 0.0F, 40.0F, 20.0F});
+  REQUIRE(radial_gradient.center == pingcore::Point{0.5F, 0.5F});
+  REQUIRE(radial_gradient.radius == pingcore::Size{0.125F, 0.25F});
+  REQUIRE(radial_gradient.transform.IsIdentity());
+}
+
+TEST_CASE("SvgResourcesCompileInheritedObjectAndUserSpaceGradientTransforms") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "resources";
+  const std::filesystem::path output = temporary.Path() / "output";
+  Write(
+      root / "images" / "transformed.svg",
+      R"svg(<svg width="40" height="20" viewBox="0 0 40 20">
+  <defs>
+    <linearGradient id="base" gradientTransform="matrix(1 0.25 -0.5 1 0.2 -0.1)">
+      <stop stop-color="black"/><stop offset="1" stop-color="white"/>
+    </linearGradient>
+    <linearGradient id="inherited" href="#base"/>
+    <linearGradient id="overridden" href="#base" gradientTransform="translate(0.25 0.5)"/>
+    <radialGradient id="user" gradientUnits="userSpaceOnUse"
+        gradientTransform="matrix(1 0.25 -0.5 1 4 2)" cx="20" cy="10" r="5">
+      <stop stop-color="white"/><stop offset="1" stop-color="black"/>
+    </radialGradient>
+  </defs>
+  <rect width="10" height="10" fill="url(#inherited)"/>
+  <rect x="10" width="10" height="10" fill="url(#overridden)"/>
+  <rect x="20" width="10" height="10" fill="url(#user)"/>
+</svg>)svg"
+  );
+
+  pingcore::resource_compiler::Compile({root, output, "test_app"});
+  const std::string payload = Read(output / "package" / "pingcore" / "test_app" / "images" / "transformed.huxv");
+  REQUIRE(static_cast<unsigned char>(payload[40]) == 1U);
+  REQUIRE(static_cast<unsigned char>(payload[42]) == 2U);
+  std::vector<std::byte> truncated(payload.size() - 1);
+  std::memcpy(truncated.data(), payload.data(), truncated.size());
+  REQUIRE_THROWS_AS(
+      pingcore::detail::InternalAccess::VectorFromRaw(pingcore::RawAsset::FromBytes(std::move(truncated))),
+      std::logic_error
+  );
+
+  DirectoryResources platform(output / "package");
+  auto resources_owner = std::make_shared<pingcore::detail::AppResources>(&platform);
+  auto& resources = *resources_owner;
+  const pingcore::VectorAsset vector =
+      resources.ResolveVector(pingcore::ImageResource("test_app", "images/transformed"), pingcore::Locale::Default());
+  const std::vector<pingcore::PaintCommand>& commands = pingcore::detail::InternalAccess::Sequence(vector).Commands();
+  REQUIRE(commands.size() == 3);
+  const auto& inherited =
+      std::get<pingcore::LinearGradient>(std::get<pingcore::FillPathCommand>(commands[0]).brush.Get()).transform;
+  REQUIRE(inherited == pingcore::Transform2D{1.0F, 0.25F, -0.5F, 1.0F, 0.2F, -0.1F});
+  const auto& overridden =
+      std::get<pingcore::LinearGradient>(std::get<pingcore::FillPathCommand>(commands[1]).brush.Get()).transform;
+  REQUIRE(overridden == pingcore::Transform2D{1.0F, 0.0F, 0.0F, 1.0F, 0.25F, 0.5F});
+  const auto& user =
+      std::get<pingcore::RadialGradient>(std::get<pingcore::FillPathCommand>(commands[2]).brush.Get()).transform;
+  REQUIRE(user.m11 == Catch::Approx(1.0F));
+  REQUIRE(user.m12 == Catch::Approx(0.5F));
+  REQUIRE(user.m21 == Catch::Approx(-0.25F));
+  REQUIRE(user.m22 == Catch::Approx(1.0F));
+  REQUIRE(user.translate_x == Catch::Approx(0.1F));
+  REQUIRE(user.translate_y == Catch::Approx(0.1F));
+}
+
+TEST_CASE("SvgResourcesCompileGradientPathStrokesInHuxvecVersionOne") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "resources";
+  const std::filesystem::path output = temporary.Path() / "output";
+  Write(
+      root / "images" / "gradient_stroke.svg",
+      R"svg(<svg width="40" height="20" viewBox="0 0 40 20">
+  <defs>
+    <linearGradient id="base" gradientTransform="matrix(1 0.25 -0.5 1 0.2 -0.1)">
+      <stop stop-color="black" stop-opacity="0.5"/><stop offset="1" stop-color="white"/>
+    </linearGradient>
+    <linearGradient id="inherited" href="#base"/>
+    <radialGradient id="radial"><stop stop-color="white"/><stop offset="1" stop-color="black"/></radialGradient>
+  </defs>
+  <g fill="none" stroke-width="3" stroke-linecap="round" stroke-linejoin="bevel"
+     stroke-dasharray="3 1 2" stroke-dashoffset="-2">
+    <rect x="5" y="2" width="20" height="12" stroke="url(#inherited)" stroke-opacity="0.5"/>
+    <path d="M25 2L38 2L32 16Z" stroke="url(#radial)"/>
+  </g>
+</svg>)svg"
+  );
+
+  pingcore::resource_compiler::Compile({root, output, "test_app"});
+  const std::string payload =
+      Read(output / "package" / "pingcore" / "test_app" / "images" / "gradient_stroke.huxv");
+  REQUIRE(payload.starts_with("HUXVEC"));
+  REQUIRE(static_cast<unsigned char>(payload[8]) == 1U);
+  REQUIRE(static_cast<unsigned char>(payload[40]) == 2U);
+  REQUIRE(static_cast<unsigned char>(payload[41]) == 2U);
+  std::vector<std::byte> truncated(payload.size() - 1);
+  std::memcpy(truncated.data(), payload.data(), truncated.size());
+  REQUIRE_THROWS_AS(
+      pingcore::detail::InternalAccess::VectorFromRaw(pingcore::RawAsset::FromBytes(std::move(truncated))),
+      std::logic_error
+  );
+
+  DirectoryResources platform(output / "package");
+  auto resources_owner = std::make_shared<pingcore::detail::AppResources>(&platform);
+  auto& resources = *resources_owner;
+  const pingcore::VectorAsset vector =
+      resources.ResolveVector(pingcore::ImageResource("test_app", "images/gradient_stroke"), pingcore::Locale::Default());
+  const std::vector<pingcore::PaintCommand>& commands = pingcore::detail::InternalAccess::Sequence(vector).Commands();
+  REQUIRE(commands.size() == 2);
+  const auto& linear = std::get<pingcore::StrokePathCommand>(commands[0]);
+  const auto& linear_gradient = std::get<pingcore::LinearGradient>(linear.brush.Get());
+  REQUIRE(linear.brush_bounds == pingcore::Rect{5.0F, 2.0F, 20.0F, 12.0F});
+  REQUIRE(linear_gradient.transform == pingcore::Transform2D{1.0F, 0.25F, -0.5F, 1.0F, 0.2F, -0.1F});
+  REQUIRE(linear_gradient.stops[0].color == pingcore::Color::Rgb(0, 0, 0, 0.25F));
+  REQUIRE(linear.style.width == 3.0F);
+  REQUIRE(linear.style.cap == pingcore::StrokeCap::Round);
+  REQUIRE(linear.style.join == pingcore::StrokeJoin::Bevel);
+  REQUIRE(linear.style.dash_pattern == std::vector<float>{3.0F, 1.0F, 2.0F, 3.0F, 1.0F, 2.0F});
+  REQUIRE(linear.style.dash_offset == 10.0F);
+  const auto& radial = std::get<pingcore::StrokePathCommand>(commands[1]);
+  REQUIRE(radial.brush_bounds == pingcore::Rect{25.0F, 2.0F, 13.0F, 14.0F});
+  REQUIRE(std::get<pingcore::RadialGradient>(radial.brush.Get()).transform.IsIdentity());
+  REQUIRE(radial.style == linear.style);
+}
+
+TEST_CASE("SvgResourcesRejectUnsupportedAndCyclicGradients") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "resources";
+  const std::filesystem::path source = root / "images" / "gradient.svg";
+
+  Write(source, R"svg(<svg viewBox="0 0 10 10"><defs><linearGradient id="a" href="#b"/>
+  <linearGradient id="b" href="#a"/></defs><rect width="10" height="10" fill="url(#a)"/></svg>)svg");
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "cycle", "test_app"}),
+      Catch::Matchers::ContainsSubstring("gradient references form a cycle")
+  );
+
+  Write(source, R"svg(<svg viewBox="0 0 10 10"><radialGradient id="paint" fx="25%">
+  <stop/><stop offset="1"/></radialGradient><rect width="10" height="10" fill="url(#paint)"/></svg>)svg");
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "focal", "test_app"}),
+      Catch::Matchers::ContainsSubstring("non-concentric radial gradients are not supported")
+  );
+
+  Write(source, R"svg(<svg viewBox="0 0 10 10"><linearGradient id="paint" spreadMethod="repeat">
+  <stop/><stop offset="1"/></linearGradient><rect width="10" height="10" fill="url(#paint)"/></svg>)svg");
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "repeat", "test_app"}),
+      Catch::Matchers::ContainsSubstring("spreadMethod supports only pad")
+  );
+}
+
+TEST_CASE("SvgResourcesRejectInexactClipAndPresentationFeatures") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "assets";
+  const std::filesystem::path source = root / "images" / "mark.svg";
+
+  Write(
+      source,
+      R"svg(<svg viewBox="0 0 10 10">
+  <clipPath id="clip" clipPathUnits="objectBoundingBox"><path d="M0 0L1 1"/></clipPath>
+  <path clip-path="url(#clip)" d="M0 0L1 1"/>
+</svg>)svg"
+  );
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "clip-units", "test_app"}),
+      Catch::Matchers::ContainsSubstring("supports only userSpaceOnUse")
+  );
+
+  Write(
+      source,
+      R"svg(<svg viewBox="0 0 10 10">
+  <clipPath id="clip"><rect width="2" height="2"/><circle r="1"/></clipPath>
+  <path clip-path="url(#clip)" d="M0 0L1 1"/>
+</svg>)svg"
+  );
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "compound-clip", "test_app"}),
+      Catch::Matchers::ContainsSubstring("must resolve to one drawable path")
+  );
+
+  Write(source, R"svg(<svg viewBox="0 0 10 10"><linearGradient id="paint" gradientTransform="scale(0)">
+  <stop/><stop offset="1"/></linearGradient><path fill="url(#paint)" d="M0 0L1 1"/></svg>)svg");
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "gradient", "test_app"}),
+      Catch::Matchers::ContainsSubstring("gradientTransform must be finite and invertible")
+  );
+
+  Write(source, R"svg(<svg viewBox="0 0 10 10"><defs><path style="filter: blur(1px)" d="M0 0L1 1"/></defs></svg>)svg");
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "unused-style", "test_app"}),
+      Catch::Matchers::ContainsSubstring("unsupported style property: filter")
+  );
+
+  Write(
+      source,
+      R"svg(<svg viewBox="0 0 10 10"><path transform="scale(3e38) scale(3e38)" d="M0 0L1 1"/></svg>)svg"
+  );
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "overflowing-transform", "test_app"}),
+      Catch::Matchers::ContainsSubstring("transform must remain finite")
+  );
+}
+
+TEST_CASE("ResourceCompilerRejectsUnsupportedSvgFeaturesAndDensityVariants") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "assets";
+  Write(
+      root / "images" / "filtered.svg",
+      R"svg(<svg viewBox="0 0 10 10"><path filter="url(#x)" d="M0 0L1 1"/></svg>)svg"
+  );
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "filtered", "test_app"}),
+      Catch::Matchers::ContainsSubstring("unsupported attribute: filter")
+  );
+
+  REQUIRE(std::filesystem::remove(root / "images" / "filtered.svg"));
+  Write(root / "images" / "mark@2x.svg", R"(<svg viewBox="0 0 10 10"><path d="M0 0L1 1"/></svg>)");
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "scaled", "test_app"}),
+      Catch::Matchers::ContainsSubstring("do not support density suffixes")
+  );
+}
+
+TEST_CASE("ResourceCompilerRejectsMixedRasterAndVectorVariants") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "assets";
+  Write(root / "images" / "mark.svg", R"(<svg viewBox="0 0 8 4"><path d="M0 0L8 4"/></svg>)");
+  Write(root / "images" / "mark@2x.png", pingcore::test::MakeTestPng(16, 8));
+
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "output", "test_app"}),
+      Catch::Matchers::ContainsSubstring("raster and vector variants must not share")
+  );
+}
+
+TEST_CASE("ResourceCompilerRejectsMalformedPathDataAfterClose") {
+  TemporaryDirectory temporary;
+  const std::filesystem::path root = temporary.Path() / "assets";
+  Write(root / "images" / "mark.svg", R"(<svg viewBox="0 0 8 4"><path d="M0 0Z 1"/></svg>)");
+
+  REQUIRE_THROWS_WITH(
+      pingcore::resource_compiler::Compile({root, temporary.Path() / "output", "test_app"}),
+      Catch::Matchers::ContainsSubstring("path data is malformed")
+  );
+}
+
+} // namespace

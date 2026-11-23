@@ -1,0 +1,1852 @@
+#include "runtime_test_support.h"
+
+#include <array>
+#include <limits>
+#include <stdexcept>
+#include <vector>
+
+#include "external_texture_test_support.h"
+#include "image_test_support.h"
+
+namespace pingcore::test {
+
+State<bool> use_column_layout;
+State<bool> use_long_cached_text;
+State<bool> expand_cached_scope;
+State<bool> update_opaque_layout_value;
+State<std::size_t> indexed_page_selection;
+State<std::size_t> pager_selection;
+State<std::size_t> reduced_motion_pager_selection;
+std::vector<std::size_t> reduced_motion_pager_settlements;
+ImageAsset layout_test_image;
+ImageFit layout_test_image_fit = ImageFit::Contain;
+HorizontalAlignment layout_test_image_horizontal_alignment = HorizontalAlignment::Center;
+VerticalAlignment layout_test_image_vertical_alignment = VerticalAlignment::Center;
+ImageSampling layout_test_image_sampling = ImageSampling::Linear;
+Size layout_test_image_frame{100.0F, 100.0F};
+VectorAsset layout_test_vector;
+std::shared_ptr<ExternalTexture> layout_test_external_texture;
+
+class CountingTextPlatform final : public TestPlatform {
+public:
+  TextLayoutMetrics MeasureText(const pingcore::AttributedText& text, const TextStyle& style, float max_width,
+      const TextLayoutOptions& options) override {
+    ++measure_text_calls;
+    return TestPlatform::MeasureText(text, style, max_width, options);
+  }
+
+  std::size_t measure_text_calls = 0;
+};
+
+View ImageLayoutApp() {
+  return Column {
+    Image(layout_test_image)
+        .Fit(layout_test_image_fit)
+        .Align(layout_test_image_horizontal_alignment, layout_test_image_vertical_alignment)
+        .Sampling(layout_test_image_sampling)
+        .With(Frame{.width = layout_test_image_frame.width, .height = layout_test_image_frame.height}),
+  };
+}
+
+View VectorImageLayoutApp() {
+  return Image(layout_test_vector)
+      .Tint(Color::Rgb(90, 120, 180))
+      .With(Frame{.width = 100.0F, .height = 100.0F});
+}
+
+View ExternalTextureLayoutApp() {
+  return Column {
+    Image(layout_test_external_texture)
+        .Fit(ImageFit::Cover)
+        .Align(HorizontalAlignment::End, VerticalAlignment::Start)
+        .Sampling(ImageSampling::Nearest)
+        .With(Frame{.width = 100.0F, .height = 100.0F}),
+  };
+}
+
+struct FlowBreakBefore {
+  using Value = bool;
+};
+
+struct LayoutBoundaryEnvironment {
+  static LayoutBoundaryEnvironment Default() {
+    return {};
+  }
+
+  bool operator==(const LayoutBoundaryEnvironment&) const = default;
+};
+
+struct OpaqueLayoutData {
+  int value;
+};
+
+struct OpaqueLayoutValue {
+  using Value = OpaqueLayoutData;
+};
+
+class TestFlow final : public Layout<TestFlow> {
+public:
+  using Layout::Layout;
+
+  TestFlow Gap(float value) && {
+    return std::move(*this).With(pingcore::Spacing{value});
+  }
+
+  static LayoutResult Measure(LayoutContext& context, ViewNode& node, pingcore::Constraints constraints) {
+    LayoutResult result;
+    float x = 0.0F;
+    float y = 0.0F;
+    float line_height = 0.0F;
+    float measured_width = 0.0F;
+
+    for (ViewNode& child : node.Children()) {
+      const Size child_size = context.Measure(child, constraints.Loose());
+      const bool break_before = child.LayoutValueOr<FlowBreakBefore>(false);
+      if (x > 0.0F && (break_before || x + child_size.width > constraints.max_width)) {
+        measured_width = std::max(measured_width, x - node.Spacing());
+        x = 0.0F;
+        y += line_height + node.Spacing();
+        line_height = 0.0F;
+      }
+
+      result.Place(child, {x, y});
+      x += child_size.width + node.Spacing();
+      line_height = std::max(line_height, child_size.height);
+    }
+
+    if (x > 0.0F) {
+      measured_width = std::max(measured_width, x - node.Spacing());
+    }
+    result.SetSize(constraints.Constrain({
+        measured_width,
+        y + line_height,
+    }));
+    return result;
+  }
+};
+
+class UnboundedWidth final : public Layout<UnboundedWidth> {
+public:
+  using Layout::Layout;
+
+  static LayoutResult Measure(LayoutContext& context, ViewNode& node, Constraints constraints) {
+    LayoutResult result;
+    if (node.ChildCount() == 0) {
+      return result.SetSize(constraints.Constrain({}));
+    }
+    ViewNode& child = node.ChildAt(0);
+    const Size size = context.Measure(
+        child,
+        {
+            0.0F,
+            std::numeric_limits<float>::infinity(),
+            0.0F,
+            constraints.max_height,
+        }
+    );
+    result.Place(child, {});
+    return result.SetSize(constraints.Constrain(size));
+  }
+};
+
+View CustomLayoutApp() {
+  return TestFlow {
+    Text("A").With(pingcore::Frame{40.0F, 10.0F}),
+    Text("B").With(pingcore::Frame{40.0F, 10.0F}).LayoutValue<FlowBreakBefore>(true),
+    Text("C").With(pingcore::Frame{40.0F, 10.0F}),
+  }.With(pingcore::Padding{5.0F})
+      .Gap(5.0F);
+}
+
+View LayoutIdentityApp() {
+  auto use_column = UseState(false);
+  use_column_layout = use_column;
+  if (use_column.Get()) {
+    return Column {
+      Text("Content"),
+    };
+  }
+  return Row {
+    Text("Content"),
+  };
+}
+
+View AxisAlignmentApp() {
+  return Column {
+    Text("A").With(pingcore::Frame{20.0F, 20.0F}),
+    Text("B").With(pingcore::Frame{20.0F, 20.0F}),
+  }.With(pingcore::MainAlign{MainAxisAlignment::SpaceBetween}, pingcore::CrossAlign{CrossAxisAlignment::Center});
+}
+
+View SpacerLayoutApp() {
+  return Row {
+    Text("L").With(pingcore::Frame{20.0F, 20.0F}),
+    Spacer(),
+    Text("R").With(pingcore::Frame{30.0F, 20.0F}),
+  }.With(pingcore::CrossAlign{CrossAxisAlignment::Center});
+}
+
+View GrowLayoutApp() {
+  return Row {
+    Spacer().With(pingcore::Grow{1.0F}),
+    Spacer().With(pingcore::Grow{2.0F}),
+  };
+}
+
+namespace {
+
+struct GrowProbeId {
+  using Value = std::size_t;
+};
+
+struct GrowProbeSize {
+  using Value = Size;
+};
+
+std::array<std::size_t, 3> grow_measure_calls{};
+std::array<Size, 3> grow_measured_sizes{};
+bool grow_horizontal = false;
+bool grow_loose_cross = false;
+CrossAxisAlignment grow_cross_alignment = CrossAxisAlignment::Stretch;
+float layout_priority = 0.0F;
+
+class GrowMeasureProbe final : public Layout<GrowMeasureProbe> {
+public:
+  using Layout::Layout;
+
+  static LayoutResult Measure(LayoutContext&, ViewNode& node, Constraints constraints) {
+    const auto id = node.LayoutValueOr<GrowProbeId>(0);
+    ++grow_measure_calls[id];
+    const Size size = constraints.Constrain(node.LayoutValueOr<GrowProbeSize>({110.0F, 40.0F}));
+    grow_measured_sizes[id] = size;
+    return LayoutResult{}.SetSize(size);
+  }
+};
+
+View DeepGrowLayoutApp() {
+  View child = GrowMeasureProbe {}.With(Grow{});
+  for (int depth = 0; depth < 12; ++depth) {
+    child = grow_horizontal ? View{Row {child}} : View{Column {child}};
+    child = std::move(child).With(Grow{}, CrossAlign{grow_cross_alignment});
+  }
+  const Frame frame = grow_loose_cross
+      ? (grow_horizontal ? Frame{.width = 400.0F} : Frame{.height = 600.0F})
+      : Frame{.width = 400.0F, .height = 600.0F};
+  child = std::move(child).With(frame);
+  return Stack {
+    child,
+  }.With(Align{HorizontalAlignment::Start, VerticalAlignment::Start});
+}
+
+View WeightedGrowLayoutApp() {
+  View fixed = GrowMeasureProbe {}.LayoutValue<GrowProbeId>(0).With(
+      Grow{0.0F},
+      grow_horizontal ? Frame{.width = 32.0F} : Frame{.height = 32.0F}
+  );
+  View first = GrowMeasureProbe {}.LayoutValue<GrowProbeId>(1).With(Grow{1.0F});
+  View second = GrowMeasureProbe {}.LayoutValue<GrowProbeId>(2).With(Grow{3.0F});
+  View content = grow_horizontal ? View{Row {fixed, first, second}} : View{Column {fixed, first, second}};
+  return Stack {
+    std::move(content).With(
+        Frame{.width = grow_horizontal ? 240.0F : 300.0F, .height = grow_horizontal ? 300.0F : 240.0F},
+        Padding{16.0F},
+        Spacing{8.0F},
+        CrossAlign{grow_cross_alignment}
+    ),
+  }.With(Align{HorizontalAlignment::Start, VerticalAlignment::Start});
+}
+
+View UnboundedGrowLayoutApp() {
+  const View child = GrowMeasureProbe {}.With(Grow{});
+  View content = grow_horizontal ? View{Row {child}} : View{Column {child}};
+  return ScrollView(std::move(content).With(CrossAlign{grow_cross_alignment}))
+      .ScrollAxis(grow_horizontal ? Axis::Horizontal : Axis::Vertical)
+      .With(Frame{.width = 240.0F, .height = 400.0F});
+}
+
+View DeepGrowVirtualListApp() {
+  View child = VirtualList(100000, [](std::size_t index) {
+    return GrowMeasureProbe {}.Key(index);
+  }).ItemExtent(42.0F).With(Grow{});
+  for (int depth = 0; depth < 12; ++depth) {
+    child = Column {
+      child,
+    }.With(Grow{}, CrossAlign{CrossAxisAlignment::Stretch});
+  }
+  return std::move(child).With(Frame{.width = 400.0F, .height = 600.0F});
+}
+
+} // namespace
+
+View ScopeGrowContent() {
+  return Text("Grow content").With(Frame{.height = 20.0F}, Grow{});
+}
+
+View ScopeGrowApp() {
+  return Column {
+    Text("Fixed").With(Frame{.height = 20.0F}),
+    Scope(ScopeGrowContent),
+  };
+}
+
+View ScopeGrowOverrideApp() {
+  return Column {
+    Text("Fixed").With(Frame{.height = 20.0F}),
+    Scope(ScopeGrowContent).With(Grow{0.0F}),
+  };
+}
+
+View EnvironmentScopeGrowApp() {
+  return Column {
+    Text("Fixed").With(Frame{.height = 20.0F}),
+    ProvideEnvironment(LayoutBoundaryEnvironment{}, Scope(ScopeGrowContent)),
+  };
+}
+
+View ScopeLayoutValueApp(bool override_value) {
+  View scoped = Scope([] {
+    return Text("B").With(Frame{40.0F, 10.0F}).LayoutValue<FlowBreakBefore>(true);
+  });
+  if (override_value) {
+    scoped = std::move(scoped).LayoutValue<FlowBreakBefore>(false);
+  }
+  return TestFlow {
+    Text("A").With(Frame{40.0F, 10.0F}),
+    scoped,
+  }.With(Frame{.width = 100.0F});
+}
+
+View ScopeLayoutValueInheritedApp() {
+  return ScopeLayoutValueApp(false);
+}
+
+View ScopeLayoutValueOverrideApp() {
+  return ScopeLayoutValueApp(true);
+}
+
+View StackAlignmentApp() {
+  return Stack {
+    Text("A").With(pingcore::Frame{20.0F, 10.0F}),
+  }.With(
+          pingcore::Align{
+              HorizontalAlignment::End,
+              VerticalAlignment::Center,
+          }
+      );
+}
+
+View StretchLayoutApp() {
+  return Column {
+    Text("A").With(pingcore::Frame{20.0F, 20.0F}),
+  }.With(pingcore::CrossAlign{CrossAxisAlignment::Stretch});
+}
+
+View NestedStretchLayoutApp() {
+  return Column {
+    Column {
+      Column {
+        Text("Measured once"),
+        Spacer().With(Frame{.height = 1.0F}),
+      }.With(CrossAlign{CrossAxisAlignment::Stretch}),
+      Spacer().With(Frame{.height = 1.0F}),
+    }.With(CrossAlign{CrossAxisAlignment::Stretch}),
+    Spacer().With(Frame{.height = 1.0F}),
+  }.With(CrossAlign{CrossAxisAlignment::Stretch});
+}
+
+View WrappedTextApp() {
+  return Column {
+    Text("abcdefghij"),
+  };
+}
+
+View AlignedTextApp() {
+  return Text("aligned")
+      .Align(TextAlign::Trailing)
+      .VerticalAlign(TextVerticalAlign::Bottom)
+      .With(Frame{80.0F, 40.0F});
+}
+
+View AdaptiveFrameApp() {
+  return Column {
+    Text("Wide").With(Frame{.width = 80.0F}),
+    Text("Tall").With(Frame{.height = 35.0F}),
+    Text("A").With(Frame{.min_width = 60.0F, .min_height = 25.0F}),
+    Text("Maximum").With(Frame{.max_width = 30.0F, .max_height = 15.0F}),
+    Text("Preferred").With(Frame{.width = 90.0F, .max_width = 70.0F}),
+    Text("Merged").With(Frame{.width = 55.0F}, Frame{.height = 30.0F}),
+    Text("Padded").With(Frame{.width = 80.0F}, Padding{10.0F}),
+  };
+}
+
+View ParentConstrainedFrameApp() {
+  return Text("A").With(Frame{200.0F, 200.0F});
+}
+
+View BoundedContainerFrameApp() {
+  return Column {
+    ScrollView {
+      Text("Scroll content").With(Frame{100.0F, 100.0F}),
+    }.With(Frame{.max_height = 40.0F}),
+    VirtualList(20, [](std::size_t index) { return Text::Format("Item {}", index); })
+        .ItemExtent(20.0F)
+        .With(Frame{.max_height = 60.0F}),
+  };
+}
+
+View FlowWrapApp() {
+  return Column {
+    Flow {
+      Text("A").With(Frame{40.0F, 10.0F}),
+      Text("B").With(Frame{40.0F, 20.0F}),
+      Text("C").With(Frame{40.0F, 15.0F}),
+    }.With(Frame{.width = 90.0F}, Spacing{5.0F}, CrossAlign{CrossAxisAlignment::Center}),
+  };
+}
+
+View FlowAlignmentApp() {
+  return Column {
+    Flow {
+      Text("A").With(Frame{30.0F, 10.0F}),
+      Text("B").With(Frame{30.0F, 10.0F}),
+    }.With(Frame{.width = 100.0F}, Spacing{10.0F}, MainAlign{MainAxisAlignment::Center}),
+  };
+}
+
+View FlowGrowApp() {
+  return Column {
+    Flow {
+      Text("A").With(Frame{30.0F, 10.0F}, Grow{1.0F}),
+      Text("B").With(Frame{30.0F, 20.0F}, Grow{2.0F}),
+      Text("C").With(Frame{80.0F, 15.0F}),
+    }.With(Frame{.width = 100.0F}, Spacing{10.0F}, CrossAlign{CrossAxisAlignment::Center}),
+  };
+}
+
+View UnboundedFlowApp() {
+  return UnboundedWidth {
+    Flow {
+      Text("A").With(Frame{30.0F, 10.0F}, Grow{}),
+      Text("B").With(Frame{30.0F, 10.0F}, Grow{}),
+    }.With(Spacing{5.0F}),
+  };
+}
+
+View ForEachLayoutApp() {
+  const std::vector<std::string> items{
+      "First",
+      "Second",
+      "Third",
+  };
+  const std::vector<std::string> empty;
+  return Column {
+    Text("Header"),
+    ForEach(items, [](const std::string& item) { return Text(item); }),
+    ForEach(empty, [](const std::string& item) { return Text(item); }),
+    Text("Footer"),
+  }.With(pingcore::Spacing{5.0F});
+}
+
+View LayoutCounter() {
+  PINGCORE_SCOPE({
+    auto count = UseState(0);
+    return Column {
+      Text(count),
+      Button("+1").OnClick([count] { count += 1; }),
+    };
+  });
+}
+
+View ForEachIdentityApp() {
+  auto expanded = UseState(false);
+  const std::vector<std::string> items = expanded.Get()
+                                             ? std::vector<std::string>{
+                                                   "new",
+                                                   "second",
+                                                   "first",
+                                               }
+                                             : std::vector<std::string>{
+                                                   "first",
+                                                   "second",
+                                               };
+  return Column {
+    ForEach(items, [](const std::string& item) { return LayoutCounter().Key(item); }),
+    Button("Toggle").OnClick([expanded] { expanded = !expanded; }),
+  };
+}
+
+View ReactiveStateApiApp() {
+  auto taps = UseState(2);
+  auto items = UseState(std::vector<std::string>{
+      "Alpha",
+      "Bravo",
+  });
+
+  return Column {
+    Text::Format("Taps {}", taps),
+    ForEach(items, [](const std::string& item) { return Text(item); }),
+    Button("Update").OnClick([taps, items] {
+      taps += 1;
+      items.Update([](auto& values) { values.push_back("Charlie"); });
+      }),
+  };
+}
+
+View CachedLayoutApp() {
+  auto long_text = UseState(false);
+  use_long_cached_text = long_text;
+  return Column {
+    Text(long_text.Get() ? "Longer label" : "Short"),
+    Text("Stable").LayoutValue<FlowBreakBefore>(false),
+  };
+}
+
+View OpaqueLayoutValueApp() {
+  auto update = UseState(false);
+  update_opaque_layout_value = update;
+  return Text("Opaque")
+      .LayoutValue<OpaqueLayoutValue>(OpaqueLayoutData{1})
+      .With(Foreground{update.Get() ? Color::Black() : Color::White()});
+}
+
+View CachedScope() {
+  PINGCORE_SCOPE({
+    auto expanded = UseState(false);
+    expand_cached_scope = expanded;
+    return Text("Scoped").With(Frame{.height = expanded.Get() ? 40.0F : 20.0F});
+  });
+}
+
+View ScopedCachedLayoutApp() {
+  return Column {
+    CachedScope(),
+    Text("Stable"),
+  };
+}
+
+View IndexedCounterPage(std::string label) {
+  PINGCORE_SCOPE({
+    auto count = UseState(0);
+    return Column {
+      Text::Format("{} {}", label, count),
+      Button("Increment " + label).OnClick([count] { count += 1; }),
+    };
+  });
+}
+
+View IndexedPagesApp() {
+  auto selected = UseState<std::size_t>(0);
+  indexed_page_selection = selected;
+  return IndexedPages(
+      {
+          IndexedCounterPage("First"),
+          IndexedCounterPage("Second"),
+      },
+      selected
+  );
+}
+
+View PagerLayoutApp() {
+  auto selected = UseState<std::size_t>(1);
+  pager_selection = selected;
+  return Pager(
+      {
+          Text("First"),
+          Text("Second"),
+          Text("Third"),
+          Text("Fourth").With(Semantics{.selected = false}),
+      },
+      selected
+  );
+}
+
+View ReducedMotionPagerApp() {
+  auto selected = UseState<std::size_t>(0);
+  reduced_motion_pager_selection = selected;
+  ThemeSpec theme = FlatLightThemeSpec();
+  theme.motion.reduced_motion = true;
+  return Theme {
+    ThemeDefinition{theme},
+    Pager({Text("First"), Text("Second")}, selected)
+        .OnSettled([](std::size_t index) { reduced_motion_pager_settlements.push_back(index); }),
+  };
+}
+
+TEST_CASE("FrameAggregateLeavesOmittedConstraintsUnspecified") {
+  const Frame frame{.height = 48.0F};
+  REQUIRE(frame.height == 48.0F);
+  REQUIRE_FALSE(frame.width.has_value());
+  REQUIRE_FALSE(frame.min_width.has_value());
+  REQUIRE_FALSE(frame.max_width.has_value());
+  REQUIRE_FALSE(frame.min_height.has_value());
+  REQUIRE_FALSE(frame.max_height.has_value());
+}
+
+TEST_CASE("TestMainAndCrossAxisAlignment") {
+  TestPlatform platform;
+  UiWindow runtime{AxisAlignmentApp, platform};
+  runtime.SetWindowMetrics({.viewport = {100.0F, 100.0F}});
+  runtime.BuildFrame();
+
+  const auto* root = runtime.RootNode();
+  REQUIRE(root != nullptr);
+  REQUIRE(root->bounds.width == 100.0F);
+  REQUIRE(root->bounds.height == 100.0F);
+  REQUIRE(root->children[0]->layout_offset.x == 40.0F);
+  REQUIRE(root->children[0]->layout_offset.y == 0.0F);
+  REQUIRE(root->children[1]->layout_offset.x == 40.0F);
+  REQUIRE(root->children[1]->layout_offset.y == 80.0F);
+}
+
+TEST_CASE("IndexedPages validates its page set and selection") {
+  REQUIRE_THROWS_AS(IndexedPages({}, 0), std::invalid_argument);
+  REQUIRE_THROWS_AS(IndexedPages({Text("Page")}, 1), std::invalid_argument);
+  REQUIRE_THROWS_AS(IndexedPages({View{}}, 0), std::invalid_argument);
+}
+
+TEST_CASE("IndexedPages retains every page and presents only the selected page") {
+  TestPlatform platform;
+  UiWindow runtime{IndexedPagesApp, platform};
+  runtime.SetWindowMetrics({.viewport = {240.0F, 120.0F}});
+  const FlattenedScene& initial = runtime.BuildFrame();
+
+  const auto* root = runtime.RootNode();
+  REQUIRE(root != nullptr);
+  REQUIRE(root->children.size() == 2);
+  const std::uint64_t first_identity = root->children[0]->identity;
+  const std::uint64_t second_identity = root->children[1]->identity;
+  REQUIRE(root->children[0]->participates_in_layout);
+  REQUIRE_FALSE(root->children[1]->participates_in_layout);
+  REQUIRE(ContainsText(initial, "First 0"));
+  REQUIRE_FALSE(ContainsText(initial, "Second 0"));
+  REQUIRE(runtime.LastCommit().semantic_frame != nullptr);
+  const auto has_semantic_label = [&runtime](std::string_view label) {
+    return std::ranges::any_of(runtime.LastCommit().semantic_frame->nodes, [label](const SemanticNode& node) {
+      return node.label == label;
+    });
+  };
+  REQUIRE(has_semantic_label("Increment First"));
+  REQUIRE_FALSE(has_semantic_label("Increment Second"));
+
+  const std::uint64_t measure_revision = root->measure_revision;
+  const std::uint64_t layout_revision = root->layout_revision;
+  runtime.BuildFrame();
+  root = runtime.RootNode();
+  REQUIRE(root->measure_revision == measure_revision);
+  REQUIRE(root->layout_revision == layout_revision);
+
+  const Rect first_button = root->children[0]->children[0]->children[1]->PresentationBounds();
+  ClickAt(runtime, {first_button.x + first_button.width * 0.5F, first_button.y + first_button.height * 0.5F});
+  REQUIRE(ContainsText(runtime.BuildFrame(), "First 1"));
+
+  indexed_page_selection = 1;
+  const FlattenedScene& second = runtime.BuildFrame();
+  root = runtime.RootNode();
+  REQUIRE(root->children[0]->identity == first_identity);
+  REQUIRE(root->children[1]->identity == second_identity);
+  REQUIRE_FALSE(root->children[0]->participates_in_layout);
+  REQUIRE(root->children[1]->participates_in_layout);
+  REQUIRE_FALSE(ContainsText(second, "First 1"));
+  REQUIRE(ContainsText(second, "Second 0"));
+  REQUIRE_FALSE(has_semantic_label("Increment First"));
+  REQUIRE(has_semantic_label("Increment Second"));
+
+  indexed_page_selection = 0;
+  const FlattenedScene& restored = runtime.BuildFrame();
+  root = runtime.RootNode();
+  REQUIRE(root->children[0]->identity == first_identity);
+  REQUIRE(root->children[1]->identity == second_identity);
+  REQUIRE(ContainsText(restored, "First 1"));
+  REQUIRE_FALSE(ContainsText(restored, "Second 0"));
+}
+
+TEST_CASE("Pager validates and retains its controlled page set") {
+  REQUIRE_THROWS_AS(Pager({}, 0), std::invalid_argument);
+  REQUIRE_THROWS_AS(Pager({Text("Page")}, 1), std::invalid_argument);
+  REQUIRE_THROWS_AS(Pager({View{}}, 0), std::invalid_argument);
+
+  TestPlatform platform;
+  UiWindow runtime{PagerLayoutApp, platform};
+  runtime.SetWindowMetrics({.viewport = {240.0F, 120.0F}});
+  const FlattenedScene& initial = runtime.BuildFrame();
+
+  const auto* root = runtime.RootNode();
+  REQUIRE(root != nullptr);
+  REQUIRE(root->kind == detail::NodeKind::ScrollView);
+  REQUIRE(root->children.size() == 4);
+  REQUIRE_FALSE(root->children[0]->participates_in_layout);
+  REQUIRE(root->children[1]->participates_in_layout);
+  REQUIRE_FALSE(root->children[2]->participates_in_layout);
+  REQUIRE_FALSE(root->children[3]->participates_in_layout);
+  REQUIRE(root->scroll_state->offset_x == 240.0F);
+  REQUIRE(root->scroll_state->content_width == 720.0F);
+  REQUIRE_FALSE(ContainsText(initial, "First"));
+  REQUIRE(ContainsText(initial, "Second"));
+  REQUIRE_FALSE(ContainsText(initial, "Third"));
+  REQUIRE(runtime.LastCommit().semantic_frame != nullptr);
+  const auto second_semantics = std::ranges::find(
+      runtime.LastCommit().semantic_frame->nodes, std::string{"Second"}, &SemanticNode::label
+  );
+  REQUIRE(second_semantics != runtime.LastCommit().semantic_frame->nodes.end());
+  REQUIRE(second_semantics->selected == std::optional{true});
+  REQUIRE(second_semantics->collection_item == std::optional{SemanticCollectionItem{.index = 1}});
+
+  const std::uint64_t measure_revision = root->measure_revision;
+  const std::uint64_t layout_revision = root->layout_revision;
+  runtime.InvalidateRoot();
+  runtime.BuildFrame();
+  root = runtime.RootNode();
+  REQUIRE(root->measure_revision == measure_revision);
+  REQUIRE(root->layout_revision == layout_revision);
+
+  const std::uint64_t first_identity = root->children[0]->identity;
+  runtime.SetWindowMetrics({.viewport = {300.0F, 120.0F}});
+  runtime.BuildFrame();
+  root = runtime.RootNode();
+  REQUIRE(root->scroll_state->offset_x == 300.0F);
+  REQUIRE(root->children[1]->PresentationBounds().x == Catch::Approx(0.0F));
+
+  pager_selection = 3;
+  runtime.BuildFrame();
+  platform.AdvanceTime(0.25);
+  const FlattenedScene& selected = runtime.BuildFrame();
+  runtime.BuildFrame();
+  root = runtime.RootNode();
+  REQUIRE(root->children[0]->identity == first_identity);
+  REQUIRE(root->children[3]->participates_in_layout);
+  REQUIRE(ContainsText(selected, "Fourth"));
+  const auto fourth_semantics = std::ranges::find(
+      runtime.LastCommit().semantic_frame->nodes, std::string{"Fourth"}, &SemanticNode::label
+  );
+  REQUIRE(fourth_semantics != runtime.LastCommit().semantic_frame->nodes.end());
+  REQUIRE(fourth_semantics->selected == std::optional{false});
+}
+
+TEST_CASE("Pager retains the departing page when a non-adjacent jump returns to its source", "[pager-retarget]") {
+  static Axis axis;
+  axis = GENERATE(Axis::Horizontal, Axis::Vertical);
+  static bool reverse;
+  reverse = GENERATE(false, true);
+  static std::size_t initial_index;
+  initial_index = GENERATE(std::size_t{1}, std::size_t{3});
+  const bool reset_geometry = GENERATE(false, true);
+  static std::vector<std::size_t> settlements;
+  settlements.clear();
+  CAPTURE(axis, reverse, initial_index, reset_geometry);
+
+  TestPlatform platform;
+  UiWindow runtime{[]() -> View {
+    auto selected = UseState(initial_index);
+    pager_selection = selected;
+    return Pager({Text("First"), Text("Second"), Text("Third"), Text("Fourth")}, selected)
+        .ScrollAxis(axis)
+        .Reverse(reverse)
+        .OnChanged([](std::size_t) { FAIL("Programmatic paging must not emit Changed"); })
+        .OnSettled([](std::size_t index) { settlements.push_back(index); });
+  }, platform};
+  runtime.SetWindowMetrics({.viewport = {240.0F, 120.0F}});
+  runtime.BuildFrame();
+  const auto* root = runtime.RootNode();
+  const std::size_t peer_index = initial_index == 1 ? 3 : 1;
+  const std::uint64_t source_identity = root->children[initial_index]->identity;
+  const std::uint64_t peer_identity = root->children[peer_index]->identity;
+  const auto position = [](const detail::MountedNode& page) {
+    const Rect bounds = page.PresentationBounds();
+    return axis == Axis::Vertical ? bounds.y : bounds.x;
+  };
+
+  pager_selection = peer_index;
+  runtime.BuildFrame();
+  platform.AdvanceTime(0.05);
+  runtime.BuildFrame();
+  const float source_position = position(*root->children[initial_index]);
+  const float peer_position = position(*root->children[peer_index]);
+  REQUIRE(source_position != 0.0F);
+  REQUIRE(settlements.empty());
+
+  pager_selection = initial_index;
+  runtime.BuildFrame();
+  REQUIRE(root->children[initial_index]->participates_in_layout);
+  REQUIRE(root->children[peer_index]->participates_in_layout);
+  REQUIRE(position(*root->children[initial_index]) == Catch::Approx(source_position));
+  REQUIRE(position(*root->children[peer_index]) == Catch::Approx(peer_position));
+  REQUIRE(root->children[initial_index]->interaction.enabled);
+  REQUIRE_FALSE(root->children[peer_index]->interaction.enabled);
+  REQUIRE(settlements.empty());
+
+  runtime.SetWindowMetrics({.viewport = {360.0F, 180.0F}});
+  runtime.BuildFrame();
+  REQUIRE(position(*root->children[initial_index]) == Catch::Approx(source_position * 1.5F));
+  REQUIRE(position(*root->children[peer_index]) == Catch::Approx(peer_position * 1.5F));
+  if (reset_geometry) {
+    reverse = !reverse;
+    runtime.InvalidateRoot();
+    runtime.BuildFrame();
+  }
+  SettlePresentation(platform, runtime);
+  REQUIRE(position(*root->children[initial_index]) == Catch::Approx(0.0F));
+  REQUIRE_FALSE(root->children[peer_index]->participates_in_layout);
+  REQUIRE(root->children[initial_index]->identity == source_identity);
+  REQUIRE(root->children[peer_index]->identity == peer_identity);
+  REQUIRE(settlements == std::vector<std::size_t>{initial_index});
+
+  const std::size_t next_peer = initial_index == 1 ? 0 : 2;
+  pager_selection = next_peer;
+  runtime.BuildFrame();
+  platform.AdvanceTime(0.05);
+  runtime.BuildFrame();
+  pager_selection = initial_index;
+  runtime.BuildFrame();
+  REQUIRE(root->children[next_peer]->participates_in_layout);
+  REQUIRE_FALSE(root->children[peer_index]->participates_in_layout);
+  SettlePresentation(platform, runtime);
+  REQUIRE(position(*root->children[initial_index]) == Catch::Approx(0.0F));
+  REQUIRE(std::ranges::count_if(root->children, [](const auto& page) {
+    return page->participates_in_layout;
+  }) == 1);
+  REQUIRE(settlements == std::vector<std::size_t>{initial_index, initial_index});
+}
+
+TEST_CASE("Pager resolves programmatic selection immediately under reduced motion") {
+  reduced_motion_pager_settlements.clear();
+  TestPlatform platform;
+  UiWindow runtime{ReducedMotionPagerApp, platform};
+  runtime.SetWindowMetrics({.viewport = {200.0F, 100.0F}});
+  runtime.BuildFrame();
+
+  REQUIRE(reduced_motion_pager_settlements.empty());
+
+  reduced_motion_pager_selection = 1;
+  runtime.BuildFrame();
+  const FlattenedScene& settled = runtime.BuildFrame();
+  REQUIRE_FALSE(ContainsText(settled, "First"));
+  REQUIRE(ContainsText(settled, "Second"));
+  runtime.BuildFrame();
+  REQUIRE(reduced_motion_pager_settlements == std::vector<std::size_t>{1});
+  runtime.InvalidateRoot();
+  runtime.BuildFrame();
+  REQUIRE(reduced_motion_pager_settlements == std::vector<std::size_t>{1});
+}
+
+TEST_CASE("TestImageMeasuresIntrinsicSizeAndResolvesContainFit") {
+  layout_test_image = ImageAsset::FromEncoded(MakeTestPng(40, 20), 2.0F);
+  layout_test_image_fit = ImageFit::Contain;
+  layout_test_image_horizontal_alignment = HorizontalAlignment::Center;
+  layout_test_image_vertical_alignment = VerticalAlignment::Center;
+  layout_test_image_sampling = ImageSampling::Linear;
+  layout_test_image_frame = {100.0F, 100.0F};
+
+  TestPlatform platform;
+  UiWindow runtime{ImageLayoutApp, platform};
+  runtime.SetWindowMetrics({.viewport = {200.0F, 200.0F}});
+  const FlattenedScene& scene = runtime.BuildFrame();
+
+  const auto image = std::ranges::find_if(scene.Commands(), [](const PaintCommand& command) {
+    return std::holds_alternative<DrawImageCommand>(command);
+  });
+  REQUIRE(image != scene.Commands().end());
+  const auto& command = std::get<DrawImageCommand>(*image);
+  REQUIRE(command.source == Rect{0.0F, 0.0F, 20.0F, 10.0F});
+  REQUIRE(command.destination == Rect{0.0F, 25.0F, 100.0F, 50.0F});
+}
+
+TEST_CASE("TestVectorImageUsesImageLayoutAndSharedPathPainting") {
+  layout_test_vector = VectorAsset::Create({20.0F, 10.0F}, [](VectorBuilder& builder) {
+    builder.FillPath(
+        Path{}.MoveTo({0.0F, 0.0F}).LineTo({20.0F, 0.0F}).LineTo({20.0F, 10.0F}).Close(),
+        Color::Black()
+    );
+  });
+  TestPlatform platform;
+  UiWindow runtime{VectorImageLayoutApp, platform};
+  runtime.SetWindowMetrics({.viewport = {200.0F, 200.0F}});
+  const FlattenedScene& scene = runtime.BuildFrame();
+
+  const auto fill = std::ranges::find_if(scene.Commands(), [](const PaintCommand& command) {
+    return std::holds_alternative<FillPathCommand>(command);
+  });
+  REQUIRE(fill != scene.Commands().end());
+  REQUIRE(BrushIsColor(std::get<FillPathCommand>(*fill).brush, Color::Rgb(90, 120, 180)));
+  REQUIRE(std::ranges::none_of(scene.Commands(), [](const PaintCommand& command) {
+    return std::holds_alternative<DrawImageCommand>(command);
+  }));
+}
+
+TEST_CASE("TestImageRejectsConfigurationForTheWrongAssetFormat") {
+  const ImageAsset raster = ImageAsset::FromEncoded(MakeTestPng(20, 10));
+  const VectorAsset vector = VectorAsset::Create({20.0F, 10.0F}, [](VectorBuilder& builder) {
+    builder.FillPath(Path{}.MoveTo({0.0F, 0.0F}).LineTo({20.0F, 10.0F}), Color::Black());
+  });
+
+  REQUIRE_THROWS_AS(Image(raster).Tint(Color::Black()), std::invalid_argument);
+  REQUIRE_THROWS_AS(Image(vector).Sampling(ImageSampling::Linear), std::invalid_argument);
+  layout_test_external_texture = MakeTestExternalTexture({20.0F, 10.0F});
+  REQUIRE_THROWS_AS(Image(layout_test_external_texture).Tint(Color::Black()), std::invalid_argument);
+}
+
+TEST_CASE("TestExternalTextureUsesImageFitAlignmentAndSampling") {
+  layout_test_external_texture = MakeTestExternalTexture({20.0F, 10.0F});
+  TestPlatform platform;
+  UiWindow runtime{ExternalTextureLayoutApp, platform};
+  runtime.SetWindowMetrics({.viewport = {200.0F, 200.0F}});
+  const FlattenedScene& scene = runtime.BuildFrame();
+  const auto command = std::ranges::find_if(scene.Commands(), [](const PaintCommand& value) {
+    return std::holds_alternative<DrawExternalTextureCommand>(value);
+  });
+
+  REQUIRE(command != scene.Commands().end());
+  const DrawExternalTextureCommand& texture = std::get<DrawExternalTextureCommand>(*command);
+  REQUIRE(texture.source == Rect{10.0F, 0.0F, 10.0F, 10.0F});
+  REQUIRE(texture.destination == Rect{0.0F, 0.0F, 100.0F, 100.0F});
+  REQUIRE(texture.sampling == ImageSampling::Nearest);
+}
+
+TEST_CASE("TestImageFitAndAlignmentResolveSourceAndDestinationGeometry") {
+  layout_test_image = ImageAsset::FromEncoded(MakeTestPng(40, 20), 2.0F);
+  layout_test_image_sampling = ImageSampling::Linear;
+  layout_test_image_frame = {100.0F, 100.0F};
+  const auto render = [](ImageFit fit, HorizontalAlignment horizontal, VerticalAlignment vertical) {
+    TestPlatform platform;
+    layout_test_image_fit = fit;
+    layout_test_image_horizontal_alignment = horizontal;
+    layout_test_image_vertical_alignment = vertical;
+    UiWindow runtime{ImageLayoutApp, platform};
+    runtime.SetWindowMetrics({.viewport = {200.0F, 200.0F}});
+    const FlattenedScene& scene = runtime.BuildFrame();
+    const auto command = std::ranges::find_if(scene.Commands(), [](const PaintCommand& value) {
+      return std::holds_alternative<DrawImageCommand>(value);
+    });
+    REQUIRE(command != scene.Commands().end());
+    return std::get<DrawImageCommand>(*command);
+  };
+
+  const DrawImageCommand fill = render(ImageFit::Fill, HorizontalAlignment::Center, VerticalAlignment::Center);
+  REQUIRE(fill.source == Rect{0.0F, 0.0F, 20.0F, 10.0F});
+  REQUIRE(fill.destination == Rect{0.0F, 0.0F, 100.0F, 100.0F});
+
+  const DrawImageCommand cover = render(ImageFit::Cover, HorizontalAlignment::End, VerticalAlignment::Start);
+  REQUIRE(cover.source == Rect{10.0F, 0.0F, 10.0F, 10.0F});
+  REQUIRE(cover.destination == Rect{0.0F, 0.0F, 100.0F, 100.0F});
+
+  const DrawImageCommand none = render(ImageFit::None, HorizontalAlignment::End, VerticalAlignment::Start);
+  REQUIRE(none.source == Rect{0.0F, 0.0F, 20.0F, 10.0F});
+  REQUIRE(none.destination == Rect{80.0F, 0.0F, 20.0F, 10.0F});
+
+  const DrawImageCommand scale_down =
+      render(ImageFit::ScaleDown, HorizontalAlignment::Center, VerticalAlignment::Center);
+  REQUIRE(scale_down.destination == Rect{40.0F, 45.0F, 20.0F, 10.0F});
+
+  layout_test_image_frame = {10.0F, 10.0F};
+  const DrawImageCommand constrained_scale_down =
+      render(ImageFit::ScaleDown, HorizontalAlignment::Center, VerticalAlignment::Center);
+  REQUIRE(constrained_scale_down.destination == Rect{0.0F, 2.5F, 10.0F, 5.0F});
+}
+
+TEST_CASE("Image cover keeps fractional source rectangles inside intrinsic bounds", "[image-cover]") {
+  for (const auto pixels : {Size{321.0F, 704.0F}, Size{704.0F, 321.0F}}) {
+    const auto encoded =
+        MakeTestPng(static_cast<std::uint32_t>(pixels.width), static_cast<std::uint32_t>(pixels.height));
+    for (const float density : {1.0F, 1.25F, 2.0F}) {
+      layout_test_image = ImageAsset::FromEncoded(encoded, density);
+      layout_test_image_fit = ImageFit::Cover;
+      layout_test_image_sampling = ImageSampling::Linear;
+      const Size intrinsic = layout_test_image.IntrinsicSize();
+      for (const auto frame : {Size{48.023F, 48.023F}, Size{117.809525F, 117.809525F},
+                               Size{118.095238F, 118.095238F}, Size{117.809525F, 78.0625F},
+                               Size{86.0F, 17.0F}, Size{17.0F, 86.0F}}) {
+        for (const auto horizontal :
+             {HorizontalAlignment::Start, HorizontalAlignment::Center, HorizontalAlignment::End}) {
+          for (const auto vertical : {VerticalAlignment::Start, VerticalAlignment::Center, VerticalAlignment::End}) {
+            CAPTURE(intrinsic.width, intrinsic.height, density, frame.width, frame.height, horizontal, vertical);
+            layout_test_image_frame = frame;
+            layout_test_image_horizontal_alignment = horizontal;
+            layout_test_image_vertical_alignment = vertical;
+            TestPlatform platform;
+            UiWindow runtime{ImageLayoutApp, platform};
+            runtime.SetWindowMetrics({.viewport = {200.0F, 200.0F}});
+            const FlattenedScene& scene = runtime.BuildFrame();
+            const auto command = std::ranges::find_if(scene.Commands(), [](const PaintCommand& value) {
+              return std::holds_alternative<DrawImageCommand>(value);
+            });
+            REQUIRE(command != scene.Commands().end());
+            const auto& image = std::get<DrawImageCommand>(*command);
+            REQUIRE(image.source.x >= 0.0F);
+            REQUIRE(image.source.y >= 0.0F);
+            REQUIRE(image.source.width > 0.0F);
+            REQUIRE(image.source.height > 0.0F);
+            REQUIRE(image.source.x + image.source.width <= intrinsic.width);
+            REQUIRE(image.source.y + image.source.height <= intrinsic.height);
+            REQUIRE(image.destination == Rect{0.0F, 0.0F, frame.width, frame.height});
+            REQUIRE(image.source.width / image.source.height == Catch::Approx(frame.width / frame.height));
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST_CASE("Image cover handles fractional frames for vectors and external textures", "[image-cover]") {
+  layout_test_vector = VectorAsset::Create({321.0F, 704.0F}, [](VectorBuilder& builder) {
+    builder.FillPath(
+        Path{}.MoveTo({0.0F, 0.0F}).LineTo({321.0F, 0.0F}).LineTo({321.0F, 704.0F}).Close(), Color::Black()
+    );
+  });
+  layout_test_external_texture = MakeTestExternalTexture({704.0F, 321.0F});
+  TestPlatform platform;
+  UiWindow runtime{[]() -> View {
+    return Row {
+      Image(layout_test_vector)
+          .Fit(ImageFit::Cover)
+          .With(Frame{48.023F, 48.023F}),
+      Image(layout_test_external_texture)
+          .Fit(ImageFit::Cover)
+          .With(Frame{48.023F, 48.023F}),
+    };
+  }, platform};
+  runtime.SetWindowMetrics({.viewport = {200.0F, 200.0F}});
+  const FlattenedScene& scene = runtime.BuildFrame();
+  REQUIRE(std::ranges::any_of(scene.Commands(), [](const PaintCommand& value) {
+    return std::holds_alternative<FillPathCommand>(value);
+  }));
+  const auto command = std::ranges::find_if(scene.Commands(), [](const PaintCommand& value) {
+    return std::holds_alternative<DrawExternalTextureCommand>(value);
+  });
+  REQUIRE(command != scene.Commands().end());
+  const auto& source = std::get<DrawExternalTextureCommand>(*command).source;
+  REQUIRE(source.x >= 0.0F);
+  REQUIRE(source.y >= 0.0F);
+  REQUIRE(source.x + source.width <= 704.0F);
+  REQUIRE(source.y + source.height <= 321.0F);
+}
+
+TEST_CASE("TestImagePaintOnlyChangesReuseMeasuredLayout") {
+  layout_test_image = ImageAsset::FromEncoded(MakeTestPng(40, 20), 2.0F);
+  layout_test_image_fit = ImageFit::Contain;
+  layout_test_image_horizontal_alignment = HorizontalAlignment::Center;
+  layout_test_image_vertical_alignment = VerticalAlignment::Center;
+  layout_test_image_sampling = ImageSampling::Linear;
+  layout_test_image_frame = {100.0F, 100.0F};
+  TestPlatform platform;
+  UiWindow runtime{ImageLayoutApp, platform};
+  runtime.SetWindowMetrics({.viewport = {200.0F, 200.0F}});
+  runtime.BuildFrame();
+
+  const detail::MountedNode* image = runtime.RootNode()->children.front().get();
+  const std::uint64_t measure_revision = image->measure_revision;
+  const std::uint64_t layout_revision = image->layout_revision;
+  const std::uint64_t content_revision = image->render_node.content.Revision();
+
+  layout_test_image = ImageAsset::FromEncoded(MakeTestPng(80, 40), 4.0F);
+  layout_test_image_fit = ImageFit::Cover;
+  layout_test_image_horizontal_alignment = HorizontalAlignment::End;
+  layout_test_image_vertical_alignment = VerticalAlignment::Start;
+  layout_test_image_sampling = ImageSampling::Nearest;
+  runtime.InvalidateRoot();
+  runtime.BuildFrame();
+
+  image = runtime.RootNode()->children.front().get();
+  REQUIRE(image->measure_revision == measure_revision);
+  REQUIRE(image->layout_revision == layout_revision);
+  REQUIRE(image->render_node.content.Revision() > content_revision);
+}
+
+TEST_CASE("TestSpacerAndGrowLayout") {
+  TestPlatform platform;
+  UiWindow runtime{SpacerLayoutApp, platform};
+  runtime.SetWindowMetrics({.viewport = {200.0F, 60.0F}});
+  runtime.BuildFrame();
+
+  const auto* root = runtime.RootNode();
+  REQUIRE(root != nullptr);
+  REQUIRE(root->children[0]->layout_offset.x == 0.0F);
+  REQUIRE(root->children[0]->layout_offset.y == 20.0F);
+  REQUIRE(root->children[1]->layout_offset.x == 20.0F);
+  REQUIRE(root->children[1]->bounds.width == 150.0F);
+  REQUIRE(root->children[2]->layout_offset.x == 170.0F);
+  REQUIRE(root->children[2]->layout_offset.y == 20.0F);
+
+  TestPlatform grow_runtime_platform{platform.platform_resources};
+  UiWindow grow_runtime{GrowLayoutApp, grow_runtime_platform};
+  grow_runtime.SetWindowMetrics({.viewport = {300.0F, 40.0F}});
+  grow_runtime.BuildFrame();
+
+  root = grow_runtime.RootNode();
+  REQUIRE(root->children[0]->bounds.width == 100.0F);
+  REQUIRE(root->children[1]->layout_offset.x == 100.0F);
+  REQUIRE(root->children[1]->bounds.width == 200.0F);
+}
+
+TEST_CASE("Scope and Environment expose effective parent layout values") {
+  TestPlatform platform;
+
+  UiWindow scope_runtime{ScopeGrowApp, platform};
+  scope_runtime.SetWindowMetrics({.viewport = {100.0F, 100.0F}});
+  scope_runtime.BuildFrame();
+  const auto* root = scope_runtime.RootNode();
+  REQUIRE(root != nullptr);
+  REQUIRE(root->children[1]->kind == detail::NodeKind::Scope);
+  REQUIRE(root->children[1]->bounds.height == 80.0F);
+  REQUIRE(root->children[1]->children[0]->bounds.height == 80.0F);
+
+  TestPlatform override_runtime_platform{platform.platform_resources};
+  UiWindow override_runtime{ScopeGrowOverrideApp, override_runtime_platform};
+  override_runtime.SetWindowMetrics({.viewport = {100.0F, 100.0F}});
+  override_runtime.BuildFrame();
+  root = override_runtime.RootNode();
+  REQUIRE(root->children[1]->bounds.height == 20.0F);
+  REQUIRE(root->children[1]->children[0]->bounds.height == 20.0F);
+
+  TestPlatform environment_runtime_platform{platform.platform_resources};
+  UiWindow environment_runtime{EnvironmentScopeGrowApp, environment_runtime_platform};
+  environment_runtime.SetWindowMetrics({.viewport = {100.0F, 100.0F}});
+  environment_runtime.BuildFrame();
+  root = environment_runtime.RootNode();
+  REQUIRE(root->children[1]->kind == detail::NodeKind::Environment);
+  REQUIRE(root->children[1]->bounds.height == 80.0F);
+  REQUIRE(root->children[1]->children[0]->kind == detail::NodeKind::Scope);
+  REQUIRE(root->children[1]->children[0]->children[0]->bounds.height == 80.0F);
+}
+
+TEST_CASE("Scope layout values use boundary override precedence") {
+  TestPlatform platform;
+
+  UiWindow inherited_runtime{ScopeLayoutValueInheritedApp, platform};
+  inherited_runtime.SetWindowMetrics({.viewport = {100.0F, 40.0F}});
+  inherited_runtime.BuildFrame();
+  const auto* root = inherited_runtime.RootNode();
+  REQUIRE(root != nullptr);
+  REQUIRE(root->children[1]->layout_offset.x == 0.0F);
+  REQUIRE(root->children[1]->layout_offset.y == 10.0F);
+
+  TestPlatform override_runtime_platform{platform.platform_resources};
+  UiWindow override_runtime{ScopeLayoutValueOverrideApp, override_runtime_platform};
+  override_runtime.SetWindowMetrics({.viewport = {100.0F, 40.0F}});
+  override_runtime.BuildFrame();
+  root = override_runtime.RootNode();
+  REQUIRE(root->children[1]->layout_offset.x == 40.0F);
+  REQUIRE(root->children[1]->layout_offset.y == 0.0F);
+}
+
+TEST_CASE("TestStackAndStretchAlignment") {
+  TestPlatform platform;
+  UiWindow stack_runtime{StackAlignmentApp, platform};
+  stack_runtime.SetWindowMetrics({.viewport = {100.0F, 80.0F}});
+  stack_runtime.BuildFrame();
+
+  const auto* root = stack_runtime.RootNode();
+  REQUIRE(root != nullptr);
+  REQUIRE(root->children[0]->layout_offset.x == 80.0F);
+  REQUIRE(root->children[0]->layout_offset.y == 35.0F);
+
+  TestPlatform stretch_runtime_platform{platform.platform_resources};
+  UiWindow stretch_runtime{StretchLayoutApp, stretch_runtime_platform};
+  stretch_runtime.SetWindowMetrics({.viewport = {120.0F, 80.0F}});
+  stretch_runtime.BuildFrame();
+
+  root = stretch_runtime.RootNode();
+  REQUIRE(root->children[0]->bounds.width == 120.0F);
+}
+
+TEST_CASE("TestTightCrossAxisAvoidsNestedStretchRemeasurement") {
+  CountingTextPlatform platform;
+  AppOptions options;
+  options.show_debug_overlay = false;
+  UiWindow runtime{NestedStretchLayoutApp, platform, std::move(options)};
+  runtime.SetWindowMetrics({.viewport = {120.0F, 80.0F}});
+  runtime.BuildFrame();
+
+  const auto* root = runtime.RootNode();
+  REQUIRE(root != nullptr);
+  REQUIRE(root->bounds.width == 120.0F);
+  REQUIRE(root->children.size() == 2);
+  REQUIRE(root->children[0]->bounds.width == 120.0F);
+  REQUIRE(root->children[0]->children.size() == 2);
+  REQUIRE(root->children[0]->children[0]->bounds.width == 120.0F);
+  REQUIRE(root->children[0]->children[0]->children.size() == 2);
+  REQUIRE(root->children[0]->children[0]->children[0]->bounds.width == 120.0F);
+  REQUIRE(platform.measure_text_calls == 1);
+}
+
+TEST_CASE("Bounded grow layouts measure deep subtrees once", "[grow-measurement]") {
+  for (const bool horizontal : {false, true}) {
+    for (const auto alignment : {CrossAxisAlignment::Start, CrossAxisAlignment::Center,
+                                CrossAxisAlignment::End, CrossAxisAlignment::Stretch}) {
+      CAPTURE(horizontal, alignment);
+      grow_horizontal = horizontal;
+      grow_cross_alignment = alignment;
+      grow_loose_cross = false;
+      grow_measure_calls.fill(0);
+      TestPlatform platform;
+      UiWindow runtime{DeepGrowLayoutApp, platform};
+      runtime.SetWindowMetrics({.viewport = {400.0F, 600.0F}});
+      runtime.BuildFrame();
+      CHECK(grow_measure_calls[0] == 1);
+      REQUIRE(grow_measured_sizes[0] == (alignment == CrossAxisAlignment::Stretch
+          ? Size{400.0F, 600.0F} : (horizontal ? Size{400.0F, 40.0F} : Size{110.0F, 600.0F})));
+
+      runtime.BuildFrame();
+      CHECK(grow_measure_calls[0] == 1);
+      runtime.SetWindowMetrics({.viewport = {300.0F, 500.0F}});
+      runtime.BuildFrame();
+      CHECK(grow_measure_calls[0] == 2);
+      REQUIRE(grow_measured_sizes[0] == (alignment == CrossAxisAlignment::Stretch
+          ? Size{300.0F, 500.0F} : (horizontal ? Size{300.0F, 40.0F} : Size{110.0F, 500.0F})));
+    }
+  }
+}
+
+TEST_CASE("Bounded grow layouts preserve weighted allocation and placement", "[grow-measurement]") {
+  for (const bool horizontal : {false, true}) {
+    for (const auto alignment : {CrossAxisAlignment::Start, CrossAxisAlignment::Center,
+                                CrossAxisAlignment::End, CrossAxisAlignment::Stretch}) {
+      CAPTURE(horizontal, alignment);
+      grow_horizontal = horizontal;
+      grow_cross_alignment = alignment;
+      grow_measure_calls.fill(0);
+      TestPlatform platform;
+      UiWindow runtime{WeightedGrowLayoutApp, platform};
+      runtime.SetWindowMetrics({.viewport = {400.0F, 600.0F}});
+      runtime.BuildFrame();
+      CHECK(grow_measure_calls == std::array<std::size_t, 3>{1, 1, 1});
+      const float cross = alignment == CrossAxisAlignment::Stretch ? 268.0F : (horizontal ? 40.0F : 110.0F);
+      const float cross_offset = 16.0F + (alignment == CrossAxisAlignment::End ? 268.0F - cross
+          : (alignment == CrossAxisAlignment::Center ? (268.0F - cross) * 0.5F : 0.0F));
+      const auto& children = runtime.RootNode()->children.front()->children;
+      REQUIRE(children.size() == 3);
+      const std::array<float, 3> main_sizes{32.0F, 40.0F, 120.0F};
+      const std::array<float, 3> main_offsets{16.0F, 56.0F, 104.0F};
+      for (std::size_t index = 0; index < children.size(); ++index) {
+        REQUIRE(grow_measured_sizes[index] == (horizontal
+            ? Size{main_sizes[index], cross} : Size{cross, main_sizes[index]}));
+        REQUIRE(children[index]->layout_offset == (horizontal
+            ? Point{main_offsets[index], cross_offset} : Point{cross_offset, main_offsets[index]}));
+      }
+
+      runtime.SetWindowMetrics({.viewport = horizontal ? Size{64.0F, 600.0F} : Size{400.0F, 64.0F}});
+      runtime.BuildFrame();
+      REQUIRE(grow_measured_sizes[0] == (horizontal ? Size{32.0F, cross} : Size{cross, 32.0F}));
+      REQUIRE(grow_measured_sizes[1] == (horizontal ? Size{0.0F, cross} : Size{cross, 0.0F}));
+      REQUIRE(grow_measured_sizes[2] == grow_measured_sizes[1]);
+    }
+  }
+}
+
+TEST_CASE("Stretching grow layouts retain intrinsic cross sizes under loose constraints", "[grow-measurement]") {
+  for (const bool horizontal : {false, true}) {
+    CAPTURE(horizontal);
+    grow_horizontal = horizontal;
+    grow_cross_alignment = CrossAxisAlignment::Stretch;
+    grow_loose_cross = true;
+    grow_measure_calls.fill(0);
+    TestPlatform platform;
+    UiWindow runtime{DeepGrowLayoutApp, platform};
+    runtime.SetWindowMetrics({.viewport = {400.0F, 600.0F}});
+    runtime.BuildFrame();
+    REQUIRE(grow_measure_calls[0] > 0);
+    REQUIRE(grow_measured_sizes[0] == (horizontal ? Size{400.0F, 40.0F} : Size{110.0F, 600.0F}));
+  }
+}
+
+TEST_CASE("Grow layouts retain natural main sizes under unbounded constraints", "[grow-measurement]") {
+  for (const bool horizontal : {false, true}) {
+    for (const auto alignment : {CrossAxisAlignment::Start, CrossAxisAlignment::Stretch}) {
+      CAPTURE(horizontal, alignment);
+      grow_horizontal = horizontal;
+      grow_cross_alignment = alignment;
+      grow_measure_calls.fill(0);
+      TestPlatform platform;
+      UiWindow runtime{UnboundedGrowLayoutApp, platform};
+      runtime.SetWindowMetrics({.viewport = {400.0F, 600.0F}});
+      runtime.BuildFrame();
+      REQUIRE(grow_measure_calls[0] > 0);
+      REQUIRE((horizontal ? grow_measured_sizes[0].width : grow_measured_sizes[0].height) ==
+          (horizontal ? 110.0F : 40.0F));
+    }
+  }
+}
+
+TEST_CASE("Deep grow layouts keep virtual list measurement bounded while scrolling", "[grow-measurement]") {
+  grow_measure_calls.fill(0);
+  TestPlatform platform;
+  UiWindow runtime{DeepGrowVirtualListApp, platform};
+  runtime.SetWindowMetrics({.viewport = {400.0F, 600.0F}});
+  runtime.BuildFrame();
+  const auto initial_calls = grow_measure_calls[0];
+  REQUIRE(initial_calls > 0);
+  REQUIRE(initial_calls < 100);
+  const auto* list = runtime.RootNode();
+  while (list->virtual_state == nullptr) {
+    REQUIRE(list->children.size() == 1);
+    list = list->children.front().get();
+  }
+  REQUIRE(list->virtual_state->realized_indices.front() == 0);
+
+  runtime.HandleScrollInput(ScrollInputEvent{{200.0F, 300.0F}, 0.0F, 1000.0F});
+  runtime.BuildFrame();
+  REQUIRE(list->virtual_state->realized_indices.front() > 0);
+  REQUIRE(grow_measure_calls[0] > initial_calls);
+  REQUIRE(grow_measure_calls[0] < 200);
+}
+
+TEST_CASE("Layout priority protects measured sizes across the Grow threshold", "[layout-priority]") {
+  for (const bool vertical : {false, true}) {
+    CAPTURE(vertical);
+    grow_horizontal = !vertical;
+    TestPlatform platform;
+    UiWindow runtime{[] {
+      View first = GrowMeasureProbe {}.LayoutValue<GrowProbeSize>({80.0F, 80.0F}).With(LayoutPriority(1.0F), Grow());
+      View second = GrowMeasureProbe {}.LayoutValue<GrowProbeSize>({20.0F, 20.0F}).With(LayoutPriority(-1.0F), Grow());
+      View layout = grow_horizontal ? View{Row {first, second}} : View{Column {first, second}};
+      return std::move(layout).With(Spacing(8.0F));
+    }, platform};
+
+    for (const float extra : {-10.0F, 0.0F, 40.0F}) {
+      CAPTURE(extra);
+      const float extent = 108.0F + extra;
+      runtime.SetWindowMetrics({.viewport = vertical ? Size{300.0F, extent} : Size{extent, 300.0F}});
+      runtime.BuildFrame();
+      const auto& children = runtime.RootNode()->children;
+      REQUIRE(children.size() == 2);
+      const float first = vertical ? children[0]->bounds.height : children[0]->bounds.width;
+      const float second = vertical ? children[1]->bounds.height : children[1]->bounds.width;
+      CHECK(first == 80.0F + std::max(0.0F, extra * 0.5F));
+      CHECK(second == 20.0F + (extra < 0.0F ? extra : extra * 0.5F));
+    }
+  }
+}
+
+TEST_CASE("Equal layout priorities share only the size above Frame minima", "[layout-priority]") {
+  TestPlatform platform;
+  UiWindow runtime{[]() -> View {
+    return Row {
+      GrowMeasureProbe {}.With(LayoutPriority(0.0F), Frame{.min_width = 30.0F}),
+      Scope([] { return GrowMeasureProbe {}.With(Frame{.width = 80.0F, .min_width = 60.0F}); }),
+    };
+  }, platform};
+
+  runtime.SetWindowMetrics({.viewport = {140.0F, 200.0F}});
+  runtime.BuildFrame();
+  const auto& children = runtime.RootNode()->children;
+  CHECK(children[0]->bounds.width == 70.0F);
+  CHECK(children[1]->bounds.width == 70.0F);
+
+  runtime.SetWindowMetrics({.viewport = {70.0F, 200.0F}});
+  runtime.BuildFrame();
+  CHECK(runtime.RootNode()->bounds.width == 70.0F);
+  CHECK(children[0]->bounds.width == 30.0F);
+  CHECK(children[1]->bounds.width == 60.0F);
+  CHECK(children[1]->layout_offset.x == 30.0F);
+}
+
+TEST_CASE("Grow redistributes surplus after a priority child reaches its Frame maximum", "[layout-priority]") {
+  TestPlatform platform;
+  UiWindow runtime{[]() -> View {
+    return Row {
+      Scope([] {
+        return GrowMeasureProbe {}.With(LayoutPriority(1.0F), Grow(3.0F), Frame{.max_width = 130.0F});
+      }),
+      GrowMeasureProbe {}.With(Grow()),
+    };
+  }, platform};
+
+  runtime.SetWindowMetrics({.viewport = {300.0F, 200.0F}});
+  runtime.BuildFrame();
+  CHECK(runtime.RootNode()->children[0]->bounds.width == 130.0F);
+  CHECK(runtime.RootNode()->children[1]->bounds.width == 170.0F);
+}
+
+TEST_CASE("Layout priority uses wrapped text height after compression", "[layout-priority]") {
+  for (const auto alignment : {CrossAxisAlignment::Start, CrossAxisAlignment::Stretch}) {
+    CAPTURE(alignment);
+    grow_cross_alignment = alignment;
+    TestPlatform platform;
+    UiWindow runtime{[]() -> View {
+      return Stack {
+        Row {
+          Text("abcdefghij"),
+          Spacer().With(Frame{.width = 20.0F}, Grow(0.0F), LayoutPriority(1.0F)),
+        }.With(CrossAlign(grow_cross_alignment)),
+      }.With(Align(HorizontalAlignment::Start, VerticalAlignment::Start));
+    }, platform};
+
+    runtime.SetWindowMetrics({.viewport = {60.0F, 100.0F}});
+    runtime.BuildFrame();
+    const auto& row = *runtime.RootNode()->children[0];
+    CHECK(row.children[0]->bounds.width == 40.0F);
+    CHECK(row.children[0]->bounds.height == 60.0F);
+    CHECK(row.children[1]->bounds.width == 20.0F);
+    CHECK(row.bounds.height == 60.0F);
+  }
+}
+
+TEST_CASE("Layout priority allocates space from the stretched child sizes", "[layout-priority]") {
+  struct AspectProbe : Layout<AspectProbe> {
+    using Layout::Layout;
+
+    static LayoutResult Measure(LayoutContext&, ViewNode&, Constraints constraints) {
+      const float height = constraints.ConstrainHeight(20.0F);
+      return LayoutResult{}.SetSize(constraints.Constrain({2.0F * height, height}));
+    }
+  };
+
+  TestPlatform platform;
+  UiWindow runtime{[]() -> View {
+    return Stack {
+      Row {
+        AspectProbe {}.With(Grow()),
+        GrowMeasureProbe {}.LayoutValue<GrowProbeSize>({50.0F, 60.0F}).With(Grow(), LayoutPriority(1.0F)),
+      }.With(CrossAlign(CrossAxisAlignment::Stretch)),
+    }.With(Align(HorizontalAlignment::Start, VerticalAlignment::Start));
+  }, platform};
+
+  const std::array cases{
+      std::array{130.0F, 80.0F, 50.0F},
+      std::array{170.0F, 120.0F, 50.0F},
+      std::array{200.0F, 135.0F, 65.0F},
+  };
+  for (const auto& [width, first_width, second_width] : cases) {
+    CAPTURE(width);
+    runtime.SetWindowMetrics({.viewport = {width, 100.0F}});
+    runtime.BuildFrame();
+    const auto& row = *runtime.RootNode()->children[0];
+    CHECK(row.children[0]->bounds == Rect{0.0F, 0.0F, first_width, 60.0F});
+    CHECK(row.children[1]->bounds == Rect{0.0F, 0.0F, second_width, 60.0F});
+    CHECK(row.children[1]->layout_offset.x == first_width);
+  }
+}
+
+TEST_CASE("Custom layouts read priority through the effective layout value", "[layout-priority]") {
+  struct Probe : Layout<Probe> {
+    using Layout::Layout;
+
+    static LayoutResult Measure(LayoutContext& context, ViewNode& node, Constraints constraints) {
+      auto& child = node.ChildAt(0);
+      const auto value = child.LayoutValueOr<LayoutPriority>(0.0F);
+      const auto size = context.Measure(child, constraints.LooseWidth().TightWidth(20.0F + value));
+      return LayoutResult{}.Place(child, {}).SetSize(size);
+    }
+  };
+
+  layout_priority = -5.0F;
+  TestPlatform platform;
+  UiWindow runtime{[]() -> View {
+    return Probe {
+      Scope([] { return GrowMeasureProbe {}.With(LayoutPriority(4.0F)); }).With(LayoutPriority(layout_priority)),
+    };
+  }, platform};
+  runtime.SetWindowMetrics({.viewport = {90.0F, 100.0F}});
+  runtime.BuildFrame();
+  CHECK(runtime.RootNode()->children[0]->bounds.width == 15.0F);
+}
+
+TEST_CASE("Layout priority rejects nonfinite declarations", "[layout-priority]") {
+  for (const float priority : {std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(),
+                               std::numeric_limits<float>::quiet_NaN()}) {
+    layout_priority = priority;
+    TestPlatform platform;
+    UiWindow runtime{[] { return Text("Invalid").With(LayoutPriority(layout_priority)); }, platform};
+    CHECK_THROWS_AS(runtime.BuildFrame(), std::invalid_argument);
+  }
+}
+
+TEST_CASE("TestWrappedTextMeasurement") {
+  TestPlatform platform;
+  UiWindow runtime{WrappedTextApp, platform};
+  runtime.SetWindowMetrics({.viewport = {40.0F, 100.0F}});
+  runtime.BuildFrame();
+
+  const auto* root = runtime.RootNode();
+  REQUIRE(root != nullptr);
+  REQUIRE(root->children[0]->bounds.width == 40.0F);
+  REQUIRE(root->children[0]->bounds.height == 60.0F);
+}
+
+TEST_CASE("TextCarriesHorizontalAndVerticalAlignmentIntoParagraphPainting") {
+  TestPlatform platform;
+  UiWindow runtime{AlignedTextApp, platform};
+  runtime.SetWindowMetrics({.viewport = {80.0F, 40.0F}});
+  const FlattenedScene& scene = runtime.BuildFrame();
+
+  const DrawTextCommand* text = FindText(scene, "aligned");
+  REQUIRE(text != nullptr);
+  REQUIRE(text->options.align == TextAlign::Trailing);
+  REQUIRE(text->options.vertical_align == TextVerticalAlign::Bottom);
+}
+
+TEST_CASE("TestAdaptiveFrameConstraints") {
+  TestPlatform platform;
+  UiWindow runtime{AdaptiveFrameApp, platform};
+  runtime.SetWindowMetrics({.viewport = {120.0F, 400.0F}});
+  runtime.BuildFrame();
+
+  const auto* root = runtime.RootNode();
+  REQUIRE(root != nullptr);
+  REQUIRE(root->children.size() == 7);
+  REQUIRE(root->children[0]->measured_size.width == 80.0F);
+  REQUIRE(root->children[0]->measured_size.height == 20.0F);
+  REQUIRE(root->children[1]->measured_size.width == 40.0F);
+  REQUIRE(root->children[1]->measured_size.height == 35.0F);
+  REQUIRE(root->children[2]->measured_size.width == 60.0F);
+  REQUIRE(root->children[2]->measured_size.height == 25.0F);
+  REQUIRE(root->children[3]->measured_size.width == 30.0F);
+  REQUIRE(root->children[3]->measured_size.height == 15.0F);
+  REQUIRE(root->children[4]->measured_size.width == 70.0F);
+  REQUIRE(root->children[4]->measured_size.height == 40.0F);
+  REQUIRE(root->children[5]->measured_size.width == 55.0F);
+  REQUIRE(root->children[5]->measured_size.height == 30.0F);
+  REQUIRE(root->children[6]->measured_size.width == 80.0F);
+  REQUIRE(root->children[6]->measured_size.height == 40.0F);
+}
+
+TEST_CASE("TestFrameConstraintsRespectParentAndBoundContainers") {
+  TestPlatform platform;
+  UiWindow constrained{ParentConstrainedFrameApp, platform};
+  constrained.SetWindowMetrics({.viewport = {80.0F, 60.0F}});
+  constrained.BuildFrame();
+
+  const auto* root = constrained.RootNode();
+  REQUIRE(root != nullptr);
+  REQUIRE(root->measured_size.width == 80.0F);
+  REQUIRE(root->measured_size.height == 60.0F);
+
+  TestPlatform containers_platform{platform.platform_resources};
+  UiWindow containers{BoundedContainerFrameApp, containers_platform};
+  containers.SetWindowMetrics({.viewport = {120.0F, 200.0F}});
+  containers.BuildFrame();
+
+  root = containers.RootNode();
+  REQUIRE(root != nullptr);
+  REQUIRE(root->children[0]->measured_size.height == 40.0F);
+  REQUIRE(root->children[1]->measured_size.height == 60.0F);
+}
+
+TEST_CASE("TestFrameConstraintValidation") {
+  {
+    TestPlatform platform;
+    UiWindow runtime{[] { return Text("A").With(Frame{.width = -1.0F}); }, platform};
+    REQUIRE_THROWS_AS(runtime.BuildFrame(), std::invalid_argument);
+  }
+  {
+    TestPlatform platform;
+    UiWindow runtime{[] { return Text("A").With(Frame{.min_width = 50.0F, .max_width = 40.0F}); }, platform};
+    REQUIRE_THROWS_AS(runtime.BuildFrame(), std::invalid_argument);
+  }
+  {
+    TestPlatform platform;
+    UiWindow runtime{
+        [] { return Text("A").With(Frame{.min_height = 50.0F}, Frame{.max_height = 40.0F}); },
+        platform,
+    };
+    REQUIRE_THROWS_AS(runtime.BuildFrame(), std::invalid_argument);
+  }
+}
+
+TEST_CASE("TestFlowWrapsAndAlignsChildrenWithinLines") {
+  TestPlatform platform;
+  UiWindow runtime{FlowWrapApp, platform};
+  runtime.SetWindowMetrics({.viewport = {120.0F, 100.0F}});
+  runtime.BuildFrame();
+
+  const auto* root = runtime.RootNode();
+  REQUIRE(root != nullptr);
+  const auto& flow = *root->children[0];
+  REQUIRE(flow.layout_descriptor->type == std::type_index(typeid(Flow)));
+  REQUIRE(flow.measured_size.width == 90.0F);
+  REQUIRE(flow.measured_size.height == 40.0F);
+  REQUIRE(flow.children[0]->layout_offset.x == 0.0F);
+  REQUIRE(flow.children[0]->layout_offset.y == 5.0F);
+  REQUIRE(flow.children[1]->layout_offset.x == 45.0F);
+  REQUIRE(flow.children[1]->layout_offset.y == 0.0F);
+  REQUIRE(flow.children[2]->layout_offset.x == 0.0F);
+  REQUIRE(flow.children[2]->layout_offset.y == 25.0F);
+}
+
+TEST_CASE("TestFlowAppliesMainAlignmentPerLine") {
+  TestPlatform platform;
+  UiWindow runtime{FlowAlignmentApp, platform};
+  runtime.SetWindowMetrics({.viewport = {120.0F, 100.0F}});
+  runtime.BuildFrame();
+
+  const auto* root = runtime.RootNode();
+  REQUIRE(root != nullptr);
+  const auto& flow = *root->children[0];
+  REQUIRE(flow.children[0]->layout_offset.x == 15.0F);
+  REQUIRE(flow.children[1]->layout_offset.x == 55.0F);
+}
+
+TEST_CASE("TestFlowDistributesGrowWithinEachLine") {
+  TestPlatform platform;
+  UiWindow runtime{FlowGrowApp, platform};
+  runtime.SetWindowMetrics({.viewport = {120.0F, 100.0F}});
+  runtime.BuildFrame();
+
+  const auto* root = runtime.RootNode();
+  REQUIRE(root != nullptr);
+  const auto& flow = *root->children[0];
+  REQUIRE(flow.children[0]->measured_size.width == 30.0F);
+  REQUIRE(flow.children[0]->layout_offset.y == 5.0F);
+  REQUIRE(flow.children[1]->measured_size.width == 60.0F);
+  REQUIRE(flow.children[1]->layout_offset.x == 40.0F);
+  REQUIRE(flow.children[2]->measured_size.width == 80.0F);
+  REQUIRE(flow.children[2]->layout_offset.x == 0.0F);
+  REQUIRE(flow.children[2]->layout_offset.y == 30.0F);
+}
+
+TEST_CASE("TestFlowKeepsIntrinsicGrowSizesWithUnboundedWidth") {
+  TestPlatform platform;
+  UiWindow runtime{UnboundedFlowApp, platform};
+  runtime.SetWindowMetrics({.viewport = {200.0F, 100.0F}});
+  runtime.BuildFrame();
+
+  const auto* root = runtime.RootNode();
+  REQUIRE(root != nullptr);
+  const auto& flow = *root->children[0];
+  REQUIRE(flow.measured_size.width == 65.0F);
+  REQUIRE(flow.children[0]->measured_size.width == 30.0F);
+  REQUIRE(flow.children[1]->measured_size.width == 30.0F);
+  REQUIRE(flow.children[1]->layout_offset.x == 35.0F);
+}
+
+TEST_CASE("TestForEachFlattensChildren") {
+  TestPlatform platform;
+  UiWindow runtime{ForEachLayoutApp, platform};
+  runtime.SetWindowMetrics({.viewport = {200.0F, 160.0F}});
+  runtime.BuildFrame();
+
+  const auto* root = runtime.RootNode();
+  REQUIRE(root != nullptr);
+  REQUIRE(root->children.size() == 5);
+  REQUIRE(root->children[0]->text.PlainText() == "Header");
+  REQUIRE(root->children[1]->text.PlainText() == "First");
+  REQUIRE(root->children[2]->text.PlainText() == "Second");
+  REQUIRE(root->children[3]->text.PlainText() == "Third");
+  REQUIRE(root->children[4]->text.PlainText() == "Footer");
+  REQUIRE(root->children[0]->layout_offset.y == 0.0F);
+  REQUIRE(root->children[1]->layout_offset.y == 25.0F);
+  REQUIRE(root->children[2]->layout_offset.y == 50.0F);
+  REQUIRE(root->children[3]->layout_offset.y == 75.0F);
+  REQUIRE(root->children[4]->layout_offset.y == 100.0F);
+}
+
+TEST_CASE("TestForEachKeyedIdentity") {
+  TestPlatform platform;
+  UiWindow runtime{ForEachIdentityApp, platform};
+  runtime.SetWindowMetrics({.viewport = {320.0F, 320.0F}});
+  runtime.BuildFrame();
+
+  const auto* root = runtime.RootNode();
+  REQUIRE(root != nullptr);
+  REQUIRE(root->children.size() == 3);
+  const std::uint64_t first_identity = root->children[0]->identity;
+
+  InvokeClick(*root->children[0]->children[0]->children[1]);
+  runtime.BuildFrame();
+  root = runtime.RootNode();
+  REQUIRE(root->children[0]->children[0]->children[0]->text.PlainText() == "1");
+
+  InvokeClick(*root->children[2]);
+  runtime.BuildFrame();
+
+  root = runtime.RootNode();
+  REQUIRE(root->children.size() == 4);
+  REQUIRE(root->children[2]->identity == first_identity);
+  REQUIRE(root->children[2]->children[0]->children[0]->text.PlainText() == "1");
+
+  InvokeClick(*root->children[3]);
+  runtime.BuildFrame();
+
+  root = runtime.RootNode();
+  REQUIRE(root->children.size() == 3);
+  REQUIRE(root->children[0]->identity == first_identity);
+  REQUIRE(root->children[0]->children[0]->children[0]->text.PlainText() == "1");
+}
+
+TEST_CASE("TestReactiveStateApis") {
+  State<int> empty;
+  REQUIRE(!empty.IsValid());
+
+  TestPlatform platform;
+  UiWindow runtime{ReactiveStateApiApp, platform};
+  runtime.SetWindowMetrics({.viewport = {320.0F, 240.0F}});
+  runtime.BuildFrame();
+
+  const auto* root = runtime.RootNode();
+  REQUIRE(root != nullptr);
+  REQUIRE(root->children.size() == 4);
+  REQUIRE(root->children[0]->text.PlainText() == "Taps 2");
+  REQUIRE(root->children[1]->text.PlainText() == "Alpha");
+  REQUIRE(root->children[2]->text.PlainText() == "Bravo");
+
+  InvokeClick(*root->children[3]);
+  runtime.BuildFrame();
+
+  root = runtime.RootNode();
+  REQUIRE(root->children.size() == 5);
+  REQUIRE(root->children[0]->text.PlainText() == "Taps 3");
+  REQUIRE(root->children[3]->text.PlainText() == "Charlie");
+}
+
+TEST_CASE("TestLayoutReusesUnchangedMeasurements") {
+  TestPlatform platform;
+  UiWindow runtime{CachedLayoutApp, platform};
+  runtime.SetWindowMetrics({.viewport = {200.0F, 100.0F}});
+  runtime.BuildFrame();
+
+  const auto* root = runtime.RootNode();
+  REQUIRE(root != nullptr);
+  REQUIRE(root->children.size() == 2);
+  const std::uint64_t root_measure_revision = root->measure_revision;
+  const std::uint64_t root_layout_revision = root->layout_revision;
+  const std::uint64_t changed_measure_revision = root->children[0]->measure_revision;
+  const std::uint64_t stable_measure_revision = root->children[1]->measure_revision;
+  const std::uint64_t stable_layout_revision = root->children[1]->layout_revision;
+
+  runtime.BuildFrame();
+
+  root = runtime.RootNode();
+  REQUIRE(root->measure_revision == root_measure_revision);
+  REQUIRE(root->layout_revision == root_layout_revision);
+  REQUIRE(root->children[0]->measure_revision == changed_measure_revision);
+  REQUIRE(root->children[1]->measure_revision == stable_measure_revision);
+  REQUIRE(root->children[1]->layout_revision == stable_layout_revision);
+
+  use_long_cached_text = true;
+  runtime.BuildFrame();
+
+  root = runtime.RootNode();
+  REQUIRE(root->measure_revision > root_measure_revision);
+  REQUIRE(root->children[0]->measure_revision > changed_measure_revision);
+  REQUIRE(root->children[1]->measure_revision == stable_measure_revision);
+  REQUIRE(root->children[1]->layout_revision == stable_layout_revision);
+
+  runtime.SetWindowMetrics({.viewport = {240.0F, 100.0F}});
+  runtime.BuildFrame();
+
+  root = runtime.RootNode();
+  REQUIRE(root->children[1]->measure_revision > stable_measure_revision);
+}
+
+TEST_CASE("TestScopedLayoutInvalidationPropagatesToAncestors") {
+  TestPlatform platform;
+  UiWindow runtime{ScopedCachedLayoutApp, platform};
+  runtime.SetWindowMetrics({.viewport = {200.0F, 100.0F}});
+  runtime.BuildFrame();
+
+  const auto* root = runtime.RootNode();
+  REQUIRE(root != nullptr);
+  const std::uint64_t root_measure_revision = root->measure_revision;
+  const std::uint64_t scope_measure_revision = root->children[0]->measure_revision;
+  const std::uint64_t scoped_text_measure_revision = root->children[0]->children[0]->measure_revision;
+  const std::uint64_t stable_measure_revision = root->children[1]->measure_revision;
+  const std::uint64_t stable_layout_revision = root->children[1]->layout_revision;
+
+  expand_cached_scope = true;
+  runtime.BuildFrame();
+
+  root = runtime.RootNode();
+  REQUIRE(root->measure_revision > root_measure_revision);
+  REQUIRE(root->children[0]->measure_revision > scope_measure_revision);
+  REQUIRE(root->children[0]->children[0]->measure_revision > scoped_text_measure_revision);
+  REQUIRE(root->children[1]->measure_revision == stable_measure_revision);
+  REQUIRE(root->children[1]->layout_revision > stable_layout_revision);
+  REQUIRE(root->children[1]->layout_offset.y == 40.0F);
+}
+
+TEST_CASE("TestNonComparableLayoutValueInvalidatesConservatively") {
+  TestPlatform platform;
+  UiWindow runtime{OpaqueLayoutValueApp, platform};
+  runtime.SetWindowMetrics({.viewport = {200.0F, 100.0F}});
+  runtime.BuildFrame();
+
+  const auto* root = runtime.RootNode();
+  REQUIRE(root != nullptr);
+  const std::uint64_t measure_revision = root->measure_revision;
+
+  update_opaque_layout_value = true;
+  runtime.BuildFrame();
+
+  root = runtime.RootNode();
+  REQUIRE(root->measure_revision > measure_revision);
+}
+
+TEST_CASE("TestCustomLayoutProtocol") {
+  TestPlatform platform;
+  UiWindow runtime{CustomLayoutApp, platform};
+  runtime.SetWindowMetrics({.viewport = {100.0F, 100.0F}});
+  runtime.BuildFrame();
+
+  const auto* root = runtime.RootNode();
+  REQUIRE(root != nullptr);
+  REQUIRE(root->kind == pingcore::detail::NodeKind::Layout);
+  REQUIRE(root->layout_descriptor->type == std::type_index(typeid(TestFlow)));
+  REQUIRE(root->children.size() == 3);
+  REQUIRE(root->children[0]->bounds.x == 0.0F);
+  REQUIRE(root->children[0]->bounds.y == 0.0F);
+  REQUIRE(root->children[0]->layout_offset.x == 5.0F);
+  REQUIRE(root->children[0]->layout_offset.y == 5.0F);
+  REQUIRE(root->children[0]->PresentationBounds().x == 5.0F);
+  REQUIRE(root->children[0]->PresentationBounds().y == 5.0F);
+  REQUIRE(root->children[1]->layout_offset.x == 5.0F);
+  REQUIRE(root->children[1]->layout_offset.y == 20.0F);
+  REQUIRE(root->children[2]->layout_offset.x == 50.0F);
+  REQUIRE(root->children[2]->layout_offset.y == 20.0F);
+}
+
+TEST_CASE("ViewNodeChildAccessChecksMutableAndConstBounds") {
+  class CheckedLayout final : public Layout<CheckedLayout> {
+  public:
+    using Layout::Layout;
+
+    static LayoutResult Measure(LayoutContext& context, ViewNode& node, Constraints constraints) {
+      const ViewNode& read_only = node;
+      std::size_t index = 0;
+      for (ViewNode& child : node.Children()) {
+        REQUIRE(&node.ChildAt(index) == &child);
+        REQUIRE(&read_only.ChildAt(index) == &child);
+        ++index;
+      }
+      REQUIRE(index == node.ChildCount());
+      constexpr auto maximum_index = std::numeric_limits<std::size_t>::max();
+      REQUIRE_THROWS_AS(node.ChildAt(node.ChildCount()), std::out_of_range);
+      REQUIRE_THROWS_AS(read_only.ChildAt(read_only.ChildCount()), std::out_of_range);
+      REQUIRE_THROWS_AS(node.ChildAt(maximum_index), std::out_of_range);
+      REQUIRE_THROWS_AS(read_only.ChildAt(maximum_index), std::out_of_range);
+      return Column::Measure(context, node, constraints);
+    }
+  };
+
+  const bool empty = GENERATE(true, false);
+  RootFactory root_factory = []() -> View { return CheckedLayout {}; };
+  if (!empty) {
+    root_factory = []() -> View {
+      return CheckedLayout {
+        Text("First"),
+        Text("Second"),
+      };
+    };
+  }
+  TestPlatform platform;
+  UiWindow runtime{root_factory, platform};
+  runtime.SetWindowMetrics({.viewport = {100.0F, 100.0F}});
+  runtime.BuildFrame();
+}
+
+TEST_CASE("TestLayoutTypeParticipatesInIdentity") {
+  TestPlatform platform;
+  UiWindow runtime{LayoutIdentityApp, platform};
+  runtime.SetWindowMetrics({.viewport = {100.0F, 100.0F}});
+  runtime.BuildFrame();
+
+  const auto* root = runtime.RootNode();
+  REQUIRE(root != nullptr);
+  const std::uint64_t row_identity = root->identity;
+  REQUIRE(root->layout_descriptor->type == std::type_index(typeid(Row)));
+
+  use_column_layout = true;
+  runtime.BuildFrame();
+  root = runtime.RootNode();
+  REQUIRE(root->identity != row_identity);
+  REQUIRE(root->layout_descriptor->type == std::type_index(typeid(Column)));
+}
+
+} // namespace pingcore::test

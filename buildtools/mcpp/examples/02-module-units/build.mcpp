@@ -1,0 +1,11 @@
+// The whole build program. `pingcore.rules` arrives through the pingcore
+// dependency, which re-exports it, so this file names no package of its own.
+
+import mcpp;
+import pingcore.rules;
+
+int main() {
+    return pingcore::rules::configure({
+        .resources = "resources",
+    }) ? 0 : 1;
+}

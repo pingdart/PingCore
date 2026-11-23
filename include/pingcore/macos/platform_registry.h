@@ -1,0 +1,497 @@
+#pragma once
+
+#if defined(__OBJC__)
+#import <AppKit/AppKit.h>
+#import <Foundation/Foundation.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
+@class HUXExternalTexture;
+
+/// Retains a C++ FileReference while exposing its native file URL to AppKit libraries.
+NS_SWIFT_NAME(FileReference)
+@interface HUXFileReference : NSObject
+
+@property(nonatomic, readonly) NSURL* fileURL;
+
+- (instancetype)init NS_UNAVAILABLE;
++ (instancetype)new NS_UNAVAILABLE;
+
+@end
+
+/// Retains address-stable memory without taking a byte snapshot.
+/// The owner must keep the pointer valid; it may be released on the last reader's thread.
+/// Synchronize producer writes with readers. Never retain pointers borrowed from temporary Swift Data storage.
+NS_SWIFT_NAME(BufferReference)
+@interface HUXBufferReference : NSObject
+
+- (instancetype)init NS_UNAVAILABLE;
++ (instancetype)new NS_UNAVAILABLE;
+- (instancetype)initWithBytes:(const void* _Nullable)bytes length:(NSUInteger)length owner:(id)owner
+    NS_SWIFT_NAME(init(bytes:length:owner:));
+
+/// Borrows read-only memory for the callback only. The pointer must not escape.
+/// @param reader Synchronous reader; retain the reference itself for asynchronous work.
+- (void)withUnsafeBytes:(void (^)(const void* _Nullable bytes, NSUInteger length))reader
+    NS_SWIFT_NAME(withUnsafeBytes(_:));
+
+/// Returns a retained subrange without copying.
+/// @param offset Byte offset relative to this reference.
+/// @param length Byte count; an out-of-range slice raises NSInvalidArgumentException.
+- (HUXBufferReference*)sliceWithOffset:(NSUInteger)offset length:(NSUInteger)length
+    NS_SWIFT_NAME(slice(offset:length:));
+
+@end
+
+typedef NS_ENUM(NSInteger, HUXPlatformPayloadKind) {
+  HUXPlatformPayloadKindNull,
+  HUXPlatformPayloadKindBoolean,
+  HUXPlatformPayloadKindInteger,
+  HUXPlatformPayloadKindDouble,
+  HUXPlatformPayloadKindString,
+  HUXPlatformPayloadKindBytes,
+  HUXPlatformPayloadKindList,
+  HUXPlatformPayloadKindObject,
+  HUXPlatformPayloadKindExternalTexture,
+  HUXPlatformPayloadKindFileReference,
+  HUXPlatformPayloadKindBufferReference,
+} NS_SWIFT_NAME(PlatformPayload.Kind);
+
+NS_SWIFT_NAME(PlatformPayload)
+@interface HUXPlatformPayload : NSObject
+
+@property(nonatomic, readonly) HUXPlatformPayloadKind kind;
+
+- (instancetype)init NS_UNAVAILABLE;
++ (instancetype)new NS_UNAVAILABLE;
+
++ (instancetype)nullValue NS_SWIFT_NAME(null());
++ (instancetype)booleanValue:(BOOL)value NS_SWIFT_NAME(boolean(_:));
++ (instancetype)integerValue:(int64_t)value NS_SWIFT_NAME(integer(_:));
++ (instancetype)doubleValue:(double)value NS_SWIFT_NAME(double(_:));
++ (instancetype)stringValue:(NSString*)value NS_SWIFT_NAME(string(_:));
++ (instancetype)bytesValue:(NSData*)value NS_SWIFT_NAME(bytes(_:));
++ (instancetype)listValue:(NSArray<HUXPlatformPayload*>*)value NS_SWIFT_NAME(list(_:));
++ (instancetype)objectValue:(NSDictionary<NSString*, HUXPlatformPayload*>*)value NS_SWIFT_NAME(object(_:));
++ (instancetype)externalTextureValue:(HUXExternalTexture*)texture NS_SWIFT_NAME(externalTexture(_:));
++ (instancetype)fileReferenceValue:(HUXFileReference*)reference NS_SWIFT_NAME(fileReference(_:));
++ (instancetype)bufferReferenceValue:(HUXBufferReference*)reference NS_SWIFT_NAME(bufferReference(_:));
+
+- (BOOL)booleanValue NS_SWIFT_NAME(boolean());
+- (int64_t)integerValue NS_SWIFT_NAME(integer());
+- (double)doubleValue NS_SWIFT_NAME(double());
+- (NSString*)stringValue NS_SWIFT_NAME(string());
+- (NSData*)bytesValue NS_SWIFT_NAME(bytes());
+- (HUXExternalTexture*)externalTextureValue NS_SWIFT_NAME(externalTexture());
+- (HUXFileReference*)fileReferenceValue NS_SWIFT_NAME(fileReference());
+- (HUXBufferReference*)bufferReferenceValue NS_SWIFT_NAME(bufferReference());
+- (HUXPlatformPayload*)field:(NSString*)name NS_SWIFT_NAME(field(_:));
+- (HUXPlatformPayload*)elementAtIndex:(NSUInteger)index NS_SWIFT_NAME(element(at:));
+- (void)validateFields:(NSSet<NSString*>*)fields NS_SWIFT_NAME(validate(fields:));
+
+@end
+
+NS_SWIFT_NAME(PlatformEventEmitter)
+@protocol HUXPlatformEventEmitter <NSObject>
+- (nullable HUXPlatformPayload*)emit:(NSString*)event payload:(HUXPlatformPayload*)payload;
+@end
+
+NS_SWIFT_NAME(PlatformResult)
+@protocol HUXPlatformResult <NSObject>
+- (void)complete:(HUXPlatformPayload*)value;
+- (void)failWithCode:(NSString*)code
+             message:(NSString*)message
+             details:(HUXPlatformPayload*)details;
+@end
+
+NS_SWIFT_NAME(PlatformCancellation)
+@protocol HUXPlatformCancellation <NSObject>
+- (void)cancel;
+@end
+
+NS_SWIFT_NAME(PlatformModule)
+@protocol HUXPlatformModule <NSObject>
+- (nullable id<HUXPlatformCancellation>)invoke:(NSString*)method
+                                      arguments:(HUXPlatformPayload*)arguments
+                                         result:(id<HUXPlatformResult>)result;
+- (void)dispose;
+@end
+
+NS_SWIFT_NAME(AppKitPlatformModuleFactory)
+@protocol HUXAppKitPlatformModuleFactory <NSObject>
+- (id<HUXPlatformModule>)createWithWindow:(NSWindow*)window
+                                  options:(HUXPlatformPayload*)options
+                                   events:(id<HUXPlatformEventEmitter>)events;
+@end
+
+NS_SWIFT_NAME(AppKitPlatformView)
+@protocol HUXAppKitPlatformView <NSObject>
+@property(nonatomic, readonly) NSView* view;
+@optional
+- (void)updateWithProperties:(HUXPlatformPayload*)properties;
+- (nullable id<HUXPlatformCancellation>)invoke:(NSString*)method
+                                      arguments:(HUXPlatformPayload*)arguments
+                                         result:(id<HUXPlatformResult>)result;
+@required
+- (void)dispose;
+@end
+
+NS_SWIFT_NAME(AppKitPlatformViewFactory)
+@protocol HUXAppKitPlatformViewFactory <NSObject>
+- (id<HUXAppKitPlatformView>)createWithWindow:(NSWindow*)window
+                                   properties:(HUXPlatformPayload*)properties
+                                       events:(id<HUXPlatformEventEmitter>)events;
+@end
+
+NS_ASSUME_NONNULL_END
+#endif
+
+#if defined(__cplusplus)
+#if defined(__OBJC__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wnullability-completeness"
+#endif
+#include <concepts>
+#include <functional>
+#include <memory>
+#include <stdexcept>
+#include <utility>
+
+#include <pingcore/platform_registry.h>
+#include <pingcore/window.h>
+
+#if defined(__OBJC__)
+@class NSView;
+@class NSWindow;
+#else
+class NSView;
+class NSWindow;
+#endif
+
+namespace pingcore::macos {
+
+/// Borrows the AppKit window on the main thread. PingCore owns the window and its close path.
+/// @param window Handle for the window to query.
+/// @return The NSWindow without transferring ownership, or null if there is no live AppKit attachment.
+/// Query again after deferred work. Retaining the object does not extend its PingCore attachment.
+/// @throws std::logic_error If called off the original live application's thread.
+NSWindow* GetPlatformWindow(const WindowHandle& window);
+
+/// Describes the AppKit lifecycle of one registered PlatformView type.
+///
+/// Properties is the complete controlled value supplied by `PlatformView(name, properties)`. Instance is arbitrary
+/// library-owned retained state and commonly stores the NSView plus delegates, observers, and event resources.
+/// Controller is optional and connects a strongly typed C++ command facade to the mounted instance.
+///
+/// `create` and `view` are required. `create` receives the owning NSWindow, and `view` is called once to obtain the
+/// stable NSView retained by Instance. When Properties is not void, `update` must apply later property revisions. When
+/// Controller is not void, both `connect` and `disconnect` are required. `dispose` is optional and runs after
+/// Controller disconnection. Callbacks execute on the AppKit main thread.
+///
+/// Example:
+/// @code
+/// macos::PlatformViewFactory<WebProperties, WebInstance> factory{
+///     .create = CreateWebView,
+///     .view = [](const std::shared_ptr<WebInstance>& instance) { return instance->view; },
+///     .update = UpdateWebView,
+///     .dispose = DisposeWebView,
+/// };
+/// context.RegisterPlatformView<WebProperties>("WebView", std::move(factory));
+/// @endcode
+///
+/// @tparam Properties Controlled declarative state, or void when the View has no properties.
+/// @tparam Instance Retained C++ or Objective-C++ state whose shared lifetime covers the mounted NSView.
+/// @tparam Controller Optional strongly typed command endpoint connected for the mounted View.
+template <class Properties, class Instance, class Controller = void> struct PlatformViewFactory;
+template <class Module, class Options = void> struct PlatformModuleFactory;
+
+#if defined(__OBJC__)
+template <class Module, class Options = void> struct ObjectiveCPlatformModuleFactory;
+template <class Properties, class Controller = void> struct ObjectiveCPlatformViewFactory;
+#endif
+
+namespace detail {
+
+/// Type-erased AppKit factory consumed by the macOS PlatformView host.
+struct AppKitViewFactory {
+  std::function<std::shared_ptr<void>(NSWindow*, const PlatformValue&, PlatformEventEmitter)> create;
+  std::function<NSView*(const std::shared_ptr<void>&)> view;
+  std::function<void(const std::shared_ptr<void>&, const PlatformValue&)> update;
+  std::function<void(const std::shared_ptr<void>&)> dispose;
+  std::function<void(const std::shared_ptr<void>&, const PlatformValue&)> connect;
+  std::function<void(const std::shared_ptr<void>&, const PlatformValue&)> disconnect;
+};
+
+NSWindow* GetAppKitWindow(UiWindow& ui_window);
+
+#if defined(__OBJC__)
+class ObjectiveCPlatformViewInstance;
+
+PlatformChannel CreateObjectiveCPlatformModule(UiWindow& ui_window, NSWindow* owner,
+                                               id<HUXAppKitPlatformModuleFactory> factory,
+                                               PlatformPayload options);
+std::shared_ptr<ObjectiveCPlatformViewInstance>
+CreateObjectiveCPlatformView(UiWindow& ui_window, NSWindow* owner,
+                             id<HUXAppKitPlatformViewFactory> factory, PlatformPayload properties,
+                             PlatformEventEmitter events, bool update_required, bool channel_required);
+NSView* GetObjectiveCPlatformView(const std::shared_ptr<ObjectiveCPlatformViewInstance>& instance);
+void UpdateObjectiveCPlatformView(const std::shared_ptr<ObjectiveCPlatformViewInstance>& instance,
+                                  PlatformPayload properties);
+void DisposeObjectiveCPlatformView(const std::shared_ptr<ObjectiveCPlatformViewInstance>& instance) noexcept;
+PlatformChannel GetObjectiveCPlatformViewChannel(const std::shared_ptr<ObjectiveCPlatformViewInstance>& instance);
+
+template <class Properties> PlatformPayload EncodeObjectiveCPlatformViewProperties(const PlatformValue& value) {
+  if constexpr (std::same_as<Properties, void>) {
+    return {};
+  } else {
+    static_assert(pingcore::detail::PlatformPayloadEncodable<Properties>);
+    return pingcore::detail::EncodePlatformValue(value.Get<Properties>());
+  }
+}
+
+template <class Properties, class Controller>
+pingcore::detail::PlatformViewFactoryRegistration
+EraseObjectiveCPlatformViewFactory(macos::ObjectiveCPlatformViewFactory<Properties, Controller> source_value,
+                                   UiWindow& ui_window) {
+  auto source =
+      std::make_shared<macos::ObjectiveCPlatformViewFactory<Properties, Controller>>(std::move(source_value));
+  auto factory = std::make_shared<AppKitViewFactory>();
+  factory->create = [source, ui_window = &ui_window](NSWindow* owner, const PlatformValue& properties,
+                                               PlatformEventEmitter events) {
+    return std::static_pointer_cast<void>(CreateObjectiveCPlatformView(
+        *ui_window, owner, source->factory, EncodeObjectiveCPlatformViewProperties<Properties>(properties),
+        std::move(events), !std::same_as<Properties, void>, !std::same_as<Controller, void>));
+  };
+  factory->view = [](const std::shared_ptr<void>& instance) {
+    return GetObjectiveCPlatformView(std::static_pointer_cast<ObjectiveCPlatformViewInstance>(instance));
+  };
+  if constexpr (!std::same_as<Properties, void>) {
+    factory->update = [](const std::shared_ptr<void>& instance, const PlatformValue& properties) {
+      UpdateObjectiveCPlatformView(std::static_pointer_cast<ObjectiveCPlatformViewInstance>(instance),
+                                   EncodeObjectiveCPlatformViewProperties<Properties>(properties));
+    };
+  }
+  factory->dispose = [](const std::shared_ptr<void>& instance) {
+    DisposeObjectiveCPlatformView(std::static_pointer_cast<ObjectiveCPlatformViewInstance>(instance));
+  };
+  if constexpr (!std::same_as<Controller, void>) {
+    factory->connect = [source](const std::shared_ptr<void>& instance, const PlatformValue& controller) {
+      if (!source->connect) {
+        throw std::logic_error("PingCore macOS Objective-C PlatformView factory must provide connect");
+      }
+      source->connect(controller.Get<Controller>(),
+                      GetObjectiveCPlatformViewChannel(
+                          std::static_pointer_cast<ObjectiveCPlatformViewInstance>(instance)));
+    };
+    factory->disconnect = [source](const std::shared_ptr<void>&, const PlatformValue& controller) {
+      if (!source->disconnect) {
+        throw std::logic_error("PingCore macOS Objective-C PlatformView factory must provide disconnect");
+      }
+      source->disconnect(controller.Get<Controller>());
+    };
+  }
+  return pingcore::detail::MakePlatformViewFactoryRegistration(std::move(factory));
+}
+#endif
+
+template <class Properties, class Instance, class Controller>
+pingcore::detail::PlatformViewFactoryRegistration
+ErasePlatformViewFactory(macos::PlatformViewFactory<Properties, Instance, Controller> source_value) {
+  auto source = std::make_shared<macos::PlatformViewFactory<Properties, Instance, Controller>>(std::move(source_value));
+  auto factory = std::make_shared<AppKitViewFactory>();
+  if (source->create) {
+    factory->create = [source](NSWindow* owner, const PlatformValue& properties, PlatformEventEmitter events) {
+      if constexpr (std::same_as<Properties, void>) {
+        return std::static_pointer_cast<void>(source->create(owner, std::move(events)));
+      } else {
+        return std::static_pointer_cast<void>(source->create(owner, properties.Get<Properties>(), std::move(events)));
+      }
+    };
+  }
+  if (source->view) {
+    factory->view = [source](const std::shared_ptr<void>& instance) {
+      return source->view(std::static_pointer_cast<Instance>(instance));
+    };
+  }
+  if constexpr (!std::same_as<Properties, void>) {
+    if (source->update) {
+      factory->update = [source](const std::shared_ptr<void>& instance, const PlatformValue& properties) {
+        source->update(*std::static_pointer_cast<Instance>(instance), properties.Get<Properties>());
+      };
+    }
+  }
+  if (source->dispose) {
+    factory->dispose = [source](const std::shared_ptr<void>& instance) {
+      source->dispose(*std::static_pointer_cast<Instance>(instance));
+    };
+  }
+  if constexpr (!std::same_as<Controller, void>) {
+    if (source->connect) {
+      factory->connect = [source](const std::shared_ptr<void>& instance, const PlatformValue& controller) {
+        source->connect(*std::static_pointer_cast<Instance>(instance), controller.Get<Controller>());
+      };
+    }
+    if (source->disconnect) {
+      factory->disconnect = [source](const std::shared_ptr<void>& instance, const PlatformValue& controller) {
+        source->disconnect(*std::static_pointer_cast<Instance>(instance), controller.Get<Controller>());
+      };
+    }
+  }
+  return pingcore::detail::MakePlatformViewFactoryRegistration(std::move(factory));
+}
+
+} // namespace detail
+
+/// Adapts a direct Objective-C++ PlatformModule factory to the platform-neutral registry callable contract.
+template <class Module> struct PlatformModuleFactory<Module, void> {
+  std::function<Module(UiWindow&, NSWindow*)> create;
+
+  Module operator()(UiWindow& ui_window) {
+    if (!create) {
+      throw std::logic_error("PingCore macOS PlatformModule factory must provide create");
+    }
+    return create(ui_window, detail::GetAppKitWindow(ui_window));
+  }
+};
+
+template <class Module, class Options> struct PlatformModuleFactory {
+  std::function<Module(UiWindow&, NSWindow*, const Options&)> create;
+
+  Module operator()(UiWindow& ui_window, const Options& options) {
+    if (!create) {
+      throw std::logic_error("PingCore macOS PlatformModule factory must provide create");
+    }
+    return create(ui_window, detail::GetAppKitWindow(ui_window), options);
+  }
+};
+
+#if defined(__OBJC__)
+/// Adapts an actual Objective-C or Swift PlatformModule factory object to a strongly typed C++ Module facade.
+/// The factory object creates the platform instance; create wraps its framework-owned PlatformChannel in Module.
+template <class Module> struct ObjectiveCPlatformModuleFactory<Module, void> {
+  __strong id<HUXAppKitPlatformModuleFactory> factory = nil;
+  std::function<Module(PlatformChannel)> create;
+
+  Module operator()(UiWindow& ui_window) {
+    if (factory == nil || !create) {
+      throw std::logic_error("PingCore macOS Objective-C PlatformModule factory is incomplete");
+    }
+    PlatformChannel channel =
+        detail::CreateObjectiveCPlatformModule(ui_window, detail::GetAppKitWindow(ui_window), factory, {});
+    try {
+      return create(channel);
+    } catch (...) {
+      channel.Close();
+      throw;
+    }
+  }
+};
+
+template <class Module, class Options> struct ObjectiveCPlatformModuleFactory {
+  static_assert(pingcore::detail::PlatformPayloadEncodable<Options>);
+
+  __strong id<HUXAppKitPlatformModuleFactory> factory = nil;
+  std::function<Module(PlatformChannel)> create;
+
+  Module operator()(UiWindow& ui_window, const Options& options) {
+    if (factory == nil || !create) {
+      throw std::logic_error("PingCore macOS Objective-C PlatformModule factory is incomplete");
+    }
+    PlatformChannel channel = detail::CreateObjectiveCPlatformModule(
+        ui_window, detail::GetAppKitWindow(ui_window), factory, pingcore::detail::EncodePlatformValue(options));
+    try {
+      return create(channel);
+    } catch (...) {
+      channel.Close();
+      throw;
+    }
+  }
+};
+
+template <class Properties> struct ObjectiveCPlatformViewFactory<Properties, void> {
+  __strong id<HUXAppKitPlatformViewFactory> factory = nil;
+
+private:
+  pingcore::detail::PlatformViewFactoryRegistration Erase(UiWindow& ui_window) && {
+    return detail::EraseObjectiveCPlatformViewFactory(std::move(*this), ui_window);
+  }
+  friend class pingcore::detail::PlatformRegistry;
+};
+
+template <class Properties, class Controller> struct ObjectiveCPlatformViewFactory {
+  __strong id<HUXAppKitPlatformViewFactory> factory = nil;
+  std::function<void(const Controller&, PlatformChannel)> connect;
+  std::function<void(const Controller&)> disconnect;
+
+private:
+  pingcore::detail::PlatformViewFactoryRegistration Erase(UiWindow& ui_window) && {
+    return detail::EraseObjectiveCPlatformViewFactory(std::move(*this), ui_window);
+  }
+  friend class pingcore::detail::PlatformRegistry;
+};
+#endif
+
+/// AppKit PlatformView factory without declarative Properties or a Controller.
+template <class Instance> struct PlatformViewFactory<void, Instance, void> {
+  std::function<std::shared_ptr<Instance>(NSWindow*, PlatformEventEmitter)> create;
+  std::function<NSView*(const std::shared_ptr<Instance>&)> view;
+  std::function<void(Instance&)> dispose;
+
+private:
+  pingcore::detail::PlatformViewFactoryRegistration Erase(UiWindow&) && {
+    return detail::ErasePlatformViewFactory(std::move(*this));
+  }
+  friend class pingcore::detail::PlatformRegistry;
+};
+
+/// AppKit PlatformView factory with a Controller and no declarative Properties.
+template <class Instance, class Controller> struct PlatformViewFactory<void, Instance, Controller> {
+  std::function<std::shared_ptr<Instance>(NSWindow*, PlatformEventEmitter)> create;
+  std::function<NSView*(const std::shared_ptr<Instance>&)> view;
+  std::function<void(Instance&)> dispose;
+  std::function<void(Instance&, const Controller&)> connect;
+  std::function<void(Instance&, const Controller&)> disconnect;
+
+private:
+  pingcore::detail::PlatformViewFactoryRegistration Erase(UiWindow&) && {
+    return detail::ErasePlatformViewFactory(std::move(*this));
+  }
+  friend class pingcore::detail::PlatformRegistry;
+};
+
+/// AppKit PlatformView factory with controlled Properties and no Controller.
+template <class Properties, class Instance> struct PlatformViewFactory<Properties, Instance, void> {
+  std::function<std::shared_ptr<Instance>(NSWindow*, const Properties&, PlatformEventEmitter)> create;
+  std::function<NSView*(const std::shared_ptr<Instance>&)> view;
+  std::function<void(Instance&, const Properties&)> update;
+  std::function<void(Instance&)> dispose;
+
+private:
+  pingcore::detail::PlatformViewFactoryRegistration Erase(UiWindow&) && {
+    return detail::ErasePlatformViewFactory(std::move(*this));
+  }
+  friend class pingcore::detail::PlatformRegistry;
+};
+
+/// AppKit PlatformView factory with controlled Properties and a Controller.
+template <class Properties, class Instance, class Controller> struct PlatformViewFactory {
+  std::function<std::shared_ptr<Instance>(NSWindow*, const Properties&, PlatformEventEmitter)> create;
+  std::function<NSView*(const std::shared_ptr<Instance>&)> view;
+  std::function<void(Instance&, const Properties&)> update;
+  std::function<void(Instance&)> dispose;
+  std::function<void(Instance&, const Controller&)> connect;
+  std::function<void(Instance&, const Controller&)> disconnect;
+
+private:
+  pingcore::detail::PlatformViewFactoryRegistration Erase(UiWindow&) && {
+    return detail::ErasePlatformViewFactory(std::move(*this));
+  }
+  friend class pingcore::detail::PlatformRegistry;
+};
+
+} // namespace pingcore::macos
+
+#if defined(__OBJC__)
+#pragma clang diagnostic pop
+#endif
+#endif

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="description" content="PingCore web application">
+  <meta name="robots" content="index,follow">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="PingCore">
+  <meta name="twitter:card" content="summary">
+  <title>PingCore</title>
+  <style>
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+    }
+
+    #pingcore-root {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+</head>
+<body>
+  <div id="pingcore-root"></div>
+  <script type="module">
+    import createPingCoreApp from "./@PINGCORE_WEB_MODULE_FILE@";
+
+    const module = await createPingCoreApp({
+      pingcoreStorageKey: "@PINGCORE_WEB_STORAGE_KEY@",
+    });
+    await document.fonts.ready;
+    const session = module.mountPingCore("#pingcore-root");
+    if (!session) {
+      throw new Error("PingCore Web session could not be mounted");
+    }
+  </script>
+</body>
+</html>

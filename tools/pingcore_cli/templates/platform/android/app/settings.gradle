@@ -1,0 +1,88 @@
+import groovy.json.JsonSlurper
+
+pluginManagement {
+    repositories {
+        gradlePluginPortal()
+        google()
+        mavenCentral()
+    }
+}
+
+// The integration that builds the application core: the one -PpingcoreBuildSystem names, the project's only
+// declaration, or CMake when the project declares both. Everything else in this shell is shared.
+def pingcoreProjectRoot = file("../..")
+def pingcoreDeclarations = [
+        cmake: new File(pingcoreProjectRoot, "CMakeLists.txt").isFile(),
+        mcpp : new File(pingcoreProjectRoot, "mcpp.toml").isFile() && new File(pingcoreProjectRoot, "build.mcpp").isFile(),
+]
+def pingcoreBuildSystem = providers.gradleProperty("pingcoreBuildSystem").orNull
+if (pingcoreBuildSystem == null) {
+    def declared = pingcoreDeclarations.findAll { it.value }.keySet().toList()
+    if (declared.isEmpty()) {
+        throw new GradleException("The project declares no build system: ${pingcoreProjectRoot}")
+    }
+    pingcoreBuildSystem = declared.first()
+} else if (!pingcoreDeclarations[pingcoreBuildSystem]) {
+    throw new GradleException("The project has no ${pingcoreBuildSystem} declaration")
+}
+
+// CMake takes the framework from PINGCORE_HOME; mcpp resolves it as a dependency and records where.
+def pingcoreHome
+if (pingcoreBuildSystem == "mcpp") {
+    def frameworkRecord = file("../../.pingcore/generated/framework.json")
+    if (!frameworkRecord.isFile()) {
+        throw new GradleException("Run 'pingcore build android' to resolve the framework")
+    }
+    pingcoreHome = file(new JsonSlurper().parse(frameworkRecord).sourceRoot)
+} else {
+    def pingcoreHomeValue = providers.environmentVariable("PINGCORE_HOME").orNull
+    if (pingcoreHomeValue == null || pingcoreHomeValue.isBlank()) {
+        throw new GradleException("PINGCORE_HOME is required")
+    }
+    pingcoreHome = file(pingcoreHomeValue)
+}
+def pingcoreLibrary = new File(pingcoreHome, "platform/android/pingcore")
+def pingcoreArchive = new File(pingcoreHome, "share/pingcore/platform/android/PingCore.aar")
+def pingcoreUsesSource = pingcoreLibrary.isDirectory()
+if (!pingcoreUsesSource && !pingcoreArchive.isFile()) {
+    throw new GradleException("PingCore Android package does not exist under ${pingcoreHome}")
+}
+
+def pingcoreLibraryGraphFile = file("../../.pingcore/generated/libraries.json")
+if (!pingcoreLibraryGraphFile.isFile()) {
+    throw new GradleException("Run 'pingcore build android' to generate the library graph")
+}
+def pingcoreLibraryGraph = new JsonSlurper().parse(pingcoreLibraryGraphFile)
+def pingcoreLibraries = []
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+gradle.ext.pingcoreBuildSystem = pingcoreBuildSystem
+gradle.ext.pingcoreHome = pingcoreHome
+gradle.ext.pingcoreUsesSource = pingcoreUsesSource
+gradle.ext.pingcoreAndroidArchive = pingcoreArchive
+rootProject.name = "@PROJECT_NAME@"
+if (pingcoreUsesSource) {
+    include(":PingCore")
+    project(":PingCore").projectDir = pingcoreLibrary
+}
+pingcoreLibraryGraph.libraries.eachWithIndex { library, index ->
+    def libraryDirectory = file("${library.sourceRoot}/platform/android")
+    if (libraryDirectory.isDirectory()) {
+        if (!new File(libraryDirectory, "build.gradle").isFile()) {
+            throw new GradleException("Android library package is missing build.gradle: ${libraryDirectory}")
+        }
+        def projectPath = ":pingcoreLibrary${index}"
+        include(projectPath)
+        project(projectPath).projectDir = libraryDirectory
+        pingcoreLibraries.add([target: library.target, projectPath: projectPath])
+    }
+}
+gradle.ext.pingcoreLibraries = pingcoreLibraries
+include(":app")

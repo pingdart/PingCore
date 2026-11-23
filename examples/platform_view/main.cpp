@@ -1,0 +1,85 @@
+#include "platform_text_field.h"
+
+#include <string>
+#include <utility>
+
+#include <pingcore/pingcore.h>
+
+using namespace pingcore;
+
+#if defined(__ANDROID__)
+constexpr float platform_text_field_height = 48.0F;
+#elif defined(__linux__)
+constexpr float platform_text_field_height = 36.0F;
+#else
+constexpr float platform_text_field_height = 28.0F;
+#endif
+
+[[pingcore::composable]]
+View PlatformViewDemo() {
+  auto value = UseState<std::string>("Editable PlatformView text");
+  auto visible = UseState(true);
+  const ThemeSpec& theme = UseTheme();
+
+  View platform_content;
+  if (visible) {
+    platform_content = Stack {
+      example::PlatformTextField(value)
+          .On<example::PlatformTextFieldEvents::Changed>([value](std::string next) { value = std::move(next); })
+          .With(Frame{.height = platform_text_field_height}),
+      Stack {
+        Button("PingCore overlay").OnClick([value] { value = "Updated from overlay"; }),
+      }.With(
+          Frame{.height = 64.0F},
+          Align(HorizontalAlignment::End, VerticalAlignment::Start)
+      ),
+    }.With(
+        Frame{.height = 64.0F},
+        Align(HorizontalAlignment::Stretch, VerticalAlignment::Center),
+        Background(theme.colors.surface_container_low)
+    );
+  } else {
+    platform_content = Text("The PlatformView is unmounted.").With(
+        Frame{.height = 64.0F},
+        Align(HorizontalAlignment::Center, VerticalAlignment::Center),
+        Foreground(theme.colors.on_surface_variant),
+        Background(theme.colors.surface_container_low)
+    );
+  }
+
+  return Column {
+    Text("PlatformView", TextRole::Title),
+    Text("The PlatformTextField participates in PingCore layout, rendering order, state, and events."),
+    std::move(platform_content),
+    Text::Format(TextRole::Label, "Controlled value: {}", value),
+    Column {
+      Button("Set from PingCore").OnClick([value] { value = "Updated by PingCore"; }),
+      Button(visible ? "Unmount PlatformView" : "Mount PlatformView").OnClick([visible] {
+        visible = !visible;
+      }),
+    }.With(
+        Spacing(theme.spacing.medium),
+        CrossAlign(CrossAxisAlignment::Stretch)
+    ),
+  }.With(
+      Padding(theme.spacing.extra_large),
+      Spacing(theme.spacing.medium),
+      CrossAlign(CrossAxisAlignment::Stretch),
+      Background(theme.colors.background)
+  );
+}
+
+View App() {
+  return MaterialTheme {PlatformViewDemo()};
+}
+
+const Application application{
+    App,
+    {
+        .window = {
+            .title = "PingCore PlatformView",
+            .initial_size = {720.0F, 440.0F},
+        },
+        .application_hooks = {example::InstallPlatformTextField},
+    }
+};

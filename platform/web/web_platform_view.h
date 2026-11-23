@@ -1,0 +1,41 @@
+#pragma once
+
+#include <cstdint>
+#include <memory>
+
+#include <emscripten/val.h>
+
+#include <pingcore/geometry.h>
+#include <pingcore/platform_registry.h>
+#include <pingcore/render_scene.h>
+
+namespace pingcore {
+class UiWindow;
+}
+
+namespace pingcore::detail {
+
+class WebRenderer;
+
+class WebPlatformViews final {
+public:
+  WebPlatformViews(WebRenderer& renderer, PlatformRegistry& registry, UiWindow& ui_window,
+                   emscripten::val root, emscripten::val base_canvas);
+  ~WebPlatformViews();
+
+  WebPlatformViews(const WebPlatformViews&) = delete;
+  WebPlatformViews& operator=(const WebPlatformViews&) = delete;
+
+  void SetViewport(Size viewport, float display_scale);
+  void Commit(const RenderFrame& frame);
+  [[nodiscard]] bool HitTest(std::uint32_t token, Point point) const;
+  void SynchronizeFocus(std::uint32_t token, bool focus_visible);
+  void MoveFocus(std::uint32_t token, bool reverse);
+  void Shutdown() noexcept;
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+} // namespace pingcore::detail

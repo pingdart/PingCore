@@ -1,0 +1,22 @@
+[template]
+description = "A PingCore application: `import pingcore;`, composables and packaged resources"
+default     = true
+post_message = """
+Built with:   mcpp build
+Run with:     mcpp run
+
+The page is in src/app.cppm, a module interface unit. Each platform's entry,
+platform/<platform>/main.cpp, holds only the call to RunApplication() and
+deliberately instantiates nothing -- that is why it needs no includes at all,
+and why pingcore.rules can leave it alone. `pingcore platform add` writes the rest
+of a platform's shell.
+
+Both files write `import pingcore;` rather than #include <pingcore/pingcore.h>.
+The two name the same entities; the module is what PingCore ships for consumers
+that want it.
+
+build.mcpp calls pingcore::rules::configure(), which schedules the composable
+transform and the resource compiler as build-graph edges. Everything else --
+the platform link interface, the scope macros, the GTK stack on Linux --
+arrives through the pingcore dependency.
+"""

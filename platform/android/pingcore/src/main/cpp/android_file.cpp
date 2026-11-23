@@ -1,0 +1,109 @@
+#include "android_file_internal.h"
+
+#include <jni.h>
+
+#include <optional>
+#include <stdexcept>
+#include <string>
+
+#include <pingcore/android/jni.h>
+
+#include "io/file_internal.h"
+
+namespace pingcore::detail {
+
+namespace {
+
+[[noreturn]] void ThrowJniFailure(JNIEnv* environment, const char* message) {
+  if (environment != nullptr && environment->ExceptionCheck()) {
+    environment->ExceptionClear();
+  }
+  throw std::runtime_error(message);
+}
+
+std::string AbsolutePath(JNIEnv* environment, jobject file, jmethodID get_absolute_path, const char* description) {
+  if (file == nullptr) {
+    ThrowJniFailure(environment, description);
+  }
+  android::LocalRef<jstring> path(
+      environment,
+      static_cast<jstring>(environment->CallObjectMethod(file, get_absolute_path))
+  );
+  if (!path || environment->ExceptionCheck()) {
+    ThrowJniFailure(environment, description);
+  }
+  return android::JavaStringToUtf8(environment, path.Get());
+}
+
+std::string TemporaryPath(std::string cache_path) {
+  if (!cache_path.empty() && cache_path.back() != '/') {
+    cache_path.push_back('/');
+  }
+  cache_path += "pingcore_tmp";
+  return cache_path;
+}
+
+} // namespace
+
+AppDirectories CreateAndroidAppDirectories(JNIEnv* environment, jobject context) {
+  if (environment == nullptr || context == nullptr) {
+    throw std::runtime_error("PingCore Android file system host is unavailable");
+  }
+
+  android::LocalRef<jclass> context_class(environment, environment->GetObjectClass(context));
+  android::LocalRef<jclass> file_class(environment, environment->FindClass("java/io/File"));
+  android::LocalRef<jclass> application_info_class(
+      environment,
+      environment->FindClass("android/content/pm/ApplicationInfo")
+  );
+  if (!context_class || !file_class || !application_info_class || environment->ExceptionCheck()) {
+    ThrowJniFailure(environment, "PingCore Android file system classes are unavailable");
+  }
+
+  const jmethodID get_files_directory =
+      environment->GetMethodID(context_class.Get(), "getFilesDir", "()Ljava/io/File;");
+  const jmethodID get_cache_directory =
+      environment->GetMethodID(context_class.Get(), "getCacheDir", "()Ljava/io/File;");
+  const jmethodID get_application_info =
+      environment->GetMethodID(context_class.Get(), "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;");
+  const jmethodID get_absolute_path =
+      environment->GetMethodID(file_class.Get(), "getAbsolutePath", "()Ljava/lang/String;");
+  const jfieldID native_library_directory =
+      environment->GetFieldID(application_info_class.Get(), "nativeLibraryDir", "Ljava/lang/String;");
+  if (get_files_directory == nullptr || get_cache_directory == nullptr || get_application_info == nullptr ||
+      get_absolute_path == nullptr || native_library_directory == nullptr || environment->ExceptionCheck()) {
+    ThrowJniFailure(environment, "PingCore Android file system methods do not match the platform backend");
+  }
+
+  android::LocalRef<jobject> data(environment, environment->CallObjectMethod(context, get_files_directory));
+  android::LocalRef<jobject> cache(environment, environment->CallObjectMethod(context, get_cache_directory));
+  android::LocalRef<jobject> application_info(
+      environment,
+      environment->CallObjectMethod(context, get_application_info)
+  );
+  if (!data || !cache || !application_info || environment->ExceptionCheck()) {
+    ThrowJniFailure(environment, "PingCore Android application directories are unavailable");
+  }
+
+  android::LocalRef<jstring> executable(
+      environment,
+      static_cast<jstring>(environment->GetObjectField(application_info.Get(), native_library_directory))
+  );
+  if (environment->ExceptionCheck()) {
+    ThrowJniFailure(environment, "PingCore Android native library directory is unavailable");
+  }
+
+  const std::string cache_path =
+      AbsolutePath(environment, cache.Get(), get_absolute_path, "PingCore Android cache directory is unavailable");
+  return PrepareAppDirectories({
+      .executable_directory = executable
+                                  ? std::optional<File>{File(android::JavaStringToUtf8(environment, executable.Get()))}
+                                  : std::nullopt,
+      .data_directory = File(AbsolutePath(environment, data.Get(), get_absolute_path,
+                                          "PingCore Android data directory is unavailable")),
+      .cache_directory = File(cache_path),
+      .temporary_directory = File(TemporaryPath(cache_path)),
+  });
+}
+
+} // namespace pingcore::detail

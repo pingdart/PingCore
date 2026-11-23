@@ -1,39 +1,243 @@
 @PACKAGE_INIT@
 
-include(CMakeFindDependencyMacro)
+include("${CMAKE_CURRENT_LIST_DIR}/PingCoreApp.cmake")
 
-find_dependency(Threads)
+if (PINGCORE_LIBRARY_GRAPH_ONLY)
+    _pingcore_configure_library_graph_framework()
+    set(PingCore_shared_FOUND TRUE)
+    set(PingCore_static_FOUND TRUE)
+    check_required_components(PingCore)
+    return()
+endif ()
 
-if(@PINGCORE_CONFIG_HAS_FREETYPE@)
-    find_dependency(Freetype)
-endif()
+set(PINGCORE_HOST_TOOL_ROOT "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_DATADIR@/pingcore/tools")
+set_and_check(PINGCORE_BUILTIN_RESOURCE_PACKAGE
+        "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_DATADIR@/pingcore/resources"
+)
+if (PINGCORE_ENABLE_LTO OR NOT PINGCORE_OPTIMIZATION STREQUAL "default")
+    message(STATUS "PingCore SDK libraries are prebuilt; optimization overrides apply to source targets")
+endif ()
 
-if(@PINGCORE_CONFIG_HAS_HARFBUZZ@)
-    list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
-    find_dependency(HarfBuzz)
-endif()
+set(_PINGCORE_WANT_SHARED FALSE)
+set(_PINGCORE_WANT_STATIC FALSE)
+if (PingCore_FIND_COMPONENTS)
+    foreach (_PINGCORE_COMPONENT IN LISTS PingCore_FIND_COMPONENTS)
+        if (_PINGCORE_COMPONENT STREQUAL "shared")
+            set(_PINGCORE_WANT_SHARED TRUE)
+        elseif (_PINGCORE_COMPONENT STREQUAL "static")
+            set(_PINGCORE_WANT_STATIC TRUE)
+        endif ()
+    endforeach ()
+    if ("testing" IN_LIST PingCore_FIND_COMPONENTS AND NOT _PINGCORE_WANT_STATIC AND NOT _PINGCORE_WANT_SHARED)
+        if (ANDROID OR EMSCRIPTEN OR IOS OR @PINGCORE_BUILD_STATIC@)
+            set(_PINGCORE_WANT_STATIC TRUE)
+        else ()
+            set(_PINGCORE_WANT_SHARED TRUE)
+        endif ()
+    endif ()
+elseif (ANDROID OR EMSCRIPTEN OR IOS)
+    set(_PINGCORE_WANT_STATIC TRUE)
+else ()
+    set(_PINGCORE_WANT_SHARED @PINGCORE_BUILD_SHARED@)
+    set(_PINGCORE_WANT_STATIC @PINGCORE_BUILD_STATIC@)
+endif ()
 
-if(@PINGCORE_CONFIG_HAS_OPENSSL@)
-    find_dependency(OpenSSL)
-endif()
+if (IOS)
+    if (_PINGCORE_WANT_STATIC)
+        set_and_check(_PINGCORE_IOS_XCFRAMEWORK
+                "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_DATADIR@/pingcore/platform/ios/PingCore.xcframework"
+        )
+        string(TOLOWER "${CMAKE_OSX_SYSROOT}" _PINGCORE_IOS_SYSROOT)
+        if (_PINGCORE_IOS_SYSROOT MATCHES "simulator")
+            set(_PINGCORE_IOS_SLICE "ios-arm64_x86_64-simulator")
+        else ()
+            set(_PINGCORE_IOS_SLICE "ios-arm64")
+        endif ()
+        set_and_check(_PINGCORE_IOS_LIBRARY
+                "${_PINGCORE_IOS_XCFRAMEWORK}/${_PINGCORE_IOS_SLICE}/libpingcore_static.a"
+        )
+        set(_PINGCORE_IOS_LINK_LIBRARIES
+                "-framework AVFoundation"
+                "-framework BackgroundTasks"
+                "-framework Contacts"
+                "-framework CoreBluetooth"
+                "-framework CoreFoundation"
+                "-framework CoreGraphics"
+                "-framework CoreImage"
+                "-framework CoreLocation"
+                "-framework CoreText"
+                "-framework CoreVideo"
+                "-framework EventKit"
+                "-framework Foundation"
+                "-framework ImageIO"
+                "-framework Metal"
+                "-framework MetalPerformanceShaders"
+                "-framework MobileCoreServices"
+                "-framework Photos"
+                "-framework QuartzCore"
+                "-framework UIKit"
+                "-framework UserNotifications"
+                "-weak_framework UniformTypeIdentifiers"
+        )
+        foreach (_PINGCORE_IOS_TARGET IN ITEMS PingCore::pingcore PingCore::pingcore_static)
+            if (TARGET ${_PINGCORE_IOS_TARGET})
+                continue()
+            endif ()
+            add_library(${_PINGCORE_IOS_TARGET} STATIC IMPORTED)
+            set_target_properties(${_PINGCORE_IOS_TARGET} PROPERTIES
+                    IMPORTED_LOCATION "${_PINGCORE_IOS_LIBRARY}"
+                    INTERFACE_INCLUDE_DIRECTORIES "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_INCLUDEDIR@"
+                    INTERFACE_LINK_LIBRARIES "${_PINGCORE_IOS_LINK_LIBRARIES}"
+            )
+        endforeach ()
+    endif ()
+elseif (ANDROID)
+    if (NOT ANDROID_ABI)
+        message(FATAL_ERROR "PingCore Android package requires ANDROID_ABI")
+    endif ()
+    if (_PINGCORE_WANT_STATIC)
+        set_and_check(PINGCORE_ANDROID_STATIC_LIBRARY
+                "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_DATADIR@/pingcore/platform/android/${ANDROID_ABI}/libpingcore_static.a"
+        )
+        foreach (_PINGCORE_ANDROID_TARGET IN ITEMS PingCore::pingcore PingCore::pingcore_static)
+            if (TARGET ${_PINGCORE_ANDROID_TARGET})
+                continue()
+            endif ()
+            add_library(${_PINGCORE_ANDROID_TARGET} STATIC IMPORTED)
+            set_target_properties(${_PINGCORE_ANDROID_TARGET} PROPERTIES
+                    IMPORTED_LOCATION "${PINGCORE_ANDROID_STATIC_LIBRARY}"
+                    INTERFACE_INCLUDE_DIRECTORIES "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_INCLUDEDIR@"
+                    INTERFACE_LINK_LIBRARIES "android;EGL;GLESv2;log"
+            )
+            _pingcore_configure_android_static_target(${_PINGCORE_ANDROID_TARGET})
+        endforeach ()
+    endif ()
+elseif (EMSCRIPTEN)
+    if (_PINGCORE_WANT_STATIC)
+        set_and_check(PINGCORE_WEB_LIBRARY
+                "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_DATADIR@/pingcore/platform/web/emscripten-@PINGCORE_WEB_EMSCRIPTEN_VERSION@/libpingcore.a"
+        )
+        foreach (_PINGCORE_WEB_TARGET IN ITEMS PingCore::pingcore PingCore::pingcore_static)
+            if (TARGET ${_PINGCORE_WEB_TARGET})
+                continue()
+            endif ()
+            add_library(${_PINGCORE_WEB_TARGET} STATIC IMPORTED)
+            set_target_properties(${_PINGCORE_WEB_TARGET} PROPERTIES
+                    IMPORTED_LOCATION "${PINGCORE_WEB_LIBRARY}"
+                    INTERFACE_COMPILE_OPTIONS -fexceptions
+                    INTERFACE_INCLUDE_DIRECTORIES "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_INCLUDEDIR@"
+                    INTERFACE_LINK_OPTIONS
+                    "--bind;--no-entry;SHELL:--pre-js \"${CMAKE_CURRENT_LIST_DIR}/PingCoreWebPlatformRegistry.js\";SHELL:--pre-js \"${CMAKE_CURRENT_LIST_DIR}/PingCoreWebFileSystem.js\";-fexceptions;-lidbfs.js;-sMODULARIZE=1;-sEXPORT_ES6=1;-sEXPORT_NAME=createPingCoreApp;-sEXPORTED_RUNTIME_METHODS=stringToNewUTF8;-sENVIRONMENT=web;-sALLOW_MEMORY_GROWTH=1;-sSTACK_SIZE=1048576;-sNO_EXIT_RUNTIME=1"
+                    INTERFACE_LINK_DEPENDS
+                    "${CMAKE_CURRENT_LIST_DIR}/PingCoreWebPlatformRegistry.js;${CMAKE_CURRENT_LIST_DIR}/PingCoreWebFileSystem.js"
+            )
+        endforeach ()
+    endif ()
+else ()
+    if (CMAKE_SIZEOF_VOID_P AND NOT CMAKE_SIZEOF_VOID_P STREQUAL "@CMAKE_SIZEOF_VOID_P@")
+        message(FATAL_ERROR
+                "PingCore SDK host libraries use a @CMAKE_SIZEOF_VOID_P@-byte pointer model, "
+                "but the consuming target uses ${CMAKE_SIZEOF_VOID_P} bytes"
+        )
+    endif ()
+    if (_PINGCORE_WANT_SHARED AND @PINGCORE_BUILD_SHARED@ AND NOT TARGET PingCore::pingcore)
+        include("${CMAKE_CURRENT_LIST_DIR}/PingCoreSharedTargets.cmake")
+    endif ()
+    if (_PINGCORE_WANT_STATIC AND @PINGCORE_BUILD_STATIC@ AND NOT TARGET PingCore::pingcore_static)
+        if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            include("${CMAKE_CURRENT_LIST_DIR}/PingCoreLinuxStaticDependencies.cmake")
+        endif ()
+        include("${CMAKE_CURRENT_LIST_DIR}/PingCoreStaticTargets.cmake")
+    endif ()
+endif ()
 
-if(APPLE)
-    find_library(SECURITY_FRAMEWORK Security REQUIRED)
-endif()
+foreach (_PINGCORE_TARGET IN ITEMS PingCore::pingcore PingCore::pingcore_static)
+    if (TARGET ${_PINGCORE_TARGET})
+        set_target_properties(${_PINGCORE_TARGET} PROPERTIES
+                PINGCORE_RESOURCE_PACKAGE "${PINGCORE_BUILTIN_RESOURCE_PACKAGE}"
+        )
+    endif ()
+endforeach ()
 
-set(_pingcore_compiler_library
-    "${CMAKE_CURRENT_LIST_DIR}/../../../@CMAKE_INSTALL_LIBDIR@/@CMAKE_STATIC_LIBRARY_PREFIX@pingdart_compiler@CMAKE_STATIC_LIBRARY_SUFFIX@")
-if(NOT EXISTS "${_pingcore_compiler_library}")
-    set(_pingcore_compiler_library "@RUST_LIB_STATIC@")
-endif()
-if(NOT TARGET pingdart_compiler)
-    add_library(pingdart_compiler STATIC IMPORTED)
-    set_target_properties(pingdart_compiler PROPERTIES
-        IMPORTED_LOCATION "${_pingcore_compiler_library}")
-endif()
+if ("testing" IN_LIST PingCore_FIND_COMPONENTS)
+    if ("static" IN_LIST PingCore_FIND_COMPONENTS AND "shared" IN_LIST PingCore_FIND_COMPONENTS)
+        message(FATAL_ERROR "PingCore testing requires a single core link form")
+    endif ()
+    if (_PINGCORE_WANT_STATIC)
+        set(_PINGCORE_TESTING_CORE_TARGET PingCore::pingcore_static)
+    else ()
+        set(_PINGCORE_TESTING_CORE_TARGET PingCore::pingcore)
+    endif ()
+    if (TARGET PingCore::testing)
+        get_target_property(_PINGCORE_TESTING_BOUND_CORE PingCore::testing INTERFACE_LINK_LIBRARIES)
+        if (_PINGCORE_TESTING_BOUND_CORE)
+            if (NOT "static" IN_LIST PingCore_FIND_COMPONENTS AND NOT "shared" IN_LIST PingCore_FIND_COMPONENTS)
+                set(_PINGCORE_TESTING_CORE_TARGET "${_PINGCORE_TESTING_BOUND_CORE}")
+            elseif (NOT _PINGCORE_TESTING_BOUND_CORE STREQUAL _PINGCORE_TESTING_CORE_TARGET)
+                message(FATAL_ERROR "PingCore testing is already bound to ${_PINGCORE_TESTING_BOUND_CORE}")
+            endif ()
+        endif ()
+    endif ()
+    set(PingCore_testing_FOUND FALSE)
+    set(_PINGCORE_TESTING_TYPE STATIC)
+    set(_PINGCORE_TESTING_LIBRARY "")
+    if (ANDROID)
+        set(_PINGCORE_TESTING_LIBRARY "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_DATADIR@/pingcore/platform/android/${ANDROID_ABI}/libpingcore_testing.a")
+    elseif (IOS)
+        set(_PINGCORE_TESTING_LIBRARY "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_DATADIR@/pingcore/platform/ios/PingCoreTesting.xcframework/${_PINGCORE_IOS_SLICE}/libpingcore_testing.a")
+    elseif (EMSCRIPTEN)
+        set(_PINGCORE_TESTING_LIBRARY "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_DATADIR@/pingcore/platform/web/emscripten-@PINGCORE_WEB_EMSCRIPTEN_VERSION@/libpingcore_testing.a")
+    elseif (EXISTS "${CMAKE_CURRENT_LIST_DIR}/PingCoreTestingTargets.cmake")
+        include("${CMAKE_CURRENT_LIST_DIR}/PingCoreTestingTargets.cmake")
+    endif ()
+    if (_PINGCORE_TESTING_LIBRARY AND EXISTS "${_PINGCORE_TESTING_LIBRARY}" AND NOT TARGET PingCore::testing)
+        add_library(PingCore::testing ${_PINGCORE_TESTING_TYPE} IMPORTED)
+        set_target_properties(PingCore::testing PROPERTIES
+                IMPORTED_LOCATION "${_PINGCORE_TESTING_LIBRARY}"
+                INTERFACE_COMPILE_FEATURES cxx_std_20
+        )
+    endif ()
+    if (TARGET PingCore::testing)
+        if (TARGET ${_PINGCORE_TESTING_CORE_TARGET})
+            set_target_properties(PingCore::testing PROPERTIES
+                    INTERFACE_LINK_LIBRARIES "${_PINGCORE_TESTING_CORE_TARGET}"
+            )
+            set(PingCore_testing_FOUND TRUE)
+        endif ()
+    endif ()
+    unset(_PINGCORE_TESTING_CORE_TARGET)
+    unset(_PINGCORE_TESTING_BOUND_CORE)
+    unset(_PINGCORE_TESTING_TYPE)
+    unset(_PINGCORE_TESTING_LIBRARY)
+endif ()
 
-if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/PingCoreTargets.cmake")
-    include("${CMAKE_CURRENT_LIST_DIR}/PingCoreTargets.cmake")
-endif()
+foreach (_PINGCORE_COMPONENT IN LISTS PingCore_FIND_COMPONENTS)
+    if (_PINGCORE_COMPONENT STREQUAL "shared" AND TARGET PingCore::pingcore)
+        get_target_property(_PINGCORE_CORE_TYPE PingCore::pingcore TYPE)
+        if (_PINGCORE_CORE_TYPE STREQUAL "SHARED_LIBRARY")
+            set(PingCore_shared_FOUND TRUE)
+        else ()
+            set(PingCore_shared_FOUND FALSE)
+        endif ()
+    elseif (_PINGCORE_COMPONENT STREQUAL "static" AND TARGET PingCore::pingcore_static)
+        set(PingCore_static_FOUND TRUE)
+    endif ()
+endforeach ()
+
+include("${CMAKE_CURRENT_LIST_DIR}/PingCoreWindowsInstaller.cmake")
 
 check_required_components(PingCore)
+
+unset(_PINGCORE_COMPONENT)
+unset(_PINGCORE_ANDROID_TARGET)
+unset(_PINGCORE_CORE_TYPE)
+unset(_PINGCORE_IOS_LIBRARY)
+unset(_PINGCORE_IOS_LINK_LIBRARIES)
+unset(_PINGCORE_IOS_SLICE)
+unset(_PINGCORE_IOS_SYSROOT)
+unset(_PINGCORE_IOS_TARGET)
+unset(_PINGCORE_IOS_XCFRAMEWORK)
+unset(_PINGCORE_TARGET)
+unset(_PINGCORE_WANT_SHARED)
+unset(_PINGCORE_WANT_STATIC)
+unset(_PINGCORE_WEB_TARGET)

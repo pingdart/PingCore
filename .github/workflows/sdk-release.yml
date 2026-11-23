@@ -1,0 +1,751 @@
+name: SDK Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to create or reuse
+        required: true
+        type: string
+      validation_only:
+        description: Build and validate artifacts without creating a tag or release
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+  RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.validation_only && github.sha || github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+
+concurrency:
+  group: sdk-release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Validate tag and version
+        id: release
+        run: >-
+          cmake
+          -DSOURCE_DIRECTORY=${{ github.workspace }}
+          -DRELEASE_TAG=${RELEASE_TAG}
+          -DOUTPUT_FILE=${GITHUB_OUTPUT}
+          -P ${{ github.workspace }}/cmake/ValidateSdkRelease.cmake
+      - name: Create release tag
+        if: github.event_name == 'workflow_dispatch' && inputs.validation_only == false
+        run: |
+          if git show-ref --verify --quiet "refs/tags/${RELEASE_TAG}"; then
+            existing_commit="$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")"
+            if [ "${existing_commit}" != "${GITHUB_SHA}" ]; then
+              echo "Release tag ${RELEASE_TAG} already points to ${existing_commit}, not ${GITHUB_SHA}" >&2
+              exit 1
+            fi
+            echo "Release tag ${RELEASE_TAG} already points to ${GITHUB_SHA}"
+            exit 0
+          fi
+
+          git tag "${RELEASE_TAG}" "${GITHUB_SHA}"
+          git push origin "refs/tags/${RELEASE_TAG}"
+
+  android-artifacts:
+    name: Build Android platform artifacts
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_REF }}
+      - name: Build Linux host tools
+        env:
+          CMAKE_BUILD_PARALLEL_LEVEL: 4
+        run: |
+          chmod +x platform/android/gradlew scripts/build_tools.sh
+          sh scripts/build_tools.sh --platform linux --architecture x86_64
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Install Android toolchain
+        run: |
+          set +o pipefail
+          yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
+          set -o pipefail
+          "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" \
+            "platform-tools" \
+            "ndk;29.0.14206865"
+      - name: Build Android artifacts
+        run: |
+          properties=platform/android/gradle.properties
+          ndk_version=$(sed -n 's/^pingcoreNdkVersion=//p' "$properties" | tr -d '\r')
+          min_sdk=$(sed -n 's/^pingcoreMinSdk=//p' "$properties" | tr -d '\r')
+          stl=$(sed -n 's/^pingcoreStl=//p' "$properties" | tr -d '\r')
+          abis=$(sed -n 's/^pingcoreAbis=//p' "$properties" | tr -d '\r' | tr ',' ' ')
+          if [ -z "$ndk_version" ] || [ -z "$min_sdk" ] || [ -z "$stl" ] || [ -z "$abis" ]; then
+            echo "PingCore Android build properties are incomplete" >&2
+            exit 1
+          fi
+          ndk="${ANDROID_HOME}/ndk/${ndk_version}"
+          test -f "$ndk/build/cmake/android.toolchain.cmake"
+          (cd platform/android && sh ./gradlew :PingCore:assembleRelease -PpingcoreBuildNative=false --no-daemon)
+          aar=platform/android/pingcore/build/outputs/aar/PingCore-release.aar
+          aar_entries=$(cmake -E tar tf "$aar")
+          if printf '%s\n' "$aar_entries" | grep -Eq '^(jni|prefab)/'; then
+            echo "PingCore Android SDK AAR must be Java-only" >&2
+            exit 1
+          fi
+          artifacts="${RUNNER_TEMP}/pingcore-platform-artifacts/android"
+          mkdir -p "$artifacts"
+          cp "$aar" "$artifacts/PingCore.aar"
+          for abi in $abis; do
+            abi_build="${RUNNER_TEMP}/pingcore-android-build/release/${abi}"
+            cmake -S . -B "$abi_build" -G Ninja \
+              "-DCMAKE_TOOLCHAIN_FILE=$ndk/build/cmake/android.toolchain.cmake" \
+              -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_LIBDIR=. \
+              "-DANDROID_ABI=$abi" "-DANDROID_PLATFORM=android-$min_sdk" "-DANDROID_STL=$stl" \
+              -DPINGCORE_BUILD_SHARED=OFF -DPINGCORE_BUILD_STATIC=ON -DPINGCORE_ENABLE_PROFILING=OFF \
+              -DPINGCORE_OPTIMIZATION=default -DPINGCORE_ENABLE_LTO=OFF \
+              -DPINGCORE_BUILD_CLI=OFF -DPINGCORE_BUILD_EXAMPLES=OFF -DPINGCORE_BUILD_TESTS=OFF \
+              -DPINGCORE_BUILD_TESTING_LIBRARY=ON -DPINGCORE_BUILD_TESTING_SMOKE_TESTS=OFF
+            cmake --build "$abi_build" --target pingcore_static pingcore_testing --parallel 4
+            cmake --install "$abi_build" --config Release --component PingCoreLibraries \
+              --prefix "$artifacts/$abi"
+          done
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: platform-artifacts-android
+          path: ${{ runner.temp }}/pingcore-platform-artifacts
+          if-no-files-found: error
+          retention-days: 7
+
+  web-artifacts:
+    name: Build Web platform artifacts
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_REF }}
+      - name: Build Linux host tools
+        env:
+          CMAKE_BUILD_PARALLEL_LEVEL: 4
+        run: |
+          chmod +x scripts/build_tools.sh
+          sh scripts/build_tools.sh --platform linux --architecture x86_64
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 4.0.19
+      - name: Build Web artifacts
+        run: |
+          emcmake cmake -S . -B build-web \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPINGCORE_BUILD_SHARED=OFF \
+            -DPINGCORE_BUILD_STATIC=ON \
+            -DPINGCORE_ENABLE_PROFILING=OFF \
+            -DPINGCORE_OPTIMIZATION=default -DPINGCORE_ENABLE_LTO=OFF \
+            -DPINGCORE_BUILD_CLI=OFF \
+            -DPINGCORE_BUILD_EXAMPLES=OFF \
+            -DPINGCORE_BUILD_TESTING_LIBRARY=ON \
+            -DPINGCORE_BUILD_TESTS=OFF
+          cmake --build build-web --target pingcore_static pingcore_testing --parallel 4
+          mkdir -p "${RUNNER_TEMP}/pingcore-platform-artifacts/web/emscripten-4.0.19"
+          cp build-web/lib/libpingcore_static.a \
+            "${RUNNER_TEMP}/pingcore-platform-artifacts/web/emscripten-4.0.19/libpingcore.a"
+          cp build-web/lib/libpingcore_testing.a \
+            "${RUNNER_TEMP}/pingcore-platform-artifacts/web/emscripten-4.0.19/libpingcore_testing.a"
+      - name: Upload Web artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: platform-artifacts-web
+          path: ${{ runner.temp }}/pingcore-platform-artifacts
+          if-no-files-found: error
+          retention-days: 7
+
+  ios-artifacts:
+    name: Build iOS platform artifacts
+    needs: validate
+    runs-on: macos-15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_REF }}
+      - name: Show Apple toolchain
+        run: |
+          xcodebuild -version
+          xcrun clang++ --version
+      - name: Build macOS host tools
+        run: |
+          chmod +x scripts/build_tools.sh
+          sh scripts/build_tools.sh --platform macos --architecture arm64
+      - name: Build iOS artifacts
+        run: >-
+          sh scripts/build_ios_xcframework.sh
+          "${{ github.workspace }}"
+          "${{ runner.temp }}/pingcore-ios-build"
+          "${{ runner.temp }}/pingcore-platform-artifacts/ios/PingCore.xcframework"
+          Release
+      - name: Validate Apple deployment targets
+        run: |
+          sh .github/workflows/scripts/check_apple_deployment_target.sh 12.0 \
+            tools/prebuilt/macos/arm64/hcg \
+            tools/prebuilt/macos/arm64/hrc
+          sh .github/workflows/scripts/check_apple_deployment_target.sh 15.0 \
+            "${RUNNER_TEMP}/pingcore-platform-artifacts/ios/PingCore.xcframework/ios-arm64/libpingcore_static.a" \
+            "${RUNNER_TEMP}/pingcore-platform-artifacts/ios/PingCore.xcframework/ios-arm64_x86_64-simulator/libpingcore_static.a"
+      - name: Upload iOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: platform-artifacts-ios
+          path: ${{ runner.temp }}/pingcore-platform-artifacts
+          if-no-files-found: error
+          retention-days: 7
+
+  linux-host-tools:
+    name: Build Linux ${{ matrix.architecture }} host tools
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            architecture: x86_64
+            image: quay.io/pypa/manylinux_2_28_x86_64
+          - runner: ubuntu-24.04-arm
+            architecture: aarch64
+            image: quay.io/pypa/manylinux_2_28_aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_REF }}
+      - name: Build host tools with GLIBC 2.28
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp \
+            --env CMAKE_BUILD_PARALLEL_LEVEL=4 \
+            --volume "${GITHUB_WORKSPACE}:/workspace" \
+            --workdir /workspace \
+            "${{ matrix.image }}" \
+            bash -lc 'sh scripts/build_tools.sh --platform linux --architecture ${{ matrix.architecture }}'
+          chmod +x \
+            "tools/prebuilt/linux/${{ matrix.architecture }}/hcg" \
+            "tools/prebuilt/linux/${{ matrix.architecture }}/hrc"
+          PINGCORE_MAX_GLIBC=2.28 PINGCORE_REQUIRE_STATIC_CXX=true \
+            sh .github/workflows/scripts/check_linux_binary_compatibility.sh \
+            "tools/prebuilt/linux/${{ matrix.architecture }}/hcg" \
+            "tools/prebuilt/linux/${{ matrix.architecture }}/hrc"
+      - name: Upload Linux host tools
+        uses: actions/upload-artifact@v4
+        with:
+          name: host-tools-linux-${{ matrix.architecture }}
+          path: tools/prebuilt/linux/${{ matrix.architecture }}
+          if-no-files-found: error
+          retention-days: 7
+
+  build-windows:
+    name: Build Windows x86_64 SDK
+    needs:
+      - validate
+      - android-artifacts
+      - web-artifacts
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_REF }}
+      - name: Download Android artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: platform-artifacts-android
+          path: platform-artifacts
+      - name: Download Web artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: platform-artifacts-web
+          path: platform-artifacts
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Build Windows host tools
+        shell: pwsh
+        run: .\scripts\build_tools.ps1 -Platform windows -Architecture x86_64
+      - name: Configure
+        run: >-
+          cmake
+          -S .
+          -B build
+          -G "Ninja Multi-Config"
+          -DPINGCORE_BUILD_CLI=ON
+          -DPINGCORE_BUILD_EXAMPLES=OFF
+          -DPINGCORE_BUILD_TESTS=ON
+          -DPINGCORE_INTERNAL_SDK_ARTIFACT_ROOT=${{ github.workspace }}/platform-artifacts
+          -DPINGCORE_INTERNAL_PACKAGE_WINDOWS_DEBUG=ON
+          -DPINGCORE_ENABLE_PROFILING=OFF
+          -DPINGCORE_OPTIMIZATION=default
+          -DPINGCORE_ENABLE_LTO=OFF
+      - name: Build Windows Debug libraries
+        run: >-
+          cmake
+          --build build
+          --config Debug
+          --target pingcore pingcore_static pingcore_testing
+          --parallel 4
+      - name: Build
+        id: test-build
+        run: cmake --build build --config Release --parallel 4
+      - name: Test common contracts and tools
+        run: ctest --test-dir build -C Release --output-on-failure -LE platform --no-tests=error --output-junit "${{ github.workspace }}/build/common-tests.xml"
+      - name: Test portable platform contracts
+        if: ${{ !cancelled() && steps.test-build.outcome == 'success' }}
+        run: ctest --test-dir build -C Release --output-on-failure -L portable --no-tests=error --output-junit "${{ github.workspace }}/build/portable-tests.xml"
+      - name: Test native platform integration
+        if: ${{ !cancelled() && steps.test-build.outcome == 'success' }}
+        run: ctest --test-dir build -C Release --output-on-failure -L native --no-tests=error --output-junit "${{ github.workspace }}/build/native-tests.xml"
+      - name: Package
+        run: >-
+          cpack
+          --config build/CPackConfig.cmake
+          -C Release
+          -G ZIP
+          -B release-assets
+      - name: Test packaged Windows installer
+        shell: pwsh
+        env:
+          SDK_ARCHIVE: ${{ github.workspace }}\release-assets\pingcore-sdk-${{ needs.validate.outputs.version }}-windows-x86_64.zip
+          SDK_PREFIX: ${{ runner.temp }}\PingCore SDK
+        run: |
+          $oldHome = [Environment]::GetEnvironmentVariable("PINGCORE_HOME", "User")
+          $oldPath = [Environment]::GetEnvironmentVariable("Path", "User")
+          $installer = Join-Path $env:GITHUB_WORKSPACE "install.ps1"
+          $cli = Join-Path $env:SDK_PREFIX "bin\pingcore.exe"
+          try {
+              & pwsh -NoProfile -File $installer -Archive $env:SDK_ARCHIVE -Prefix $env:SDK_PREFIX -Yes
+              if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $cli -PathType Leaf)) {
+                  throw "Windows SDK installation failed"
+              }
+              $selectedHome = [Environment]::GetEnvironmentVariable("PINGCORE_HOME", "User")
+              if (-not [string]::Equals($selectedHome, $env:SDK_PREFIX, [System.StringComparison]::OrdinalIgnoreCase)) {
+                  throw "Windows SDK installation did not select PINGCORE_HOME"
+              }
+              $versionOutput = & $cli --version
+              if ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch '^pingcore [0-9]+\.[0-9]+\.[0-9]+$') {
+                  throw "Installed Windows SDK CLI did not run"
+              }
+              & pwsh -NoProfile -File $installer -Uninstall -Prefix $env:SDK_PREFIX -Yes
+              if ($LASTEXITCODE -ne 0 -or (Test-Path -LiteralPath $env:SDK_PREFIX)) {
+                  throw "Windows SDK uninstall failed"
+              }
+          } finally {
+              [Environment]::SetEnvironmentVariable("PINGCORE_HOME", $oldHome, "User")
+              [Environment]::SetEnvironmentVariable("Path", $oldPath, "User")
+              if (Test-Path -LiteralPath $env:SDK_PREFIX) {
+                  Remove-Item -LiteralPath $env:SDK_PREFIX -Recurse -Force
+              }
+          }
+      - name: Upload SDK archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-windows-x86_64
+          path: |
+            release-assets/pingcore-sdk-${{ needs.validate.outputs.version }}-windows-x86_64.zip
+            release-assets/pingcore-sdk-${{ needs.validate.outputs.version }}-windows-x86_64.zip.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  build-macos:
+    name: Build macOS ${{ matrix.architecture }} SDK
+    needs:
+      - validate
+      - android-artifacts
+      - web-artifacts
+      - ios-artifacts
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            architecture: arm64
+            parallel_jobs: 3
+          - runner: macos-15-intel
+            architecture: x86_64
+            parallel_jobs: 4
+    runs-on: ${{ matrix.runner }}
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
+      CMAKE_BUILD_PARALLEL_LEVEL: ${{ matrix.parallel_jobs }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_REF }}
+      - name: Show Apple toolchain
+        run: |
+          xcodebuild -version
+          xcrun clang++ --version
+      - name: Download Android artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: platform-artifacts-android
+          path: platform-artifacts
+      - name: Download Web artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: platform-artifacts-web
+          path: platform-artifacts
+      - name: Download iOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: platform-artifacts-ios
+          path: platform-artifacts
+      - name: Build macOS host tools
+        run: |
+          chmod +x install.sh scripts/build_tools.sh
+          sh scripts/build_tools.sh --platform macos --architecture "${{ matrix.architecture }}"
+      - name: Configure
+        run: >-
+          cmake
+          -S .
+          -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0
+          -DPINGCORE_ENABLE_PROFILING=OFF
+          -DPINGCORE_OPTIMIZATION=default
+          -DPINGCORE_ENABLE_LTO=OFF
+          -DPINGCORE_BUILD_CLI=ON
+          -DPINGCORE_BUILD_EXAMPLES=OFF
+          -DPINGCORE_BUILD_TESTS=ON
+          -DPINGCORE_INTERNAL_SDK_ARTIFACT_ROOT=${{ github.workspace }}/platform-artifacts
+      - name: Build
+        id: test-build
+        run: cmake --build build --config Release --parallel "${{ matrix.parallel_jobs }}"
+      - name: Validate macOS deployment targets
+        run: |
+          sh .github/workflows/scripts/check_apple_deployment_target.sh 12.0 \
+            "tools/prebuilt/macos/${{ matrix.architecture }}/hcg" \
+            "tools/prebuilt/macos/${{ matrix.architecture }}/hrc" \
+            build/bin/pingcore \
+            build/lib/libpingcore.dylib \
+            build/lib/libpingcore_static.a
+      - name: Test common contracts and tools
+        run: ctest --test-dir build -C Release --verbose --output-on-failure -LE platform --no-tests=error --output-junit "${{ github.workspace }}/build/common-tests.xml"
+      - name: Test portable platform contracts
+        if: ${{ !cancelled() && steps.test-build.outcome == 'success' }}
+        run: ctest --test-dir build -C Release --output-on-failure -L portable --no-tests=error --output-junit "${{ github.workspace }}/build/portable-tests.xml"
+      - name: Test native platform integration
+        if: ${{ !cancelled() && steps.test-build.outcome == 'success' }}
+        run: ctest --test-dir build -C Release --output-on-failure -L native --no-tests=error --output-junit "${{ github.workspace }}/build/native-tests.xml"
+      - name: Package
+        run: >-
+          cpack
+          --config build/CPackConfig.cmake
+          -C Release
+          -G TGZ
+          -B release-assets
+      - name: Upload SDK archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-macos-${{ matrix.architecture }}
+          path: |
+            release-assets/pingcore-sdk-${{ needs.validate.outputs.version }}-macos-${{ matrix.architecture }}.tar.gz
+            release-assets/pingcore-sdk-${{ needs.validate.outputs.version }}-macos-${{ matrix.architecture }}.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  build-linux:
+    name: Build Linux ${{ matrix.architecture }} SDK
+    needs:
+      - validate
+      - android-artifacts
+      - web-artifacts
+      - linux-host-tools
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            architecture: x86_64
+            parallel_jobs: 4
+          - runner: ubuntu-24.04-arm
+            architecture: aarch64
+            parallel_jobs: 4
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:24.04
+    env:
+      CC: gcc-14
+      CXX: g++-14
+      CMAKE_BUILD_PARALLEL_LEVEL: ${{ matrix.parallel_jobs }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_REF }}
+      - name: Download Android artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: platform-artifacts-android
+          path: platform-artifacts
+      - name: Download Web artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: platform-artifacts-web
+          path: platform-artifacts
+      - name: Download Linux host tools
+        uses: actions/download-artifact@v4
+        with:
+          name: host-tools-linux-${{ matrix.architecture }}
+          path: tools/prebuilt/linux/${{ matrix.architecture }}
+      - name: Install Linux build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            binutils ca-certificates curl fontconfig fonts-dejavu-core git libepoxy-dev libgtk-4-dev \
+            libsoup-3.0-dev ninja-build pkg-config python3-pip software-properties-common
+          add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y gcc-14 g++-14
+          python3 -m pip install --break-system-packages cmake==3.31.10
+      - name: Install Linux runtime deployment tool
+        run: |
+          case "${{ matrix.architecture }}" in
+            x86_64) patchelf_sha256=2abdc34fbe949c995a1baa4ec310896a085588a45a99cd0d726851bdfac2a4bb ;;
+            aarch64) patchelf_sha256=ba6850c1a6f4cbdb050e1cc22fa5239159ad31c43606846e49c408d335f594ff ;;
+            *) exit 1 ;;
+          esac
+          patchelf_archive="${RUNNER_TEMP}/patchelf-0.19.2-${{ matrix.architecture }}.tar.gz"
+          patchelf_root="${RUNNER_TEMP}/pingcore-patchelf"
+          curl --fail --location --retry 3 \
+            "https://github.com/NixOS/patchelf/releases/download/0.19.2/patchelf-0.19.2-${{ matrix.architecture }}.tar.gz" \
+            --output "${patchelf_archive}"
+          printf '%s  %s\n' "${patchelf_sha256}" "${patchelf_archive}" | sha256sum --check --status
+          mkdir -p "${patchelf_root}"
+          tar -xzf "${patchelf_archive}" -C "${patchelf_root}"
+          printf '%s\n' "${patchelf_root}/bin" >> "${GITHUB_PATH}"
+          "${patchelf_root}/bin/patchelf" --version
+      - name: Prepare executables
+        run: >-
+          chmod +x
+          install.sh
+          tools/prebuilt/linux/${{ matrix.architecture }}/hcg
+          tools/prebuilt/linux/${{ matrix.architecture }}/hrc
+      - name: Configure
+        run: >-
+          cmake
+          -S .
+          -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DPINGCORE_BUILD_CLI=ON
+          -DPINGCORE_BUILD_EXAMPLES=OFF
+          -DPINGCORE_BUILD_TESTS=ON
+          -DPINGCORE_INTERNAL_SDK_ARTIFACT_ROOT=${GITHUB_WORKSPACE}/platform-artifacts
+          -DPINGCORE_ENABLE_PROFILING=OFF
+          -DPINGCORE_OPTIMIZATION=default
+          -DPINGCORE_ENABLE_LTO=OFF
+      - name: Build
+        id: test-build
+        run: cmake --build build --parallel "${{ matrix.parallel_jobs }}"
+      - name: Test common contracts and tools
+        id: linux-common-tests
+        run: ctest --test-dir build --verbose --output-on-failure --timeout 300 -LE platform --no-tests=error --output-junit "${{ github.workspace }}/build/common-tests.xml"
+      - name: Test portable platform contracts
+        id: linux-portable-tests
+        if: ${{ !cancelled() && steps.test-build.outcome == 'success' }}
+        run: ctest --test-dir build --output-on-failure --timeout 300 -L portable --no-tests=error --output-junit "${{ github.workspace }}/build/portable-tests.xml"
+      - name: Test native platform integration
+        id: linux-native-tests
+        if: ${{ !cancelled() && steps.test-build.outcome == 'success' }}
+        run: ctest --test-dir build --output-on-failure --timeout 300 -L native --no-tests=error --output-junit "${{ github.workspace }}/build/native-tests.xml"
+      - name: Upload Linux test logs
+        if: failure() && (steps.linux-common-tests.outcome == 'failure' || steps.linux-portable-tests.outcome == 'failure' || steps.linux-native-tests.outcome == 'failure')
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-test-logs-${{ matrix.architecture }}
+          path: |
+            build/Testing/Temporary/
+            build/*-tests.xml
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Validate Linux SDK binary compatibility
+        run: >-
+          sh .github/workflows/scripts/check_linux_binary_compatibility.sh
+          build/lib/libpingcore.so
+          build/bin/pingcore
+      - name: Package
+        run: >-
+          cpack
+          --config build/CPackConfig.cmake
+          -C Release
+          -G TGZ
+          -B release-assets
+      - name: Upload SDK archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-linux-${{ matrix.architecture }}
+          path: |
+            release-assets/pingcore-sdk-${{ needs.validate.outputs.version }}-linux-${{ matrix.architecture }}.tar.gz
+            release-assets/pingcore-sdk-${{ needs.validate.outputs.version }}-linux-${{ matrix.architecture }}.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  build-android-host:
+    name: Build Android-Termux arm64-v8a SDK
+    needs:
+      - validate
+      - android-artifacts
+      - web-artifacts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_REF }}
+      - name: Download Android artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: platform-artifacts-android
+          path: platform-artifacts
+      - name: Download Web artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: platform-artifacts-web
+          path: platform-artifacts
+      - name: Install Android NDK
+        run: |
+          set +o pipefail
+          yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
+          set -o pipefail
+          "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" "ndk;29.0.14206865"
+      - name: Build host tools
+        env:
+          CMAKE_BUILD_PARALLEL_LEVEL: 4
+        run: |
+          chmod +x scripts/build_tools.sh
+          sh scripts/build_tools.sh --platform linux --architecture x86_64
+          sh scripts/build_tools.sh \
+            --platform android \
+            --architecture arm64-v8a \
+            --android-ndk "${ANDROID_HOME}/ndk/29.0.14206865"
+      - name: Configure Android-Termux SDK
+        run: >-
+          cmake
+          -S .
+          -B build-android-host
+          -G Ninja
+          -DCMAKE_TOOLCHAIN_FILE=${ANDROID_HOME}/ndk/29.0.14206865/build/cmake/android.toolchain.cmake
+          -DANDROID_ABI=arm64-v8a
+          -DANDROID_PLATFORM=android-24
+          -DCMAKE_BUILD_TYPE=Release
+          -DPINGCORE_BUILD_SHARED=ON
+          -DPINGCORE_BUILD_STATIC=OFF
+          -DPINGCORE_ENABLE_PROFILING=OFF
+          -DPINGCORE_OPTIMIZATION=default
+          -DPINGCORE_ENABLE_LTO=OFF
+          -DPINGCORE_BUILD_CLI=ON
+          -DPINGCORE_BUILD_EXAMPLES=OFF
+          -DPINGCORE_BUILD_TESTS=OFF
+          -DPINGCORE_INTERNAL_SDK_ARTIFACT_ROOT=${{ github.workspace }}/platform-artifacts
+      - name: Build Android-Termux SDK
+        run: cmake --build build-android-host --parallel 4
+      - name: Package Android-Termux SDK
+        run: >-
+          cpack
+          --config build-android-host/CPackConfig.cmake
+          -C Release
+          -G TGZ
+          -B release-assets
+      - name: Validate Android-Termux SDK
+        env:
+          SDK_ROOT: ${{ runner.temp }}/android-host-sdk
+          SDK_ARCHIVE: ${{ github.workspace }}/release-assets/pingcore-sdk-${{ needs.validate.outputs.version }}-android-arm64-v8a.tar.gz
+        run: |
+          mkdir -p "${SDK_ROOT}"
+          tar -xzf "${SDK_ARCHIVE}" -C "${SDK_ROOT}" --strip-components=1
+          for executable in \
+            "${SDK_ROOT}/bin/pingcore" \
+            "${SDK_ROOT}/share/pingcore/tools/android/arm64-v8a/hcg" \
+            "${SDK_ROOT}/share/pingcore/tools/android/arm64-v8a/hrc"; do
+            test -x "${executable}"
+            "${ANDROID_HOME}/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
+              --program-headers "${executable}" | grep -F '/system/bin/linker64'
+          done
+          test -f "${SDK_ROOT}/include/pingcore/pingcore.h"
+          test -f "${SDK_ROOT}/lib/cmake/PingCore/PingCoreConfig.cmake"
+          test -f "${SDK_ROOT}/share/pingcore/resources/pingcore/resources.bin"
+          test -f "${SDK_ROOT}/share/pingcore/platform/android/PingCore.aar"
+      - name: Upload Android-Termux SDK archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-android-arm64-v8a
+          path: |
+            release-assets/pingcore-sdk-${{ needs.validate.outputs.version }}-android-arm64-v8a.tar.gz
+            release-assets/pingcore-sdk-${{ needs.validate.outputs.version }}-android-arm64-v8a.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  prepare:
+    name: Prepare release
+    if: github.event_name != 'workflow_dispatch' || inputs.validation_only == false
+    needs:
+      - validate
+      - build-windows
+      - build-macos
+      - build-linux
+      - build-android-host
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_REF }}
+      - name: Download SDK archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sdk-*
+          path: release-assets
+          merge-multiple: true
+      - name: Add installers
+        run: cp install.sh install.ps1 release-assets/
+      - name: Validate release assets
+        run: >-
+          cmake
+          -DSOURCE_DIRECTORY=${{ github.workspace }}
+          -DRELEASE_TAG=${RELEASE_TAG}
+          -DASSET_DIRECTORY=${{ github.workspace }}/release-assets
+          -P ${{ github.workspace }}/cmake/ValidateSdkRelease.cmake
+      - name: Prepare GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" \
+              --prerelease=false \
+              --title "PingCore ${RELEASE_VERSION}" \
+              --verify-tag
+          else
+            gh release create "${RELEASE_TAG}" \
+              --draft \
+              --notes "" \
+              --title "PingCore ${RELEASE_VERSION}" \
+              --verify-tag
+          fi
+          gh release upload "${RELEASE_TAG}" release-assets/* --clobber

@@ -1,0 +1,72 @@
+import PingCorePlatform
+import UIKit
+
+final class TestPlatformModule: NSObject, PlatformModule {
+  func invoke(_ method: String, arguments: PlatformPayload, result: PlatformResult) -> PlatformCancellation? {
+    result.complete(.object([
+      "method": .string(method),
+      "arguments": arguments,
+    ]))
+    return nil
+  }
+
+  func dispose() {}
+}
+
+final class TestPlatformModuleFactory: NSObject, UIKitWindowPlatformModuleFactory {
+  func create(with viewController: UIViewController, options: PlatformPayload,
+              events: PlatformEventEmitter) -> PlatformModule {
+    _ = events.emit("created", payload: options)
+    return TestPlatformModule()
+  }
+}
+
+final class TestPlatformView: NSObject, UIKitPlatformView {
+  let view = UIView()
+
+  func dispose() {}
+}
+
+final class TestPlatformViewFactory: NSObject, UIKitPlatformViewFactory {
+  func create(with viewController: UIViewController, properties: PlatformPayload,
+              events: PlatformEventEmitter) -> UIKitPlatformView {
+    _ = events.emit("created", payload: properties)
+    return TestPlatformView()
+  }
+}
+
+let payload: PlatformPayload = .object([
+  "enabled": .boolean(true),
+  "count": .integer(3),
+])
+payload.validate(fields: ["enabled", "count"])
+
+func useFileReference(_ reference: FileReference) {
+  _ = reference.fileURL
+  _ = PlatformPayload.fileReference(reference).fileReference()
+}
+
+func copyFileReference(_ url: URL) throws -> FileReference {
+  try FileReference.copy(from: url)
+}
+
+let texture = PixelBufferTexture(intrinsicSize: CGSize(width: 16, height: 9))
+texture.finish()
+
+final class TestApplicationModuleFactory: NSObject, PlatformModuleFactory {
+  func create(options: PlatformPayload, events: PlatformEventEmitter) -> PlatformModule {
+    _ = events.emit("created", payload: options)
+    return TestPlatformModule()
+  }
+}
+
+@MainActor
+func usePresentation(_ owner: UIViewController) -> PlatformCancellation {
+  presentationCoordinator(for: owner).enqueue(start: { presenter, finished in
+    _ = presenter
+    finished()
+    return nil
+  }, failure: { error in
+    _ = error.localizedDescription
+  })
+}

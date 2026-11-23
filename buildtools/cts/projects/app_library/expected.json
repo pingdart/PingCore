@@ -1,0 +1,64 @@
+{
+  "schema": 1,
+  "target": "cts_app_library",
+  "requires": [],
+  "facts": {
+    "profile": "debug",
+    "artifact.name": "cts_app_library",
+    "framework.linkage": "static",
+    "resources.location": "<artifact>.resources/pingcore/resources.bin",
+    "libraries": [
+      "CtsKit::Widgets",
+      "CtsKit::Core"
+    ],
+    "artifact.bundle": "<none>",
+    "package.kind": "appimage"
+  },
+  "launch": {
+    "app.title": "CTS library application",
+    "widgets.caption": "Caption from the widgets library",
+    "core.name": "Name from the core library"
+  },
+  "targets": {
+    "macos": {
+      "facts": {
+        "artifact.bundle": "cts_app_library.app",
+        "resources.location": "<bundle>/Contents/Resources/PingCore/pingcore/resources.bin",
+        "package.kind": "dmg"
+      }
+    },
+    "web": {
+      "facts": {
+        "resources.location": "<artifact>.data:/pingcore/resources.bin",
+        "package.kind": "web"
+      }
+    },
+    "android": {
+      "facts": {
+        "artifact.name": "libcts_app_library.so",
+        "resources.location": "application core",
+        "android.exports": "JNI entries only",
+        "package.kind": "apk",
+        "package.library_code": [
+          "org.pingcore.ctsprobe.core.CoreAndroid",
+          "org.pingcore.ctsprobe.widgets.WidgetsAndroid",
+          "org.pingcore.ctsprobe.widgets.WidgetsExtra"
+        ],
+        "package.abis": "the selection"
+      }
+    },
+    "ios": {
+      "facts": {
+        "artifact.name": "libcts_app_library_pingcore.a",
+        "resources.location": "application core",
+        "ios.link_inputs": "present",
+        "package.kind": "app"
+      }
+    },
+    "windows": {
+      "facts": {
+        "package.kind": "setup"
+      }
+    }
+  }
+}

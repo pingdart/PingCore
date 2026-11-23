@@ -1,0 +1,52 @@
+#pragma once
+
+#include <memory>
+
+#include <pingcore/app.h>
+
+@class PingCoreView;
+@protocol UITextInput;
+
+namespace pingcore::detail {
+
+class UIKitTextInputBridge;
+
+class UIKitTextInput final : public PlatformTextInput {
+public:
+  UIKitTextInput(UiWindow& ui_window, PingCoreView* view);
+  ~UIKitTextInput() override;
+
+  UIKitTextInput(const UIKitTextInput&) = delete;
+  UIKitTextInput& operator=(const UIKitTextInput&) = delete;
+
+  [[nodiscard]] bool IsActive() const noexcept;
+  [[nodiscard]] const TextInputConfiguration& Configuration() const noexcept;
+  [[nodiscard]] TextInputContext QueryContext(TextOffset start = 0, TextOffset length = 0) const;
+  [[nodiscard]] TextInputGeometry QueryGeometry(TextRange range) const;
+  [[nodiscard]] TextInputPositionResult QueryPosition(Point point) const;
+  [[nodiscard]] id<UITextInput> Responder() const noexcept;
+  TextInputApplyResult Apply(TextInputCommand command);
+  bool PerformAction(TextInputAction action);
+
+  void Start(
+      TextInputSessionId session_id,
+      const TextInputConfiguration& configuration,
+      const TextInputState& state,
+      const TextInputGeometry& geometry
+  ) override;
+  void Update(TextInputSessionId session_id, const TextInputState& state, const TextInputGeometry& geometry) override;
+  void Restart(
+      TextInputSessionId session_id,
+      const TextInputConfiguration& configuration,
+      const TextInputState& state,
+      const TextInputGeometry& geometry
+  ) override;
+  void Stop(TextInputSessionId session_id) override;
+  void RequestShowKeyboard(TextInputSessionId session_id) override;
+  void RequestHideKeyboard(TextInputSessionId session_id) override;
+
+private:
+  std::unique_ptr<UIKitTextInputBridge> bridge_;
+};
+
+} // namespace pingcore::detail

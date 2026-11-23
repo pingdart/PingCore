@@ -1,0 +1,722 @@
+#include <pingcore/app.h>
+
+#include <algorithm>
+#include <exception>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <utility>
+
+#include "application_internal.h"
+#include "io/file_internal.h"
+#include "platform_registry_internal.h"
+#include "runtime/ui_window_internal.h"
+#include "system_tray_internal.h"
+#include "macros_internal.h"
+
+namespace pingcore::detail {
+
+namespace {
+
+void ValidateApplicationActivation(const ApplicationActivation& activation) {
+  const auto* files = std::get_if<FileActivation>(&activation);
+  if (files != nullptr && files->files.empty()) {
+    throw std::invalid_argument("PingCore file activation must contain at least one file");
+  }
+  const auto* notification = std::get_if<NotificationActivation>(&activation);
+  if (notification != nullptr) {
+    PINGCORE_DISCARD(EncodeLocalNotificationData(notification->data));
+  }
+  if (notification != nullptr &&
+      (notification->identifier.empty() || notification->identifier.find('\0') != std::string::npos ||
+       !IsValidUtf8(notification->identifier))) {
+    throw std::invalid_argument(
+        "PingCore notification activation identifier must contain non-empty valid UTF-8 without null characters");
+  }
+}
+
+void ValidateApplicationLifecycleState(ApplicationLifecycleState lifecycle_state) {
+  switch (lifecycle_state) {
+  case ApplicationLifecycleState::Active:
+  case ApplicationLifecycleState::Inactive:
+  case ApplicationLifecycleState::Background:
+    return;
+  }
+  throw std::invalid_argument("PingCore application lifecycle state is invalid");
+}
+
+void ValidatePermission(Permission permission) {
+  switch (permission) {
+  case Permission::Camera:
+  case Permission::Microphone:
+  case Permission::Location:
+  case Permission::PreciseLocation:
+  case Permission::BackgroundLocation:
+  case Permission::Notifications:
+  case Permission::ContactsRead:
+  case Permission::CalendarAdd:
+  case Permission::CalendarReadWrite:
+  case Permission::PhotosRead:
+  case Permission::VideosRead:
+  case Permission::PhotoLibraryAdd:
+  case Permission::BluetoothScan:
+  case Permission::BluetoothConnect:
+    return;
+  }
+  throw std::invalid_argument("PingCore permission is invalid");
+}
+
+void ValidatePermissionSettingsTarget(PermissionSettingsTarget target) {
+  switch (target) {
+  case PermissionSettingsTarget::Application:
+  case PermissionSettingsTarget::System:
+    return;
+  }
+  throw std::invalid_argument("PingCore permission settings target is invalid");
+}
+
+void InvokeCancellation(std::function<void()> cancellation) noexcept {
+  if (!cancellation) {
+    return;
+  }
+  try {
+    cancellation();
+  } catch (...) {
+  }
+}
+
+} // namespace
+
+struct PermissionController::Impl final : public std::enable_shared_from_this<Impl> {
+  class Operation {
+  public:
+    virtual ~Operation() = default;
+
+    virtual void Start(const std::shared_ptr<PermissionTransport>& transport,
+                       const std::weak_ptr<Impl>& controller) = 0;
+    virtual void Fail() noexcept = 0;
+    virtual std::function<void()> Detach() noexcept = 0;
+  };
+
+  Impl(std::shared_ptr<PermissionTransport> transport, UiThreadDispatcher dispatch_to_ui_thread)
+      : transport(std::move(transport)), dispatch_to_ui_thread(std::move(dispatch_to_ui_thread)) {
+    if (this->transport && !this->dispatch_to_ui_thread) {
+      throw std::logic_error("PingCore permission transport requires a UiThreadDispatcher");
+    }
+  }
+
+  ~Impl() {
+    Disconnect();
+  }
+
+  void Submit(const std::shared_ptr<Operation>& operation, bool interactive) {
+    if (!connected || !transport) {
+      operation->Fail();
+      return;
+    }
+    if (!interactive) {
+      try {
+        operation->Start(transport, weak_from_this());
+      } catch (...) {
+        operation->Fail();
+      }
+      return;
+    }
+    queued.push_back(operation);
+    StartNext();
+  }
+
+  void Cancel(const std::shared_ptr<Operation>& operation) noexcept {
+    std::function<void()> cancellation = operation->Detach();
+    if (active == operation) {
+      if (!cancellation) {
+        return;
+      }
+      active.reset();
+      InvokeCancellation(std::move(cancellation));
+      StartNext();
+      return;
+    }
+    const auto found = std::find(queued.begin(), queued.end(), operation);
+    if (found != queued.end()) {
+      queued.erase(found);
+      return;
+    }
+    InvokeCancellation(std::move(cancellation));
+  }
+
+  void Finish(const std::shared_ptr<Operation>& operation) {
+    if (active != operation) {
+      return;
+    }
+    active.reset();
+    StartNext();
+  }
+
+  void Post(std::function<void()> operation) noexcept {
+    try {
+      dispatch_to_ui_thread(std::move(operation));
+    } catch (...) {
+      std::terminate();
+    }
+  }
+
+  void Disconnect() noexcept {
+    if (!connected) {
+      return;
+    }
+    connected = false;
+    if (active) {
+      InvokeCancellation(active->Detach());
+      active.reset();
+    }
+    for (const std::shared_ptr<Operation>& operation : queued) {
+      operation->Detach();
+    }
+    queued.clear();
+    transport.reset();
+  }
+
+  void StartNext() {
+    while (connected && !active && !queued.empty()) {
+      active = std::move(queued.front());
+      queued.pop_front();
+      try {
+        active->Start(transport, weak_from_this());
+      } catch (...) {
+        active->Fail();
+        active.reset();
+      }
+    }
+  }
+
+  std::shared_ptr<ExecutionContext> application_source = CurrentApplicationRuntime()->execution;
+  std::shared_ptr<PermissionTransport> transport;
+  UiThreadDispatcher dispatch_to_ui_thread;
+  std::deque<std::shared_ptr<Operation>> queued;
+  std::shared_ptr<Operation> active;
+  bool connected = true;
+};
+
+namespace {
+
+template <class Result>
+class PermissionOperation final : public PermissionController::Impl::Operation,
+                                  public std::enable_shared_from_this<PermissionOperation<Result>> {
+public:
+  using Completion = std::function<void(Result)>;
+  using Starter = std::function<std::function<void()>(PermissionTransport&, Completion)>;
+
+  PermissionOperation(Starter starter, Result failure) : starter_(std::move(starter)), failure_(std::move(failure)) {}
+
+  void Suspend(TaskContinuation continuation) {
+    std::scoped_lock lock(mutex_);
+    continuation_ = std::move(continuation);
+  }
+
+  void Start(const std::shared_ptr<PermissionTransport>& transport,
+      const std::weak_ptr<PermissionController::Impl>& controller) override {
+    if (!transport) {
+      Fail();
+      return;
+    }
+    controller_ = controller;
+    std::weak_ptr<PermissionOperation> weak = this->shared_from_this();
+    std::function<void()> cancellation = starter_(*transport, [weak, controller](Result result) mutable {
+      if (const std::shared_ptr<PermissionController::Impl> owner = controller.lock()) {
+        owner->Post([weak, controller, result = std::move(result)]() mutable {
+          const std::shared_ptr<PermissionOperation> operation = weak.lock();
+          const std::shared_ptr<PermissionController::Impl> active_controller = controller.lock();
+          if (!operation || !active_controller) {
+            return;
+          }
+          operation->Complete(std::move(result));
+          active_controller->Finish(operation);
+        });
+      }
+    });
+
+    bool cancel_started_operation = false;
+    {
+      std::scoped_lock lock(mutex_);
+      if (canceled_) {
+        cancel_started_operation = static_cast<bool>(cancellation);
+      } else if (!result_.has_value()) {
+        cancellation_ = std::move(cancellation);
+      }
+    }
+    if (cancel_started_operation) {
+      InvokeCancellation(std::move(cancellation));
+      if (const std::shared_ptr<PermissionController::Impl> owner = controller.lock()) {
+        owner->Finish(this->shared_from_this());
+      }
+    }
+  }
+
+  void Fail() noexcept override {
+    Complete(std::move(failure_));
+  }
+
+  std::function<void()> Detach() noexcept override {
+    std::scoped_lock lock(mutex_);
+    canceled_ = true;
+    continuation_ = {};
+    return std::move(cancellation_);
+  }
+
+  void Cancel() noexcept {
+    if (const std::shared_ptr<PermissionController::Impl> controller = controller_.lock()) {
+      controller->Cancel(this->shared_from_this());
+    } else {
+      Detach();
+    }
+  }
+
+  Result TakeResult() {
+    std::scoped_lock lock(mutex_);
+    if (!result_.has_value()) {
+      throw std::logic_error("PingCore permission operation resumed without a result");
+    }
+    return std::move(*result_);
+  }
+
+private:
+  void Complete(Result result) noexcept {
+    TaskContinuation continuation;
+    {
+      std::scoped_lock lock(mutex_);
+      if (canceled_ || result_.has_value()) {
+        return;
+      }
+      result_.emplace(std::move(result));
+      cancellation_ = {};
+      continuation = std::exchange(continuation_, {});
+    }
+    continuation.Resume();
+  }
+
+  std::mutex mutex_;
+  Starter starter_;
+  Result failure_;
+  std::weak_ptr<PermissionController::Impl> controller_;
+  TaskContinuation continuation_;
+  std::function<void()> cancellation_;
+  std::optional<Result> result_;
+  bool canceled_ = false;
+};
+
+template <class Result>
+class PermissionAwaiter final {
+public:
+  using Operation = PermissionOperation<Result>;
+
+  PermissionAwaiter(std::shared_ptr<PermissionController::Impl> controller, typename Operation::Starter starter,
+    Result failure, bool interactive)
+      : controller_(std::move(controller)), operation_(std::make_shared<Operation>(std::move(starter), failure)),
+        interactive_(interactive) {}
+
+  ~PermissionAwaiter() {
+    if (operation_) {
+      operation_->Cancel();
+    }
+  }
+
+  void Suspend(TaskContinuation continuation) {
+    operation_->Suspend(std::move(continuation));
+    controller_->Submit(operation_, interactive_);
+  }
+
+  Result TakeResult() {
+    Result result = operation_->TakeResult();
+    operation_.reset();
+    return result;
+  }
+
+private:
+  std::shared_ptr<PermissionController::Impl> controller_;
+  std::shared_ptr<Operation> operation_;
+  bool interactive_ = false;
+};
+
+template <class Result>
+Task<Result> RunPermissionOperation(std::shared_ptr<PermissionController::Impl> controller,
+    typename PermissionOperation<Result>::Starter starter, Result failure, bool interactive) {
+  ValidateApplicationCall(controller->application_source);
+  co_return co_await TaskAwaiter<PermissionAwaiter<Result>>(std::move(controller), std::move(starter), std::move(failure), interactive);
+}
+
+Task<PermissionStatus> CheckPermission(std::shared_ptr<PermissionController::Impl> controller, Permission permission) {
+  ValidateApplicationCall(controller->application_source);
+  return RunPermissionOperation<PermissionStatus>(
+      std::move(controller),
+      [permission](PermissionTransport& transport, PermissionStatusCompletion completion) {
+        return transport.Check(permission, std::move(completion));
+      },
+      PermissionStatus::Unavailable,
+      false);
+}
+
+Task<PermissionStatus> RequestPermission(std::shared_ptr<PermissionController::Impl> controller,
+                                         Permission permission) {
+  auto source = CapturePresentationContext(controller->application_source);
+  const auto identity = controller->transport ? controller->transport->PresentationIdentity() : 0;
+  return RunPermissionOperation<PermissionStatus>(
+      std::move(controller),
+      [permission, identity, source = std::move(source)](PermissionTransport& transport, PermissionStatusCompletion completion) {
+        if (!IsPresentationSourceAvailable(source)) {
+          completion(PermissionStatus::Unavailable);
+          return std::function<void()>{};
+        }
+        ExecutionGuard guard(source);
+        if (identity != transport.PresentationIdentity()) {
+          completion(PermissionStatus::Unavailable);
+          return std::function<void()>{};
+        }
+        return transport.Request(permission, std::move(completion));
+      },
+      PermissionStatus::Unavailable, true);
+}
+
+Task<bool> OpenPermissionSettings(std::shared_ptr<PermissionController::Impl> controller, Permission permission,
+                                  PermissionSettingsTarget target) {
+  auto source = CapturePresentationContext(controller->application_source);
+  const auto identity = controller->transport ? controller->transport->PresentationIdentity() : 0;
+  return RunPermissionOperation<bool>(
+      std::move(controller),
+      [permission, target, identity, source = std::move(source)](PermissionTransport& transport,
+                                                                  PermissionSettingsCompletion completion) {
+        if (!IsPresentationSourceAvailable(source)) {
+          completion(false);
+          return std::function<void()>{};
+        }
+        ExecutionGuard guard(source);
+        if (identity != transport.PresentationIdentity()) {
+          completion(false);
+          return std::function<void()>{};
+        }
+        return transport.OpenSettings(permission, target, std::move(completion));
+      },
+      false, true);
+}
+
+} // namespace
+
+PermissionController::PermissionController(std::shared_ptr<PermissionTransport> transport,
+    UiThreadDispatcher dispatch_to_ui_thread)
+    : impl_(std::make_shared<Impl>(std::move(transport), std::move(dispatch_to_ui_thread))) {}
+
+PermissionController::~PermissionController() {
+  Disconnect();
+}
+
+Task<PermissionStatus> PermissionController::Check(Permission permission) const {
+  ValidatePermission(permission);
+  return CheckPermission(impl_, permission);
+}
+
+Task<PermissionStatus> PermissionController::Request(Permission permission) const {
+  ValidatePermission(permission);
+  return RequestPermission(impl_, permission);
+}
+
+Task<bool> PermissionController::OpenSettings(Permission permission, PermissionSettingsTarget target) const {
+  ValidatePermission(permission);
+  ValidatePermissionSettingsTarget(target);
+  return OpenPermissionSettings(impl_, permission, target);
+}
+
+void PermissionController::Disconnect() noexcept {
+  impl_->Disconnect();
+}
+
+ApplicationService::ApplicationService(Runtime& runtime, std::optional<ApplicationActivation> startup_activation, ApplicationLifecycleState initial_lifecycle,
+                                       std::shared_ptr<PermissionController> permissions,
+                                       std::shared_ptr<LocalNotificationService> local_notifications,
+                                       std::shared_ptr<SystemTrayService> system_tray,
+                                       PlatformClipboard* platform_clipboard, std::optional<AppDirectories> directories)
+    : runtime_(&runtime), startup_activation_(std::move(startup_activation)),
+      lifecycle_state_(std::make_shared<StateCell<ApplicationLifecycleState>>(initial_lifecycle)),
+      permissions_(std::move(permissions)), local_notifications_(std::move(local_notifications)),
+      system_tray_(std::move(system_tray)), clipboard_(new pingcore::Clipboard(platform_clipboard)),
+      directories_(std::move(directories)) {
+  if (startup_activation_) {
+    ValidateApplicationActivation(*startup_activation_);
+  }
+  ValidateApplicationLifecycleState(initial_lifecycle);
+  if (!permissions_) {
+    throw std::invalid_argument("PingCore application permission controller must not be empty");
+  }
+  if (!local_notifications_) {
+    throw std::invalid_argument("PingCore application local notification service must not be empty");
+  }
+  if (!system_tray_) {
+    throw std::invalid_argument("PingCore application system tray service must not be empty");
+  }
+  if (directories_) {
+    ProtectAppDirectories(*directories_);
+  }
+}
+
+const std::optional<ApplicationActivation>& ApplicationService::StartupActivation() const noexcept {
+  return startup_activation_;
+}
+
+ApplicationLifecycleState ApplicationService::LifecycleState() const {
+  ObserveState(lifecycle_state_);
+  return lifecycle_state_->value;
+}
+
+std::function<void()> ApplicationService::ConnectActivation(std::function<void(ApplicationActivation)> handler) {
+  if (!handler) {
+    throw std::invalid_argument("PingCore application activation handler must not be empty");
+  }
+  if (activation_handler_) {
+    throw std::logic_error("PingCore application activation handler is already connected");
+  }
+  if (runtime_ == nullptr) {
+    throw std::logic_error("PingCore application activation handle is disconnected");
+  }
+
+  activation_connection_ = next_connection_++;
+  activation_handler_ = std::move(handler);
+  if (!pending_activations_.empty()) {
+    runtime_->RequestEventDispatch();
+  }
+
+  const std::uint64_t connection = activation_connection_;
+  std::weak_ptr<ApplicationService> service = weak_from_this();
+  return [service = std::move(service), connection] {
+    if (const std::shared_ptr<ApplicationService> active = service.lock()) {
+      active->DisconnectActivationHandler(connection);
+    }
+  };
+}
+
+std::function<void()>
+ApplicationService::ConnectLifecycle(std::function<void(ApplicationLifecycleState)> handler) {
+  if (!handler) {
+    throw std::invalid_argument("PingCore application lifecycle handler must not be empty");
+  }
+  if (runtime_ == nullptr) {
+    throw std::logic_error("PingCore application lifecycle handle is disconnected");
+  }
+
+  const std::uint64_t connection = next_connection_++;
+  lifecycle_handlers_.emplace(connection,
+      [source = CurrentExecutionContext(), handler = std::move(handler)](ApplicationLifecycleState state) {
+        ExecutionGuard guard(source);
+        handler(state);
+      });
+  std::weak_ptr<ApplicationService> service = weak_from_this();
+  return [service = std::move(service), connection] {
+    if (const std::shared_ptr<ApplicationService> active = service.lock()) {
+      active->DisconnectLifecycleHandler(connection);
+    }
+  };
+}
+
+const std::shared_ptr<SystemTrayService>& ApplicationService::SystemTray() const noexcept {
+  return system_tray_;
+}
+
+const std::shared_ptr<LocalNotificationService>& ApplicationService::LocalNotifications() const noexcept {
+  return local_notifications_;
+}
+
+const std::shared_ptr<Clipboard>& ApplicationService::Clipboard() const noexcept {
+  return clipboard_;
+}
+
+const AppDirectories& ApplicationService::Directories() const {
+  if (!directories_) {
+    throw std::logic_error("PingCore application directories are not available on this host");
+  }
+  return *directories_;
+}
+
+Task<PermissionStatus> ApplicationService::CheckPermission(Permission permission) const {
+  return permissions_->Check(permission);
+}
+
+Task<PermissionStatus> ApplicationService::RequestPermission(Permission permission) const {
+  return permissions_->Request(permission);
+}
+
+Task<bool> ApplicationService::OpenPermissionSettings(Permission permission, PermissionSettingsTarget target) const {
+  return permissions_->OpenSettings(permission, target);
+}
+
+bool ApplicationService::SupportsMultipleWindows() const {
+  if (!runtime_) return false;
+  runtime_->state_->RequireThread();
+  return runtime_->state_->phase != ApplicationRuntimeState::Phase::Stopping &&
+         runtime_->state_->phase != ApplicationRuntimeState::Phase::Stopped && runtime_->SupportsMultipleWindows();
+}
+
+WindowCapabilities ApplicationService::WindowSupport() const {
+  return SupportsMultipleWindows() ? runtime_->QueryWindowSupport() : WindowCapabilities{};
+}
+
+WindowHandle ApplicationService::OpenWindow(ViewFactory content, WindowOptions options) const {
+  if (!runtime_) throw std::logic_error("PingCore application is disconnected");
+  return runtime_->OpenWindow(std::move(content), std::move(options));
+}
+
+void ApplicationService::Quit() const {
+  if (runtime_ != nullptr) {
+    runtime_->RequestShutdown();
+  }
+}
+
+void ApplicationService::Enqueue(ApplicationActivation activation) {
+  ValidateApplicationActivation(activation);
+  if (runtime_ == nullptr) {
+    return;
+  }
+  pending_activations_.push_back(std::move(activation));
+  runtime_->RequestEventDispatch();
+}
+
+void ApplicationService::UpdateLifecycleState(ApplicationLifecycleState lifecycle_state) {
+  ValidateApplicationLifecycleState(lifecycle_state);
+  if (runtime_ == nullptr || lifecycle_state_->value == lifecycle_state) {
+    return;
+  }
+  lifecycle_state_->value = lifecycle_state;
+  ++lifecycle_state_->version;
+  NotifyState(lifecycle_state_);
+  if (!lifecycle_handlers_.empty()) {
+    LifecycleDelivery delivery{lifecycle_state, {}};
+    for (const auto& [identity, handler] : lifecycle_handlers_) {
+      delivery.recipients.push_back(identity);
+    }
+    pending_lifecycle_states_.push_back(std::move(delivery));
+    runtime_->RequestEventDispatch();
+  }
+}
+
+void ApplicationService::DispatchPending() {
+  if (!runtime_) return;
+  const auto application = runtime_->state_;
+  // Snapshot both channels so reentrant submissions wait for a later application dispatch turn.
+  const std::size_t activation_count = pending_activations_.size();
+  const std::size_t lifecycle_count = pending_lifecycle_states_.size();
+  if (activation_handler_) {
+    for (std::size_t index = 0; index < activation_count && !pending_activations_.empty() && activation_handler_; ++index) {
+      if (!application->accepts_tasks) return;
+      ApplicationActivation activation = std::move(pending_activations_.front());
+      pending_activations_.pop_front();
+      auto handler = activation_handler_;
+      handler(std::move(activation));
+    }
+  }
+  for (std::size_t index = 0; index < lifecycle_count && !pending_lifecycle_states_.empty(); ++index) {
+    LifecycleDelivery delivery = std::move(pending_lifecycle_states_.front());
+    pending_lifecycle_states_.pop_front();
+    for (const auto identity : delivery.recipients) {
+      if (!application->accepts_tasks) return;
+      if (const auto found = lifecycle_handlers_.find(identity); found != lifecycle_handlers_.end()) {
+        auto handler = found->second;
+        handler(delivery.state);
+      }
+    }
+  }
+}
+
+void ApplicationService::Disconnect() noexcept {
+  clipboard_->Disconnect();
+  permissions_->Disconnect();
+  local_notifications_->Disconnect();
+  system_tray_->Disconnect();
+  runtime_ = nullptr;
+  pending_activations_.clear();
+  pending_lifecycle_states_.clear();
+  activation_handler_ = {};
+  lifecycle_handlers_.clear();
+  activation_connection_ = 0;
+}
+
+void ApplicationService::DisconnectActivationHandler(std::uint64_t connection) noexcept {
+  if (activation_connection_ != connection) {
+    return;
+  }
+  activation_handler_ = {};
+  activation_connection_ = 0;
+}
+
+void ApplicationService::DisconnectLifecycleHandler(std::uint64_t connection) noexcept {
+  lifecycle_handlers_.erase(connection);
+}
+
+} // namespace pingcore::detail
+
+namespace pingcore {
+
+const std::optional<ApplicationActivation>& ApplicationHandle::StartupActivation() const noexcept {
+  return service_->StartupActivation();
+}
+
+ApplicationLifecycleState ApplicationHandle::LifecycleState() const {
+  return service_->LifecycleState();
+}
+
+std::shared_ptr<Clipboard> ApplicationHandle::Clipboard() const noexcept {
+  return service_->Clipboard();
+}
+
+const AppDirectories& ApplicationHandle::Directories() const {
+  return service_->Directories();
+}
+
+File ApplicationHandle::CurrentDirectory() const {
+  return File(detail::CurrentDirectoryPath());
+}
+
+SystemTrayHandle ApplicationHandle::SystemTray() const {
+  return SystemTrayHandle{service_->SystemTray()};
+}
+
+LocalNotificationHandle ApplicationHandle::LocalNotifications() const {
+  return LocalNotificationHandle{service_->LocalNotifications()};
+}
+
+Task<PermissionStatus> ApplicationHandle::CheckPermissionAsync(Permission permission) const {
+  return service_->CheckPermission(permission);
+}
+
+Task<PermissionStatus> ApplicationHandle::RequestPermissionAsync(Permission permission) const {
+  return service_->RequestPermission(permission);
+}
+
+Task<bool> ApplicationHandle::OpenPermissionSettingsAsync(
+    Permission permission, PermissionSettingsTarget target) const {
+  return service_->OpenPermissionSettings(permission, target);
+}
+
+bool ApplicationHandle::SupportsMultipleWindows() const {
+  return service_->SupportsMultipleWindows();
+}
+
+WindowCapabilities ApplicationHandle::WindowSupport() const {
+  return service_->WindowSupport();
+}
+
+WindowHandle ApplicationHandle::OpenWindow(ViewFactory content, WindowOptions options) const {
+  return service_->OpenWindow(std::move(content), std::move(options));
+}
+
+void ApplicationHandle::Quit() const {
+  service_->Quit();
+}
+
+
+std::function<void()>
+ApplicationHandle::ConnectLifecycle(std::function<void(ApplicationLifecycleState)> handler) const {
+  return service_->ConnectLifecycle(std::move(handler));
+}
+
+ApplicationHandle UseApplication() {
+  return ApplicationHandle{UseService<detail::ApplicationService>()};
+}
+
+} // namespace pingcore

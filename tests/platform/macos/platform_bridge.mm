@@ -1,0 +1,443 @@
+#import <CoreVideo/CoreVideo.h>
+#import <objc/runtime.h>
+
+#include <catch2/catch_amalgamated.hpp>
+
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <string>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include <pingcore/macos/external_texture.h>
+#include <pingcore/macos/platform_registry.h>
+
+#include "macos_external_texture_internal.h"
+#include "io/file_internal.h"
+#include "runtime_test_support.h"
+
+@interface PingCoreTestMacCancellation : NSObject <HUXPlatformCancellation>
+- (instancetype)initWithBlock:(void (^)(void))block;
+@end
+
+@implementation PingCoreTestMacCancellation {
+  void (^_block)(void);
+}
+
+- (instancetype)initWithBlock:(void (^)(void))block {
+  self = [super init];
+  if (self != nil) {
+    _block = [block copy];
+  }
+  return self;
+}
+
+- (void)cancel {
+  void (^block)(void) = _block;
+  _block = nil;
+  if (block != nil) {
+    block();
+  }
+}
+
+@end
+
+@interface PingCoreTestMacPlatformView : NSObject <HUXAppKitPlatformView>
+@property(nonatomic, readonly) NSView* view;
+@property(nonatomic, readonly) HUXPlatformPayload* properties;
+@property(nonatomic, readonly) NSInteger updateCount;
+@property(nonatomic, readonly) NSInteger cancelCount;
+@property(nonatomic, readonly) NSInteger disposeCount;
+@property(nonatomic, readonly) NSArray<NSString*>* terminationOrder;
+- (instancetype)initWithProperties:(HUXPlatformPayload*)properties
+                             events:(id<HUXPlatformEventEmitter>)events;
+- (HUXPlatformPayload*)requestDecision;
+- (void)emitLateEvent;
+@end
+
+@implementation PingCoreTestMacPlatformView {
+  __strong id<HUXPlatformEventEmitter> _events;
+  __strong NSMutableArray<NSString*>* _mutableTerminationOrder;
+}
+
+- (instancetype)initWithProperties:(HUXPlatformPayload*)properties
+                             events:(id<HUXPlatformEventEmitter>)events {
+  self = [super init];
+  if (self != nil) {
+    _view = [NSView new];
+    _properties = properties;
+    _events = events;
+    _mutableTerminationOrder = [NSMutableArray array];
+  }
+  return self;
+}
+
+- (void)updateWithProperties:(HUXPlatformPayload*)properties {
+  _properties = properties;
+  ++_updateCount;
+}
+
+- (id<HUXPlatformCancellation>)invoke:(NSString*)method
+                            arguments:(HUXPlatformPayload*)arguments
+                               result:(id<HUXPlatformResult>)result {
+  if ([method isEqualToString:@"echo"]) {
+    [result complete:arguments];
+    [result complete:HUXPlatformPayload.nullValue];
+    return nil;
+  }
+  if ([method isEqualToString:@"pending"]) {
+    __weak PingCoreTestMacPlatformView* weak_self = self;
+    return [[PingCoreTestMacCancellation alloc] initWithBlock:^{
+      PingCoreTestMacPlatformView* strong_self = weak_self;
+      if (strong_self != nil) {
+        ++strong_self->_cancelCount;
+        [strong_self->_mutableTerminationOrder addObject:@"cancel"];
+      }
+    }];
+  }
+  [result failWithCode:@"test/unknown-method"
+               message:@"Unknown method"
+               details:HUXPlatformPayload.nullValue];
+  return nil;
+}
+
+- (void)dispose {
+  ++_disposeCount;
+  [_mutableTerminationOrder addObject:@"dispose"];
+}
+
+- (NSArray<NSString*>*)terminationOrder {
+  return [_mutableTerminationOrder copy];
+}
+
+- (HUXPlatformPayload*)requestDecision {
+  return [_events emit:@"decision" payload:[HUXPlatformPayload integerValue:7]];
+}
+
+- (void)emitLateEvent {
+  [_events emit:@"changed" payload:[HUXPlatformPayload stringValue:@"late"]];
+}
+
+@end
+
+@interface PingCoreTestMacPlatformViewFactory : NSObject <HUXAppKitPlatformViewFactory>
+@property(nonatomic, readonly) NSWindow* owner;
+@property(nonatomic, readonly) PingCoreTestMacPlatformView* instance;
+@end
+
+@implementation PingCoreTestMacPlatformViewFactory
+
+- (id<HUXAppKitPlatformView>)createWithWindow:(NSWindow*)window
+                                   properties:(HUXPlatformPayload*)properties
+                                       events:(id<HUXPlatformEventEmitter>)events {
+  _owner = window;
+  _instance = [[PingCoreTestMacPlatformView alloc] initWithProperties:properties events:events];
+  [events emit:@"changed" payload:[HUXPlatformPayload stringValue:@"created"]];
+  return _instance;
+}
+
+@end
+
+namespace pingcore::test {
+namespace {
+
+TEST_CASE("MacObjectiveCPlatformPayloadPreservesEveryValueKind") {
+  @autoreleasepool {
+    HUXPixelBufferTexture* texture = [[HUXPixelBufferTexture alloc] initWithIntrinsicSize:CGSizeMake(16.0, 9.0)];
+    HUXPlatformPayload* payload = [HUXPlatformPayload objectValue:@{
+      @"null" : HUXPlatformPayload.nullValue,
+      @"boolean" : [HUXPlatformPayload booleanValue:YES],
+      @"integer" : [HUXPlatformPayload integerValue:std::numeric_limits<std::int64_t>::min()],
+      @"double" : [HUXPlatformPayload doubleValue:-12.5],
+      @"string" : [HUXPlatformPayload stringValue:@"value"],
+      @"bytes" : [HUXPlatformPayload bytesValue:[NSData dataWithBytes:"\x01\x02" length:2]],
+      @"list" : [HUXPlatformPayload listValue:@[
+        HUXPlatformPayload.nullValue,
+        [HUXPlatformPayload externalTextureValue:texture],
+      ]],
+      @"texture" : [HUXPlatformPayload externalTextureValue:texture],
+    }];
+
+    REQUIRE(payload.kind == HUXPlatformPayloadKindObject);
+    REQUIRE([[payload field:@"null"] kind] == HUXPlatformPayloadKindNull);
+    REQUIRE([[payload field:@"boolean"] booleanValue]);
+    REQUIRE([[payload field:@"integer"] integerValue] == std::numeric_limits<std::int64_t>::min());
+    REQUIRE([[payload field:@"double"] doubleValue] == -12.5);
+    REQUIRE([[[payload field:@"string"] stringValue] isEqualToString:@"value"]);
+    REQUIRE([[payload field:@"bytes"] bytesValue].length == 2);
+    REQUIRE([[[payload field:@"list"] elementAtIndex:1] kind] == HUXPlatformPayloadKindExternalTexture);
+
+    const std::shared_ptr<ExternalTexture> cpp_texture =
+        macos::detail::UnwrapExternalTexture([[payload field:@"texture"] externalTextureValue]);
+    REQUIRE(cpp_texture != nullptr);
+    REQUIRE(cpp_texture->IntrinsicSize() == Size{16.0F, 9.0F});
+  }
+}
+
+TEST_CASE("MacObjectiveCPlatformPayloadRejectsInvalidValuesAndTextures") {
+  @autoreleasepool {
+    bool invalid_double_rejected = false;
+    @try {
+      [HUXPlatformPayload doubleValue:std::numeric_limits<double>::infinity()];
+    } @catch (NSException*) {
+      invalid_double_rejected = true;
+    }
+    REQUIRE(invalid_double_rejected);
+
+    HUXExternalTexture* forged = static_cast<HUXExternalTexture*>(class_createInstance(HUXExternalTexture.class, 0));
+    bool forged_texture_rejected = false;
+    @try {
+      [HUXPlatformPayload externalTextureValue:forged];
+    } @catch (NSException*) {
+      forged_texture_rejected = true;
+    }
+    REQUIRE(forged_texture_rejected);
+  }
+}
+
+TEST_CASE("MacObjectiveCBufferReferenceRetainsStorageWithoutCopying") {
+  __weak NSMutableData* weak_storage = nil;
+  __strong HUXBufferReference* survivor = nil;
+  @autoreleasepool {
+    NSMutableData* storage = [NSMutableData dataWithLength:8];
+    weak_storage = storage;
+    HUXBufferReference* reference = [[HUXBufferReference alloc] initWithBytes:storage.bytes length:8 owner:storage];
+    HUXPlatformPayload* payload = [HUXPlatformPayload bufferReferenceValue:reference];
+    REQUIRE(payload.kind == HUXPlatformPayloadKindBufferReference);
+    survivor = [payload.bufferReferenceValue sliceWithOffset:2 length:4];
+    REQUIRE([payload.bufferReferenceValue isEqual:reference]);
+    REQUIRE(payload.bufferReferenceValue.hash == reference.hash);
+    REQUIRE_FALSE([reference isEqual:[[HUXBufferReference alloc] initWithBytes:storage.bytes length:8 owner:storage]]);
+    static_cast<std::byte*>(storage.mutableBytes)[2] = std::byte{42};
+    const void* expected = static_cast<const std::byte*>(storage.bytes) + 2;
+    [survivor withUnsafeBytes:^(const void* bytes, NSUInteger length) {
+      REQUIRE(bytes == expected);
+      REQUIRE(length == 4);
+      REQUIRE(static_cast<const std::byte*>(bytes)[0] == std::byte{42});
+    }];
+    bool rejected = false;
+    @try {
+      [reference sliceWithOffset:8 length:1];
+    } @catch (NSException* exception) {
+      rejected = [exception.name isEqualToString:NSInvalidArgumentException];
+    }
+    REQUIRE(rejected);
+  }
+  REQUIRE(weak_storage != nil);
+  survivor = nil;
+  REQUIRE(weak_storage == nil);
+}
+
+TEST_CASE("MacObjectiveCBufferReferenceRoundTripPreservesBackingIdentity") {
+  @autoreleasepool {
+    TestPlatform platform;
+    UiWindow runtime(+[]() -> View { return {}; }, platform);
+    NSWindow* window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 320, 200)
+                                                 styleMask:NSWindowStyleMaskBorderless
+                                                   backing:NSBackingStoreBuffered defer:NO];
+    PingCoreTestMacPlatformViewFactory* factory = [PingCoreTestMacPlatformViewFactory new];
+    auto storage = std::make_shared<Bytes>(8);
+    BufferReference reference(*storage, storage);
+    PlatformEventEmitter emitter = detail::MakePlatformEventEmitter({}, [](std::string, PlatformPayload) {
+      return std::optional<PlatformPayload>{};
+    });
+    auto instance = macos::detail::CreateObjectiveCPlatformView(
+        platform, window, factory, PlatformPayload(reference), std::move(emitter), true, true);
+    const void* expected = storage->data();
+    [factory.instance.properties.bufferReferenceValue withUnsafeBytes:^(const void* bytes, NSUInteger length) {
+      REQUIRE(bytes == expected);
+      REQUIRE(length == 8);
+    }];
+    std::optional<BufferReference> returned;
+    PlatformChannel channel = macos::detail::GetObjectiveCPlatformViewChannel(instance);
+    channel.Invoke("echo", PlatformPayload(reference), [&](PlatformResult<PlatformPayload> result) {
+      returned = std::get<PlatformPayload>(result).AsBufferReference();
+    });
+    platform.RunPlatformModuleTasks();
+    REQUIRE(returned.has_value());
+    REQUIRE(*returned == reference);
+    REQUIRE(returned->AsBytes().data() == expected);
+    macos::detail::DisposeObjectiveCPlatformView(instance);
+    platform.RunPlatformModuleTasks();
+  }
+}
+
+TEST_CASE("MacObjectiveCPlatformPayloadRetainsFileReferenceAndExposesFileURL") {
+  @autoreleasepool {
+    TestPlatform platform;
+    UiWindow runtime(+[]() -> View { return {}; }, platform);
+    NSWindow* window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0.0, 0.0, 320.0, 200.0)
+                                                   styleMask:NSWindowStyleMaskBorderless
+                                                     backing:NSBackingStoreBuffered
+                                                       defer:NO];
+    PingCoreTestMacPlatformViewFactory* factory = [PingCoreTestMacPlatformViewFactory new];
+    const FileReference reference =
+        detail::MakeLocalFileReference(File(std::string(NSTemporaryDirectory().UTF8String)), true);
+    const std::shared_ptr<detail::FileReferenceBackend> backend = detail::FileReferenceBackend::Of(reference);
+    PlatformEventEmitter emitter = detail::MakePlatformEventEmitter({}, [](std::string, PlatformPayload) {
+      return std::optional<PlatformPayload>{};
+    });
+    const std::shared_ptr<macos::detail::ObjectiveCPlatformViewInstance> instance =
+        macos::detail::CreateObjectiveCPlatformView(platform, window, factory, PlatformPayload(reference),
+                                                    std::move(emitter), true, true);
+
+    HUXFileReference* native_reference = factory.instance.properties.fileReferenceValue;
+    REQUIRE(factory.instance.properties.kind == HUXPlatformPayloadKindFileReference);
+    const std::optional<File> local_file = reference.AsFile();
+    REQUIRE(local_file.has_value());
+    const std::string local_path = local_file->Path();
+    REQUIRE([native_reference.fileURL.path isEqualToString:[NSString stringWithUTF8String:local_path.c_str()]]);
+
+    PlatformChannel channel = macos::detail::GetObjectiveCPlatformViewChannel(instance);
+    std::shared_ptr<detail::FileReferenceBackend> returned_backend;
+    channel.Invoke("echo", PlatformPayload(reference), [&](PlatformResult<PlatformPayload> result) {
+      returned_backend =
+          detail::FileReferenceBackend::Of(std::get<PlatformPayload>(std::move(result)).AsFileReference());
+    });
+    platform.RunPlatformModuleTasks();
+    REQUIRE(returned_backend == backend);
+
+    macos::detail::DisposeObjectiveCPlatformView(instance);
+    platform.RunPlatformModuleTasks();
+  }
+}
+
+TEST_CASE("MacObjectiveCPixelBufferTextureUsesTheExistingMailbox") {
+  @autoreleasepool {
+    HUXPixelBufferTexture* texture = [[HUXPixelBufferTexture alloc] initWithIntrinsicSize:CGSizeMake(2.0, 2.0)];
+    CVPixelBufferRef pixel_buffer = nullptr;
+    REQUIRE(CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                2,
+                2,
+                kCVPixelFormatType_32BGRA,
+                nullptr,
+                &pixel_buffer
+            ) == kCVReturnSuccess);
+    REQUIRE(pixel_buffer != nullptr);
+    [texture publishPixelBuffer:pixel_buffer];
+    [texture finish];
+
+    bool finished_source_rejected = false;
+    @try {
+      [texture publishPixelBuffer:pixel_buffer];
+    } @catch (NSException*) {
+      finished_source_rejected = true;
+    }
+    CVPixelBufferRelease(pixel_buffer);
+    REQUIRE(finished_source_rejected);
+  }
+}
+
+TEST_CASE("MacObjectiveCMetalTextureUsesTheExistingMailbox") {
+  @autoreleasepool {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    REQUIRE(device != nil);
+    MTLTextureDescriptor* descriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                           width:2 height:2 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    id<MTLTexture> source = [device newTextureWithDescriptor:descriptor];
+    REQUIRE(source != nil);
+    HUXMetalTexture* texture = [[HUXMetalTexture alloc] initWithIntrinsicSize:CGSizeMake(2.0, 2.0)];
+    [texture publishTexture:source origin:HUXMetalTextureOriginTopLeft alpha:HUXMetalTextureAlphaOpaque];
+
+    HUXPlatformPayload* payload = [HUXPlatformPayload externalTextureValue:texture];
+    const std::shared_ptr<ExternalTexture> identity =
+        macos::detail::UnwrapExternalTexture(payload.externalTextureValue);
+    const std::shared_ptr<macos::MetalTexture> metal_texture =
+        std::dynamic_pointer_cast<macos::MetalTexture>(identity);
+    REQUIRE(metal_texture != nullptr);
+    REQUIRE(metal_texture->Revision() == 1);
+
+    [texture finish];
+    bool finished_source_rejected = false;
+    @try {
+      [texture publishTexture:source origin:HUXMetalTextureOriginTopLeft alpha:HUXMetalTextureAlphaOpaque];
+    } @catch (NSException*) {
+      finished_source_rejected = true;
+    }
+    REQUIRE(finished_source_rejected);
+  }
+}
+
+TEST_CASE("MacObjectiveCPlatformViewUsesOneEventAndChannelLifecycle") {
+  @autoreleasepool {
+    TestPlatform platform;
+    UiWindow runtime(+[]() -> View { return {}; }, platform);
+    NSWindow* window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0.0, 0.0, 320.0, 200.0)
+                                                   styleMask:NSWindowStyleMaskBorderless
+                                                     backing:NSBackingStoreBuffered
+                                                       defer:NO];
+    PingCoreTestMacPlatformViewFactory* factory = [PingCoreTestMacPlatformViewFactory new];
+    std::vector<std::pair<std::string, std::string>> events;
+    PlatformEventEmitter emitter = detail::MakePlatformEventEmitter(
+        {},
+        [&events](std::string name, PlatformPayload payload) {
+          if (name == "decision") {
+            return std::optional{PlatformPayload(payload.AsInteger() == 7)};
+          }
+          events.emplace_back(std::move(name), payload.AsString());
+          return std::optional<PlatformPayload>{};
+        }
+    );
+    const std::shared_ptr<macos::detail::ObjectiveCPlatformViewInstance> instance =
+        macos::detail::CreateObjectiveCPlatformView(
+            platform, window, factory, PlatformPayload("initial"), std::move(emitter), true, true
+        );
+
+    REQUIRE(factory.owner == window);
+    REQUIRE(macos::detail::GetObjectiveCPlatformView(instance) == factory.instance.view);
+    REQUIRE([factory.instance.properties.stringValue isEqualToString:@"initial"]);
+    REQUIRE(events == std::vector<std::pair<std::string, std::string>>{{"changed", "created"}});
+    HUXPlatformPayload* decision = [factory.instance requestDecision];
+    REQUIRE(decision.kind == HUXPlatformPayloadKindBoolean);
+    REQUIRE(decision.booleanValue);
+
+    macos::detail::UpdateObjectiveCPlatformView(instance, PlatformPayload("updated"));
+    REQUIRE(factory.instance.updateCount == 1);
+    REQUIRE([factory.instance.properties.stringValue isEqualToString:@"updated"]);
+    REQUIRE(macos::detail::GetObjectiveCPlatformView(instance) == factory.instance.view);
+
+    PlatformChannel channel = macos::detail::GetObjectiveCPlatformViewChannel(instance);
+    bool completed = false;
+    std::string result_value;
+    channel.Invoke(
+        "echo",
+        PlatformPayload("value"),
+        [&](PlatformResult<PlatformPayload> result) {
+          completed = true;
+          result_value = std::get<PlatformPayload>(std::move(result)).AsString();
+        }
+    );
+    REQUIRE_FALSE(completed);
+    platform.RunPlatformModuleTasks();
+    REQUIRE(completed);
+    REQUIRE(result_value == "value");
+
+    const PlatformRequestId pending = channel.Invoke("pending", {}, [](PlatformResult<PlatformPayload>) {});
+    platform.RunPlatformModuleTasks();
+    REQUIRE(channel.Cancel(pending));
+    REQUIRE_FALSE(channel.Cancel(pending));
+    platform.RunPlatformModuleTasks();
+    REQUIRE(factory.instance.cancelCount == 1);
+
+    channel.Invoke("pending", {}, [](PlatformResult<PlatformPayload>) {});
+    platform.RunPlatformModuleTasks();
+    macos::detail::DisposeObjectiveCPlatformView(instance);
+    macos::detail::DisposeObjectiveCPlatformView(instance);
+    REQUIRE_FALSE(channel.IsOpen());
+    [factory.instance emitLateEvent];
+    REQUIRE(events.size() == 1);
+    REQUIRE(factory.instance.disposeCount == 0);
+    platform.RunPlatformModuleTasks();
+    REQUIRE(factory.instance.cancelCount == 2);
+    REQUIRE(factory.instance.disposeCount == 1);
+    REQUIRE([factory.instance.terminationOrder isEqualToArray:@[ @"cancel", @"cancel", @"dispose" ]]);
+  }
+}
+
+} // namespace
+} // namespace pingcore::test

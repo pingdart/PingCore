@@ -1,0 +1,50 @@
+#pragma once
+
+#include <sys/types.h>
+
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+
+#include <pingcore/app.h>
+
+typedef struct _GtkWidget GtkWidget;
+
+namespace pingcore {
+
+class UiWindow;
+
+namespace detail {
+
+class LinuxFileDrop final {
+public:
+  LinuxFileDrop(GtkWidget* widget, UiWindow& ui_window, UiThreadDispatcher dispatcher);
+  ~LinuxFileDrop();
+  LinuxFileDrop(const LinuxFileDrop&) = delete;
+  LinuxFileDrop& operator=(const LinuxFileDrop&) = delete;
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+struct LinuxAppDirectoryEnvironment {
+  std::optional<std::string> home_directory;
+  std::optional<std::string> passwd_home_directory;
+  std::optional<std::string> data_home;
+  std::optional<std::string> cache_home;
+  std::optional<std::string> runtime_directory;
+  std::string fallback_temporary_root;
+  uid_t effective_user_id = 0;
+};
+
+[[nodiscard]] std::string ResolveLinuxExecutablePath();
+[[nodiscard]] AppDirectories
+ResolveLinuxAppDirectories(std::string_view executable_path, const LinuxAppDirectoryEnvironment& environment);
+[[nodiscard]] AppDirectories
+CreateLinuxAppDirectories(std::string_view executable_path, LinuxAppDirectoryEnvironment environment);
+[[nodiscard]] AppDirectories CreateLinuxAppDirectories();
+
+} // namespace detail
+} // namespace pingcore

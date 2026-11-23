@@ -1,0 +1,335 @@
+#include "platform.h"
+
+#include <algorithm>
+#include <array>
+#include <fstream>
+#include <iterator>
+#include <stdexcept>
+#include <utility>
+
+namespace pingcore::cli {
+namespace {
+
+const std::array<const PlatformDriver*, 6>& PlatformDrivers() {
+  static const std::array drivers{
+      &detail::AndroidPlatformDriver(),
+      &detail::WindowsPlatformDriver(),
+      &detail::LinuxPlatformDriver(),
+      &detail::MacOSPlatformDriver(),
+      &detail::IosPlatformDriver(),
+      &detail::WebPlatformDriver(),
+  };
+  return drivers;
+}
+
+} // namespace
+
+namespace detail {
+
+std::string_view NormalizeTargetAbi(const PlatformDriver& platform, std::string_view abi) {
+  const auto supported = platform.TargetAbis();
+  if (const auto match = std::ranges::find(supported, abi); match != supported.end()) {
+    return *match;
+  }
+  if (abi == "x64" || abi == "amd64") {
+    abi = "x86_64";
+  }
+  const auto match = std::ranges::find_if(supported, [abi](std::string_view candidate) {
+    return candidate == abi || ((abi == "arm64" || abi == "aarch64") &&
+        (candidate == "arm64" || candidate == "aarch64" || candidate == "arm64-v8a"));
+  });
+  return match == supported.end() ? std::string_view{} : *match;
+}
+
+std::string JoinTargetAbis(std::span<const std::string> abis, char separator) {
+  std::string joined;
+  for (const std::string& abi : abis) {
+    if (!joined.empty()) {
+      joined += separator;
+    }
+    joined += abi;
+  }
+  return joined;
+}
+
+std::vector<Diagnostic>
+ValidateRequiredFiles(const std::filesystem::path& root, std::span<const std::string_view> paths) {
+  std::vector<Diagnostic> diagnostics;
+  for (const std::string_view relative_path : paths) {
+    if (!std::filesystem::is_regular_file(root / relative_path)) {
+      diagnostics.push_back({true, "missing " + std::string(relative_path)});
+    }
+  }
+  return diagnostics;
+}
+
+std::string ReadFile(const std::filesystem::path& path) {
+  std::ifstream stream(path, std::ios::binary);
+  if (!stream) {
+    throw std::runtime_error("cannot read " + path.string());
+  }
+  return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+}
+
+std::string JsonString(std::string_view json, std::string_view key) {
+  const std::string marker = "\"" + std::string(key) + "\"";
+  const std::size_t key_position = json.find(marker);
+  if (key_position == std::string_view::npos) {
+    throw std::runtime_error("integration plan is missing " + std::string(key));
+  }
+  const std::size_t colon = json.find(':', key_position + marker.size());
+  const std::size_t quote = colon == std::string_view::npos ? colon : json.find('\"', colon + 1);
+  if (quote == std::string_view::npos) {
+    throw std::runtime_error("integration plan has an invalid " + std::string(key));
+  }
+
+  std::string value;
+  bool escaped = false;
+  for (std::size_t index = quote + 1; index < json.size(); ++index) {
+    const char character = json[index];
+    if (escaped) {
+      if (character == 'n') {
+        value.push_back('\n');
+      } else if (character == 'r') {
+        value.push_back('\r');
+      } else {
+        value.push_back(character);
+      }
+      escaped = false;
+    } else if (character == '\\') {
+      escaped = true;
+    } else if (character == '\"') {
+      return value;
+    } else {
+      value.push_back(character);
+    }
+  }
+  throw std::runtime_error("integration plan has an unterminated " + std::string(key));
+}
+
+std::filesystem::path AppIntegrationPlan(const PlatformCommandContext& context) {
+  const std::filesystem::path root = context.build_directory / "pingcore-integration";
+  std::vector<std::filesystem::path> plans;
+  if (std::filesystem::is_directory(root)) {
+    for (const std::filesystem::directory_entry& entry : std::filesystem::recursive_directory_iterator(root)) {
+      if (entry.is_regular_file() && entry.path().filename() == "app.json") {
+        plans.push_back(entry.path());
+      }
+    }
+  }
+  if (plans.size() != 1) {
+    throw std::runtime_error(
+        plans.empty() ? "application integration plan was not generated"
+                      : "build produced more than one application integration plan"
+    );
+  }
+  return plans.front();
+}
+
+std::vector<std::string> DeviceArguments(const std::optional<PlatformDevice>& device) {
+  if (!device) {
+    return {};
+  }
+  return {"-s", device->id};
+}
+
+std::string ProfileConfiguration(std::string_view profile) {
+  if (profile == "debug") {
+    return "Debug";
+  }
+  if (profile == "release") {
+    return "Release";
+  }
+  throw std::invalid_argument("unknown build profile: " + std::string(profile));
+}
+
+std::vector<ProcessCommand> DesktopBuildCommands(const PlatformCommandContext& context) {
+  const std::string configuration = ProfileConfiguration(context.profile);
+  std::vector<std::string> configure_arguments{
+      "-S",
+      context.project_root.string(),
+      "-B",
+      context.build_directory.string(),
+      "-DCMAKE_BUILD_TYPE=" + configuration,
+      "-DPINGCORE_HOME=" + context.pingcore_home.string(),
+      std::string("-DPINGCORE_PACKAGE=") + (context.package ? "ON" : "OFF"),
+  };
+  if (!context.cmake_generator.empty()) {
+    configure_arguments.insert(configure_arguments.begin(), {"-G", context.cmake_generator});
+  }
+  if (context.optimization) {
+    configure_arguments.push_back("-DPINGCORE_OPTIMIZATION=" + *context.optimization);
+  }
+  if (context.lto) {
+    configure_arguments.push_back(std::string("-DPINGCORE_ENABLE_LTO=") + (*context.lto ? "ON" : "OFF"));
+  }
+  if (context.profiling) {
+    configure_arguments.push_back("-DPINGCORE_ENABLE_PROFILING=ON");
+  }
+  return {
+      {"cmake", std::move(configure_arguments), context.project_root},
+      {"cmake",
+       {"--build", context.build_directory.string(), "--config", configuration},
+       context.project_root},
+  };
+}
+
+std::vector<ProcessCommand> DesktopPackageStageCommands(const PlatformCommandContext& context,
+                                                        const std::filesystem::path& staging,
+                                                        std::string_view install_component) {
+  const std::string configuration = ProfileConfiguration(context.profile);
+  return {
+      {"cmake", {"-E", "rm", "-rf", staging.string()}, context.project_root},
+      {"cmake", {"-E", "make_directory", staging.string()}, context.project_root},
+      {"cmake",
+       {"--install", context.build_directory.string(), "--config", configuration, "--component",
+        std::string(install_component), "--prefix", staging.string()},
+       context.project_root},
+  };
+}
+
+std::vector<ProcessCommand> LibraryGraphConfigureCommands(const PlatformCommandContext& context) {
+  const std::filesystem::path build_directory = context.project_root / ".pingcore/build" /
+      BuildHomeKey(context.pingcore_home) / "library-graph";
+  std::vector<std::string> arguments{
+      "-S",
+      context.project_root.string(),
+      "-B",
+      build_directory.string(),
+      "-DPINGCORE_LIBRARY_GRAPH_ONLY=ON",
+      "-DPINGCORE_LIBRARY_GRAPH_OUTPUT=" + (context.project_root / ".pingcore/generated/libraries.json").string(),
+      "-DPINGCORE_HOME=" + context.pingcore_home.string(),
+  };
+  if (!std::filesystem::is_regular_file(build_directory / "CMakeCache.txt") &&
+      !ReadEnvironmentVariable("CMAKE_GENERATOR") && FindExecutable("ninja")) {
+    arguments.insert(arguments.begin(), {"-G", "Ninja"});
+  }
+  return {
+      {"cmake", std::move(arguments), context.project_root},
+  };
+}
+
+} // namespace detail
+
+GeneratedTree PlatformDriver::CreateLibraryPackage(const LibraryTemplateContext&, const std::filesystem::path&) const {
+  return {};
+}
+
+std::vector<EnvironmentDiagnostic> PlatformDriver::DiagnoseEnvironment(const EnvironmentRequest& request) const {
+  if (!SupportsCurrentHost()) {
+    return {{
+        EnvironmentDiagnosticStatus::Unavailable,
+        "host",
+        "unsupported from host " + std::string(CurrentHostId()),
+        {},
+    }};
+  }
+
+  if (request.operation == EnvironmentOperation::Devices && !SupportsDeviceDiscovery()) {
+    return {{EnvironmentDiagnosticStatus::Unavailable, "devices", "Device discovery is unsupported", {}}};
+  }
+
+  std::vector<EnvironmentDiagnostic> diagnostics;
+  for (const std::string_view tool : RequiredTools()) {
+    const std::optional<std::filesystem::path> executable = FindExecutable(tool);
+    diagnostics.push_back({
+        executable ? EnvironmentDiagnosticStatus::Ready : EnvironmentDiagnosticStatus::Missing,
+        std::string(tool),
+        std::string(tool),
+        executable ? executable->string() : std::string{},
+    });
+  }
+  return diagnostics;
+}
+
+std::vector<SetupAction> PlatformDriver::PlanSetup(std::span<const EnvironmentDiagnostic> diagnostics,
+                                                   const EnvironmentRequest&) const {
+  std::vector<SetupAction> actions;
+  for (const EnvironmentDiagnostic& diagnostic : diagnostics) {
+    if (diagnostic.status == EnvironmentDiagnosticStatus::Missing) {
+      actions.push_back({"Install or configure " + diagnostic.label + " for " + std::string(Id()),
+                         std::nullopt,
+                         "configure_" + diagnostic.id,
+                         {},
+                         {diagnostic.id}});
+    }
+  }
+  return actions;
+}
+
+bool PlatformDriver::SupportsDeviceDiscovery() const noexcept {
+  return false;
+}
+
+std::vector<PlatformDevice> PlatformDriver::DiscoverDevices(const EnvironmentRequest&) const {
+  throw std::logic_error("platform does not support device discovery: " + std::string(Id()));
+}
+
+std::vector<ProcessCommand> PlatformDriver::LibraryGraphCommands(const PlatformCommandContext&) const {
+  return {};
+}
+
+void PlatformDriver::UpdateProjectIntegration(const PlatformCommandContext&) const {}
+
+std::vector<ProcessCommand> PlatformDriver::PackageCommands(const PlatformCommandContext&) const {
+  return {};
+}
+
+ProcessEnvironment PlatformDriver::ResolveEnvironment(const EnvironmentRequest&) const {
+  return {};
+}
+
+void PlatformDriver::ValidateBuildAbis(const PlatformCommandContext&) const {}
+
+void PlatformDriver::VerifyBuildAbis(const PlatformCommandContext&) const {}
+
+std::vector<ProcessCommand> PlatformDriver::OpenCommands(const PlatformCommandContext&) const {
+  throw std::logic_error("platform does not support opening a development project: " + std::string(Id()));
+}
+
+std::string_view DeviceStateName(DeviceState state) noexcept {
+  switch (state) {
+  case DeviceState::Ready:
+    return "ready";
+  case DeviceState::Offline:
+    return "offline";
+  case DeviceState::Unauthorized:
+    return "unauthorized";
+  case DeviceState::Unavailable:
+    return "unavailable";
+  }
+  return "unavailable";
+}
+
+std::string_view CurrentHostId() noexcept {
+#if defined(_WIN32)
+  return "windows";
+#elif defined(__APPLE__)
+  return "macos";
+#elif defined(__ANDROID__)
+  return "android";
+#elif defined(__linux__)
+  return "linux";
+#else
+  return "unknown";
+#endif
+}
+
+const PlatformDriver* FindPlatformDriver(std::string_view id) noexcept {
+  const std::array<const PlatformDriver*, 6>& drivers = PlatformDrivers();
+  const auto iterator =
+      std::find_if(drivers.begin(), drivers.end(), [id](const PlatformDriver* driver) { return driver->Id() == id; });
+  return iterator == drivers.end() ? nullptr : *iterator;
+}
+
+std::vector<std::string_view> PlatformIds() {
+  const std::array<const PlatformDriver*, 6>& drivers = PlatformDrivers();
+  std::vector<std::string_view> ids;
+  ids.reserve(drivers.size());
+  for (const PlatformDriver* driver : drivers) {
+    ids.push_back(driver->Id());
+  }
+  return ids;
+}
+
+} // namespace pingcore::cli

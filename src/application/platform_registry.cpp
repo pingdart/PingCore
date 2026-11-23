@@ -1,0 +1,548 @@
+#include <pingcore/platform_registry.h>
+
+#include <deque>
+#include <mutex>
+#include <stdexcept>
+#include <unordered_map>
+#include <utility>
+
+#include <pingcore/app.h>
+
+#include "platform_registry_internal.h"
+#include "application_internal.h"
+#include "runtime/ui_window_internal.h"
+
+namespace pingcore {
+
+namespace detail {
+
+class PlatformChannelImpl final : public std::enable_shared_from_this<PlatformChannelImpl> {
+public:
+  struct PendingCall {
+    std::function<void(PlatformResult<PlatformPayload>)> completion;
+    std::function<void()> cancel;
+  };
+
+  PlatformChannelImpl(UiThreadDispatcher ui_thread_dispatcher, std::shared_ptr<ExecutionContext> source)
+      : dispatch_to_ui_thread_(std::move(ui_thread_dispatcher)), source_(std::move(source)) {
+    if (!dispatch_to_ui_thread_) {
+      throw std::invalid_argument("PingCore PlatformChannel UI thread dispatcher must not be empty");
+    }
+  }
+
+  ~PlatformChannelImpl() {
+    Close();
+  }
+
+  void Connect(PlatformChannelTransport transport) {
+    if (!transport.invoke) {
+      throw std::invalid_argument("PingCore PlatformChannel transport must provide invoke");
+    }
+    std::lock_guard lock(mutex_);
+    if (!open_) {
+      throw std::logic_error("PingCore PlatformChannel is closed");
+    }
+    if (connected_) {
+      throw std::logic_error("PingCore PlatformChannel transport is already connected");
+    }
+    transport_ = std::move(transport);
+    connected_ = true;
+  }
+
+  [[nodiscard]] bool IsOpen() const noexcept {
+    std::lock_guard lock(mutex_);
+    return open_;
+  }
+
+  PlatformRequestId Invoke(std::string method, PlatformPayload arguments,
+                           std::function<void(PlatformResult<PlatformPayload>)> completion) {
+    if (method.empty()) {
+      throw std::invalid_argument("PingCore PlatformChannel method must not be empty");
+    }
+    if (!IsValidUtf8(method)) {
+      throw std::invalid_argument("PingCore PlatformChannel method must contain valid UTF-8");
+    }
+    if (!completion) {
+      throw std::invalid_argument("PingCore PlatformChannel completion must not be empty");
+    }
+
+    UiThreadDispatcher dispatcher;
+    PlatformRequestId request = 0;
+    {
+      std::lock_guard lock(mutex_);
+      if (!open_) {
+        throw std::logic_error("PingCore PlatformChannel is closed");
+      }
+      if (!connected_) {
+        throw std::logic_error("PingCore PlatformChannel transport is not connected");
+      }
+      if (next_request_ == 0) {
+        throw std::logic_error("PingCore PlatformChannel request identity space is exhausted");
+      }
+      request = next_request_++;
+      pending_.emplace(request, PendingCall{std::move(completion), {}});
+      dispatcher = dispatch_to_ui_thread_;
+    }
+
+    const std::weak_ptr weak_channel = weak_from_this();
+    try {
+      dispatcher([weak_channel, request, method = std::move(method), arguments = std::move(arguments)]() mutable {
+        if (const std::shared_ptr channel = weak_channel.lock()) {
+          channel->InvokeTransport(request, std::move(method), std::move(arguments));
+        }
+      });
+    } catch (...) {
+      std::lock_guard lock(mutex_);
+      pending_.erase(request);
+      throw;
+    }
+    return request;
+  }
+
+  void On(std::string event, std::function<void(const PlatformPayload&)> handler) {
+    if (event.empty()) {
+      throw std::invalid_argument("PingCore PlatformChannel event must not be empty");
+    }
+    if (!IsValidUtf8(event)) {
+      throw std::invalid_argument("PingCore PlatformChannel event must contain valid UTF-8");
+    }
+    if (!handler) {
+      throw std::invalid_argument("PingCore PlatformChannel event handler must not be empty");
+    }
+    std::lock_guard lock(mutex_);
+    if (!open_) {
+      throw std::logic_error("PingCore PlatformChannel is closed");
+    }
+    if (!events_.emplace(std::move(event), std::move(handler)).second) {
+      throw std::invalid_argument("PingCore PlatformChannel event was registered more than once");
+    }
+  }
+
+  bool Cancel(PlatformRequestId request) {
+    if (request == 0) {
+      return false;
+    }
+    std::function<void()> cancel;
+    {
+      std::lock_guard lock(mutex_);
+      const auto found = pending_.find(request);
+      if (found == pending_.end()) {
+        return false;
+      }
+      cancel = std::move(found->second.cancel);
+      pending_.erase(found);
+    }
+    if (cancel) {
+      UiThreadDispatcher dispatcher = dispatch_to_ui_thread_;
+      try {
+        dispatcher([cancel = std::move(cancel)] {
+          try {
+            cancel();
+          } catch (...) {
+          }
+        });
+      } catch (...) {
+      }
+    }
+    return true;
+  }
+
+  void Close() noexcept {
+    std::vector<std::function<void()>> cancellations;
+    std::function<void()> dispose;
+    UiThreadDispatcher dispatcher;
+    {
+      std::lock_guard lock(mutex_);
+      if (!open_) {
+        return;
+      }
+      open_ = false;
+      cancellations.reserve(pending_.size());
+      for (auto& [request, call] : pending_) {
+        if (call.cancel) {
+          cancellations.push_back(std::move(call.cancel));
+        }
+      }
+      pending_.clear();
+      events_.clear();
+      queued_events_.clear();
+      event_delivery_scheduled_ = false;
+      dispose = std::move(transport_.dispose);
+      transport_.invoke = {};
+      connected_ = false;
+      dispatcher = dispatch_to_ui_thread_;
+    }
+    if (cancellations.empty() && !dispose) {
+      return;
+    }
+    try {
+      dispatcher([cancellations = std::move(cancellations), dispose = std::move(dispose)] {
+        for (const auto& cancel : cancellations) {
+          try {
+            cancel();
+          } catch (...) {
+          }
+        }
+        if (dispose) {
+          try {
+            dispose();
+          } catch (...) {
+          }
+        }
+      });
+    } catch (...) {
+    }
+  }
+
+  void PostEvent(std::string event, PlatformPayload payload) {
+    if (event.empty() || !IsValidUtf8(event)) {
+      return;
+    }
+    UiThreadDispatcher dispatcher;
+    {
+      std::lock_guard lock(mutex_);
+      if (!open_) {
+        return;
+      }
+      queued_events_.emplace_back(std::move(event), std::move(payload));
+      if (event_delivery_scheduled_) {
+        return;
+      }
+      event_delivery_scheduled_ = true;
+      dispatcher = dispatch_to_ui_thread_;
+    }
+    const std::weak_ptr weak_channel = weak_from_this();
+    try {
+      dispatcher([weak_channel] {
+        if (const std::shared_ptr channel = weak_channel.lock()) {
+          channel->DrainEvents();
+        }
+      });
+    } catch (...) {
+      std::lock_guard lock(mutex_);
+      queued_events_.clear();
+      event_delivery_scheduled_ = false;
+    }
+  }
+
+private:
+  /// Checks the captured application/window lifetime before native channel delivery.
+  /// @return True for a live original source; otherwise closes the channel and returns false.
+  bool CanDeliver() {
+    if (IsPresentationSourceAvailable(source_)) return true;
+    Close();
+    return false;
+  }
+
+  void InvokeTransport(PlatformRequestId request, std::string method, PlatformPayload arguments) {
+    if (!CanDeliver()) return;
+    ExecutionGuard guard(source_);
+    std::function<std::function<void()>(std::string, PlatformPayload,
+                                        std::function<void(PlatformResult<PlatformPayload>)>)>
+        invoke;
+    {
+      std::lock_guard lock(mutex_);
+      if (!open_ || !pending_.contains(request)) {
+        return;
+      }
+      invoke = transport_.invoke;
+    }
+
+    const std::weak_ptr weak_channel = weak_from_this();
+    std::function<void()> cancel;
+    try {
+      cancel = invoke(std::move(method), std::move(arguments),
+                      [weak_channel, request](PlatformResult<PlatformPayload> result) mutable {
+                        if (const std::shared_ptr channel = weak_channel.lock()) {
+                          channel->PostResult(request, std::move(result));
+                        }
+                      });
+    } catch (...) {
+      PostResult(request, PlatformError{
+                              "pingcore/call-failed",
+                              "PingCore platform call failed before producing a result",
+                              {},
+                          });
+      return;
+    }
+
+    std::function<void()> cancel_now;
+    {
+      std::lock_guard lock(mutex_);
+      const auto found = pending_.find(request);
+      if (found != pending_.end()) {
+        found->second.cancel = std::move(cancel);
+      } else {
+        cancel_now = std::move(cancel);
+      }
+    }
+    if (cancel_now) {
+      try {
+        cancel_now();
+      } catch (...) {
+      }
+    }
+  }
+
+  void PostResult(PlatformRequestId request, PlatformResult<PlatformPayload> result) {
+    UiThreadDispatcher dispatcher;
+    {
+      std::lock_guard lock(mutex_);
+      if (!open_ || !pending_.contains(request)) {
+        return;
+      }
+      dispatcher = dispatch_to_ui_thread_;
+    }
+    const std::weak_ptr weak_channel = weak_from_this();
+    try {
+      dispatcher([weak_channel, request, result = std::move(result)]() mutable {
+        if (const std::shared_ptr channel = weak_channel.lock()) {
+          channel->DeliverResult(request, std::move(result));
+        }
+      });
+    } catch (...) {
+      std::lock_guard lock(mutex_);
+      pending_.erase(request);
+    }
+  }
+
+  void DeliverResult(PlatformRequestId request, PlatformResult<PlatformPayload> result) {
+    if (!CanDeliver()) return;
+    ExecutionGuard guard(source_);
+    std::function<void(PlatformResult<PlatformPayload>)> completion;
+    {
+      std::lock_guard lock(mutex_);
+      if (!open_) {
+        return;
+      }
+      const auto found = pending_.find(request);
+      if (found == pending_.end()) {
+        return;
+      }
+      completion = std::move(found->second.completion);
+      pending_.erase(found);
+    }
+    if (auto* error = std::get_if<PlatformError>(&result)) {
+      try {
+        if (error->code.empty()) {
+          throw std::invalid_argument("empty code");
+        }
+        if (!IsValidUtf8(error->code) || !IsValidUtf8(error->message)) {
+          throw std::invalid_argument("PingCore PlatformChannel error must contain valid UTF-8");
+        }
+      } catch (...) {
+        result = PlatformError{
+            "pingcore/invalid-error",
+            "PingCore platform call returned an invalid error payload",
+            {},
+        };
+      }
+    }
+    try {
+      completion(std::move(result));
+    } catch (...) {
+    }
+  }
+
+  void DrainEvents() {
+    ExecutionGuard guard(source_);
+    while (CanDeliver()) {
+      std::function<void(const PlatformPayload&)> handler;
+      PlatformPayload payload;
+      {
+        std::lock_guard lock(mutex_);
+        if (!open_ || queued_events_.empty()) {
+          queued_events_.clear();
+          event_delivery_scheduled_ = false;
+          return;
+        }
+        auto [event, next_payload] = std::move(queued_events_.front());
+        queued_events_.pop_front();
+        payload = std::move(next_payload);
+        const auto found = events_.find(event);
+        if (found != events_.end()) {
+          handler = found->second;
+        }
+      }
+      if (handler) {
+        try {
+          handler(payload);
+        } catch (...) {
+        }
+      }
+    }
+  }
+
+  UiThreadDispatcher dispatch_to_ui_thread_;
+  const std::shared_ptr<ExecutionContext> source_;
+  PlatformChannelTransport transport_;
+  mutable std::mutex mutex_;
+  PlatformRequestId next_request_ = 1;
+  bool open_ = true;
+  bool connected_ = false;
+  bool event_delivery_scheduled_ = false;
+  std::unordered_map<PlatformRequestId, PendingCall> pending_;
+  std::unordered_map<std::string, std::function<void(const PlatformPayload&)>> events_;
+  std::deque<std::pair<std::string, PlatformPayload>> queued_events_;
+};
+
+PlatformChannelEndpoint MakePlatformChannelEndpoint(UiThreadDispatcher dispatch_to_ui_thread,
+                                                    std::shared_ptr<ExecutionContext> source) {
+  if (!source || !IsPresentationSourceAvailable(source)) {
+    throw std::logic_error("PingCore PlatformChannel requires a live execution source");
+  }
+  return PlatformChannelEndpoint(
+      std::make_shared<PlatformChannelImpl>(std::move(dispatch_to_ui_thread), std::move(source)));
+}
+
+PlatformChannel PlatformChannelEndpoint::Channel() const {
+  return PlatformChannel(impl_);
+}
+
+PlatformEventEmitter PlatformChannelEndpoint::Events() const {
+  const std::weak_ptr weak_channel = impl_;
+  return MakePlatformEventEmitter({}, [weak_channel](std::string event, PlatformPayload payload) {
+    if (const std::shared_ptr channel = weak_channel.lock()) {
+      channel->PostEvent(std::move(event), std::move(payload));
+    }
+    return std::optional<PlatformPayload>{};
+  });
+}
+
+void PlatformChannelEndpoint::Connect(PlatformChannelTransport transport) const {
+  if (!impl_) {
+    throw std::logic_error("PingCore PlatformChannel endpoint is empty");
+  }
+  impl_->Connect(std::move(transport));
+}
+
+void PlatformChannelEndpoint::Close() const noexcept {
+  if (impl_) {
+    impl_->Close();
+  }
+}
+
+void PlatformRegistry::RegisterValue(std::string name, std::unique_ptr<Registration> registration) {
+  if (frozen_) {
+    throw std::logic_error("PingCore platform registry is already frozen");
+  }
+  if (name.empty()) {
+    throw std::invalid_argument("PingCore platform registration name must not be empty");
+  }
+  if (!IsValidUtf8(name)) {
+    throw std::invalid_argument("PingCore platform registration name must contain valid UTF-8");
+  }
+  if (!registrations_.emplace(std::move(name), std::move(registration)).second) {
+    throw std::logic_error("PingCore platform registration name was registered more than once");
+  }
+}
+
+void PlatformRegistry::RegisterViewValue(std::string name, std::type_index properties_type,
+                                         std::type_index controller_type,
+                                         std::function<PlatformViewFactoryRegistration(UiWindow&)> factory) {
+  if (!factory) {
+    throw std::invalid_argument("PingCore PlatformView factory must not be empty");
+  }
+  RegisterValue(std::move(name),
+                std::make_unique<ViewRegistration>(properties_type, controller_type, std::move(factory)));
+}
+
+PlatformRegistry::ModuleInstance PlatformRegistry::OpenModuleValue(std::string name, std::type_index module_type,
+                                                                   std::type_index options_type,
+                                                                   const PlatformValue* options) {
+  const auto found = registrations_.find(name);
+  if (found == registrations_.end()) {
+    throw std::logic_error("PingCore PlatformModule is not registered: " + name);
+  }
+  Registration& registration = *found->second;
+  if (registration.kind != Kind::Module) {
+    throw std::logic_error("PingCore platform registration is not a PlatformModule: " + name);
+  }
+  if (registration.primary_type != module_type || registration.secondary_type != options_type) {
+    throw std::logic_error("PingCore PlatformModule registration has incompatible C++ types: " + name);
+  }
+  return static_cast<ModuleRegistration&>(registration).Open(*runtime_, options);
+}
+
+PlatformViewFactoryRegistration PlatformRegistry::FindViewValue(UiWindow& ui, std::string_view name, std::type_index properties_type,
+                                                                std::type_index controller_type,
+                                                                std::type_index factory_type) const {
+  const auto found = registrations_.find(std::string(name));
+  if (found == registrations_.end()) {
+    throw std::logic_error("PingCore PlatformView is not registered: " + std::string(name));
+  }
+  const Registration& registration = *found->second;
+  if (registration.kind != Kind::View) {
+    throw std::logic_error("PingCore platform registration is not a PlatformView: " + std::string(name));
+  }
+  if (registration.primary_type != properties_type || registration.secondary_type != controller_type) {
+    throw std::logic_error("PingCore PlatformView registration has incompatible C++ types: " + std::string(name));
+  }
+  const auto& view = static_cast<const ViewRegistration&>(registration);
+  PlatformViewFactoryRegistration factory = view.factory(ui);
+  if (!factory.factory || factory.type != factory_type) {
+    throw std::logic_error("PingCore PlatformView is registered for a different platform window: " + std::string(name));
+  }
+  return factory;
+}
+
+PlatformRegistry& CurrentPlatformRegistry() {
+  if (Composer::Current()) {
+    throw std::logic_error("PingCore PlatformModule cannot be opened during composition");
+  }
+  return CurrentApplicationRuntime()->registry;
+}
+
+PlatformEventEmitter MakePlatformEventEmitter(
+    std::function<std::optional<PlatformValue>(std::type_index, PlatformValue)> emit_direct,
+    std::function<std::optional<PlatformPayload>(std::string, PlatformPayload)> emit_payload
+) {
+  return PlatformEventEmitter(std::move(emit_direct), std::move(emit_payload));
+}
+
+} // namespace detail
+
+bool PlatformChannel::IsOpen() const noexcept {
+  return impl_ && impl_->IsOpen();
+}
+
+PlatformRequestId PlatformChannel::Invoke(std::string method, PlatformPayload arguments,
+                                          std::function<void(PlatformResult<PlatformPayload>)> completion) const {
+  if (!impl_) {
+    throw std::logic_error("PingCore PlatformChannel is empty");
+  }
+  return impl_->Invoke(std::move(method), std::move(arguments), std::move(completion));
+}
+
+void PlatformChannel::On(std::string event, std::function<void(const PlatformPayload&)> handler) const {
+  if (!impl_) {
+    throw std::logic_error("PingCore PlatformChannel is empty");
+  }
+  impl_->On(std::move(event), std::move(handler));
+}
+
+bool PlatformChannel::Cancel(PlatformRequestId request) const {
+  return impl_ && impl_->Cancel(request);
+}
+
+void PlatformChannel::Close() const noexcept {
+  if (impl_) {
+    impl_->Close();
+  }
+}
+
+std::optional<PlatformValue> PlatformEventEmitter::EmitValue(std::type_index key, PlatformValue value) const {
+  if (emit_direct_) {
+    return emit_direct_(key, std::move(value));
+  }
+  return std::nullopt;
+}
+
+std::optional<PlatformPayload> PlatformEventEmitter::Emit(std::string name, PlatformPayload payload) const {
+  if (emit_payload_) {
+    return emit_payload_(std::move(name), std::move(payload));
+  }
+  return std::nullopt;
+}
+
+} // namespace pingcore

@@ -1,0 +1,54 @@
+#pragma once
+
+#include <windows.h>
+
+#include <memory>
+#include <string_view>
+
+#include <pingcore/geometry.h>
+#include <pingcore/render_scene.h>
+#include <pingcore/text.h>
+
+namespace pingcore::detail {
+
+class TextLayoutBackend;
+
+enum class Win32RenderResult {
+  Presented,
+  Skipped,
+  Retry,
+  Recreate,
+};
+
+class Win32Renderer final {
+public:
+  Win32Renderer();
+  ~Win32Renderer();
+
+  Win32Renderer(const Win32Renderer&) = delete;
+  Win32Renderer& operator=(const Win32Renderer&) = delete;
+
+  void Initialize(bool transparent_background = false);
+  void Discard() noexcept;
+  void ResetDeviceResources() noexcept;
+  void UpdateTextLocale();
+  void Resize(HWND window, float dpi);
+  void DpiChanged(HWND window, float dpi);
+  [[nodiscard]] bool EnablePlatformComposition(HWND window);
+  [[nodiscard]] FontMetrics Metrics(const Font& font);
+  [[nodiscard]] TextRunMetrics
+  MeasureRun(std::string_view text, const TextStyle& style, const TextShapingOptions& options);
+  [[nodiscard]] TextLayoutMetrics
+  MeasureText(std::string_view text, const TextStyle& style, float max_width, const TextLayoutOptions& options);
+  [[nodiscard]] TextLayoutMetrics
+  MeasureText(const AttributedText& text, const TextStyle& style, float max_width, const TextLayoutOptions& options);
+  std::unique_ptr<TextLayoutBackend> CreatePlatformTextLayout(
+      const AttributedText& text, const TextStyle& style, float max_width, const TextLayoutOptions& options);
+  [[nodiscard]] Win32RenderResult Render(HWND window, float dpi, const RenderFrame& frame, const RECT& paint_rect);
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+} // namespace pingcore::detail

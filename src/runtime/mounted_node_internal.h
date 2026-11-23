@@ -1,0 +1,678 @@
+#pragma once
+
+#include <algorithm>
+#include <any>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <typeindex>
+#include <unordered_map>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include <pingcore/animation.h>
+#include <pingcore/app.h>
+#include <pingcore/event.h>
+#include <pingcore/environment.h>
+#include <pingcore/lifecycle.h>
+#include <pingcore/modifier.h>
+#include <pingcore/platform_registry.h>
+#include <pingcore/resource.h>
+#include <pingcore/state.h>
+#include <pingcore/view.h>
+
+#include "graphics/geometry_internal.h"
+#include "semantics_internal.h"
+#include "view_internal.h"
+
+namespace pingcore::detail {
+
+class AppResources;
+class RecomposeScope;
+struct CachedParagraphLayout;
+class ScrollConnection;
+struct ExecutionContext;
+
+struct ViewHandleGeometry {
+  Rect bounds;
+  Transform2D local_to_window;
+};
+
+/// Keeps a target attached to its original window without retaining that window or its Environment.
+struct ViewHandleBinding {
+  explicit ViewHandleBinding(std::shared_ptr<ExecutionContext> source) : source(std::move(source)) {}
+
+  std::shared_ptr<ExecutionContext> source;
+  std::uint64_t node_identity = 0;
+  std::optional<ViewHandleGeometry> geometry;
+};
+
+inline std::optional<double> EarliestWakeAfter(std::optional<double> first, std::optional<double> second) noexcept {
+  if (!first.has_value()) {
+    return second;
+  }
+  if (!second.has_value()) {
+    return first;
+  }
+  return std::min(*first, *second);
+}
+
+struct ScrollItemRequest {
+  std::size_t index;
+  ScrollAlignment alignment;
+};
+
+class ScrollControllerState {
+public:
+  explicit ScrollControllerState(float initial_offset);
+
+  std::shared_ptr<StateCell<ScrollMetrics>> metrics;
+  std::weak_ptr<ScrollConnection> connection;
+  std::optional<float> pending_offset;
+  std::optional<ScrollItemRequest> pending_item;
+  bool was_connected = false;
+};
+
+struct CompositionSlotKey {
+  std::string file;
+  std::string function;
+  std::uint32_t line = 0;
+  std::uint32_t column = 0;
+  std::uint32_t occurrence = 0;
+
+  bool operator==(const CompositionSlotKey&) const = default;
+};
+
+struct CompositionSlotKeyHash {
+  std::size_t operator()(const CompositionSlotKey& key) const noexcept;
+};
+
+struct StateSlotStorage {
+  std::unordered_map<CompositionSlotKey, std::shared_ptr<StateCellBase>, CompositionSlotKeyHash> slots;
+};
+
+struct LifecycleSlot {
+  std::vector<LifecycleDependency> dependencies;
+  LifecycleCleanup cleanup;
+  bool retained_for_commit = false;
+};
+
+struct LifecycleDeclaration {
+  CompositionSlotKey key;
+  LifecycleSetup setup;
+  std::vector<LifecycleDependency> dependencies;
+};
+
+struct VirtualItemState {
+  NodeKind kind = NodeKind::Layout;
+  std::optional<ViewKey> key;
+  const LayoutDescriptor* layout_descriptor = nullptr;
+  const VirtualLayoutDescriptor* virtual_layout_descriptor = nullptr;
+  std::optional<StateSlotStorage> state_slots;
+  std::vector<VirtualItemState> children;
+};
+
+struct VirtualItemStateCache {
+  std::unordered_map<ViewKey, VirtualItemState> keyed;
+  std::unordered_map<std::size_t, VirtualItemState> indexed;
+};
+
+struct VirtualCollectionSemantics {
+  SemanticRole role = SemanticRole::Generic;
+  SemanticRole item_role = SemanticRole::Generic;
+  SemanticCollection collection;
+
+  bool operator==(const VirtualCollectionSemantics&) const = default;
+};
+
+class VirtualItemDependencyCapture {
+public:
+  VirtualItemDependencyCapture(std::shared_ptr<RecomposeScope> scope, std::uint64_t owner_identity);
+  ~VirtualItemDependencyCapture();
+
+  VirtualItemDependencyCapture(const VirtualItemDependencyCapture&) = delete;
+  VirtualItemDependencyCapture& operator=(const VirtualItemDependencyCapture&) = delete;
+
+  void Clear();
+  void Observe(const std::shared_ptr<CompositionDependency>& dependency);
+
+  class Guard {
+  public:
+    explicit Guard(VirtualItemDependencyCapture& capture);
+    ~Guard();
+
+    Guard(const Guard&) = delete;
+    Guard& operator=(const Guard&) = delete;
+
+  private:
+    VirtualItemDependencyCapture* previous_;
+  };
+
+  static VirtualItemDependencyCapture* Current() noexcept;
+  [[nodiscard]] std::shared_ptr<RecomposeScope> Scope() const noexcept;
+
+private:
+  static thread_local VirtualItemDependencyCapture* current_;
+  std::weak_ptr<RecomposeScope> scope_;
+  std::uint64_t owner_identity_ = 0;
+};
+
+struct VirtualNodeState {
+  ViewItemSource source;
+  std::unique_ptr<VirtualItemDependencyCapture> dependency_capture;
+  std::unordered_map<std::size_t, View> item_declarations;
+  std::vector<std::size_t> realized_indices;
+  std::vector<VirtualLayoutResult::Placement> realized_placements;
+  std::optional<VirtualCollectionSemantics> collection_semantics;
+  std::unique_ptr<VirtualItemStateCache> item_state_cache;
+  bool viewport_dirty = true;
+  // A parent may measure the same child repeatedly; only the candidate selected for layout commits its correction.
+  std::optional<Point> pending_scroll_offset;
+};
+
+inline constexpr std::array scroll_axes{Axis::Horizontal, Axis::Vertical};
+
+inline constexpr std::size_t ScrollAxisIndex(Axis axis) noexcept {
+  return axis == Axis::Vertical ? 1 : 0;
+}
+
+inline std::span<const Axis> ScrollAxes(Axis axis, bool both_axes) noexcept {
+  return both_axes ? std::span<const Axis>{scroll_axes}
+                   : std::span<const Axis>{scroll_axes}.subspan(ScrollAxisIndex(axis), 1);
+}
+
+struct ScrollMotionFrameResult {
+  bool needs_frame = false;
+  std::optional<float> transfer_velocity{};
+};
+
+class ScrollMotion {
+public:
+  void Stop(MountedNode& node, Axis axis, ScrollPhase phase = ScrollPhase::Cancel);
+  bool StartMomentum(MountedNode& node, Axis axis, float velocity);
+  bool StartOverscrollSettlement(MountedNode& node, Axis axis);
+  ScrollMotionFrameResult Advance(MountedNode& node, Axis axis, const FrameInfo& frame);
+
+  float overscroll_offset = 0.0F;
+
+private:
+  enum class Mode {
+    Idle,
+    Momentum,
+    OverscrollSettlement,
+  };
+
+  void Reset() noexcept;
+
+  float velocity_ = 0.0F;
+  std::optional<double> previous_timestamp_;
+  Mode mode_ = Mode::Idle;
+};
+
+struct ScrollNodeState {
+  Axis axis = Axis::Vertical;
+  bool both_axes = false;
+  std::uint32_t allowed_sources = std::numeric_limits<std::uint32_t>::max();
+  bool touch_drag_only = false;
+  bool allows_automatic_reveal = true;
+  bool allows_leading_overscroll = true;
+  bool allows_trailing_overscroll = true;
+  float offset_y = 0.0F;
+  float offset_x = 0.0F;
+  float content_height = 0.0F;
+  float content_width = 0.0F;
+  std::optional<Rect> viewport_override;
+  std::array<ScrollMotion, 2> motion;
+  // The first slot follows a single-axis layout if its axis changes during measurement.
+  std::array<std::shared_ptr<ScrollConnection>, 2> connections;
+
+  std::span<const Axis> Axes() const noexcept { return ScrollAxes(axis, both_axes); }
+  bool Supports(Axis value) const noexcept { return both_axes || axis == value; }
+  float& Offset(Axis value) noexcept { return value == Axis::Vertical ? offset_y : offset_x; }
+  float Offset(Axis value) const noexcept { return value == Axis::Vertical ? offset_y : offset_x; }
+  float ContentExtent(Axis value) const noexcept { return value == Axis::Vertical ? content_height : content_width; }
+  ScrollMotion& Motion(Axis value) noexcept { return motion[ScrollAxisIndex(value)]; }
+  const ScrollMotion& Motion(Axis value) const noexcept { return motion[ScrollAxisIndex(value)]; }
+  ScrollConnection* Connection(Axis value) const noexcept {
+    return connections[both_axes ? ScrollAxisIndex(value) : 0].get();
+  }
+};
+
+struct NodeExtensionEntry {
+  const ModifierDescriptor* descriptor = nullptr;
+  std::unique_ptr<pingcore::NodeExtension> extension;
+  std::shared_ptr<const void> value;
+  bool interaction_sync_pending = true;
+};
+
+// Owns render-only instances; source identities and revisions avoid rerecording mounted content for every fragment.
+struct FragmentRenderGroup {
+  void Update(std::span<const RenderNode* const> sources, std::span<const TransitionFragment> fragments);
+  void Clear();
+
+  std::vector<std::unique_ptr<RenderNode>> nodes;
+  std::vector<std::uint64_t> source_ids;
+  std::vector<const RenderNode*> roots;
+};
+
+struct NodePresentation {
+  Transform2D local_transform;
+  // A retained container can move its descendants without changing its own layout or foreground presentation.
+  Transform2D children_transform;
+  // Clips intersect in this node's local space, after descendant transforms.
+  std::vector<ClipShape> children_clips;
+  std::vector<TransitionFragment> children_fragments;
+  // Higher values paint above siblings; equal values preserve declaration order.
+  int z_index = 0;
+  float local_opacity = 1.0F;
+  float render_opacity = 1.0F;
+  Transform2D resolved_transform;
+  float resolved_opacity = 1.0F;
+  // Temporary render-only replacement never changes declarative opacity or accessibility identity.
+  bool suppress_render = false;
+  // Borrowed render subtree appended after ordinary children and before foreground paint.
+  const RenderNode* overlay = nullptr;
+};
+
+// MountedNode is the retained counterpart of ViewSpec. UiWindow reads copied component payloads only from matching
+// NodeKind branches, while layout, paint, interaction, and extension state persist across compatible declarations.
+struct MountedNode final : public pingcore::ViewNode {
+  ~MountedNode() override;
+  void PublishViewBinding();
+
+  UiWindow* ui_window = nullptr;
+  NodeKind kind = NodeKind::Layout;
+  std::uint64_t identity = 0;
+  std::optional<ViewKey> key;
+  AttributedText text;
+  std::shared_ptr<CachedParagraphLayout> cached_paragraph_layout;
+  ViewProperties properties;
+  SemanticPatch component_semantics;
+  std::optional<SemanticPatch> author_semantics;
+  std::function<View()> scope_factory;
+#if defined(PINGCORE_ENABLE_PROFILING) && PINGCORE_ENABLE_PROFILING
+  ProfileSource profile_source;
+#endif
+  CanvasPainter canvas_painter;
+  ImageProperties image_properties;
+  std::shared_ptr<const PlatformViewDeclaration> platform_view;
+  std::uint64_t platform_view_properties_revision = 0;
+  std::uint64_t platform_view_controller_revision = 0;
+  const LayoutDescriptor* layout_descriptor = nullptr;
+  const VirtualLayoutDescriptor* virtual_layout_descriptor = nullptr;
+  std::unordered_map<std::type_index, ErasedLayoutValue> layout_values;
+  std::unordered_map<std::type_index, std::any> layout_cache;
+  std::vector<LayoutResult::Placement> layout_placements;
+  EventBindings event_bindings;
+  std::function<void(const EventBindings&)> activation;
+  std::shared_ptr<RecomposeScope> recompose_scope;
+  // Constraints, unconsumed safe area, and native title-bar geometry jointly identify a reusable measurement result.
+  std::optional<Constraints> measured_constraints;
+  std::optional<EdgeInsets> measured_safe_area;
+  std::optional<WindowTitleBarMetrics> measured_title_bar;
+  // Measurement derives this from properties.padding plus the safe-area edges consumed by this node. Layout and paint
+  // use the resolved value while the declarative properties remain stable across window-inset changes.
+  EdgeInsets resolved_padding;
+  Size measured_size;
+  // Bounds stay at the node-local origin; layout_offset places the node in its parent's local coordinates.
+  Rect bounds;
+  Point layout_offset;
+  NodePresentation presentation;
+  std::unique_ptr<FragmentRenderGroup> fragment_render_group;
+  RenderNode render_node;
+  std::uint64_t measure_revision = 0;
+  std::uint64_t layout_revision = 0;
+  SemanticNodeId semantic_identity = 0;
+  std::unordered_map<VirtualSemanticKey, SemanticNodeId, VirtualSemanticKeyHash> virtual_semantic_identities;
+  // Measurement, descendant placement, content recording, and foreground recording are invalidated independently.
+  bool measure_dirty = true;
+  bool layout_dirty = true;
+  bool content_paint_dirty = true;
+  bool foreground_paint_dirty = true;
+  // Mounted child changes and fragment links in this subtree need synchronization even while invisible.
+  bool render_structure_dirty = true;
+  // This records whether the immediate parent committed this node in its LayoutResult placements. Effective
+  // participation also requires every ancestor to participate and is intentionally distinct from visual visibility.
+  bool participates_in_layout = true;
+  std::unique_ptr<ScrollNodeState> scroll_state;
+  std::unique_ptr<VirtualNodeState> virtual_state;
+  std::vector<NodeExtensionEntry> extensions;
+  std::shared_ptr<const Environment> environment;
+  std::shared_ptr<Environment> owned_environment;
+  // Cached when the compiled declaration is applied so animation frames do not repeatedly resolve ThemeSpec.
+  bool reduced_motion = false;
+  bool pointer_events_enabled = true;
+  bool local_enabled = true;
+  // Transient input exclusion preserves the declarative enabled state and its visual styling.
+  bool exclude_input = false;
+  InteractionState interaction;
+  std::uint32_t active_press_count = 0;
+  // True only for the node that first disables an otherwise enabled subtree. Stateful controls use their disabled
+  // colors at this boundary; inherited disabled descendants remain visually enabled under the boundary group opacity.
+  bool applies_disabled_appearance = false;
+  // Declarative border and radii remain stable targets; these fields hold the current animated surface presentation.
+  std::optional<Border> resolved_border;
+  CornerRadii resolved_corner_radii;
+  // Re-resolved during geometry preparation from static indication geometry or a component's dynamic control bounds.
+  std::optional<Rect> indication_bounds_override;
+  std::shared_ptr<const Indication> foreground_indication;
+  std::optional<Color> resolved_foreground;
+  bool declared_focusable = false;
+  std::shared_ptr<ViewHandleBinding> view_handle;
+  bool initial_focus_consumed = false;
+  bool trap_focus = false;
+  bool subtree_has_extensions = true;
+  std::vector<std::unique_ptr<MountedNode>> children;
+  // Resolved child indices in paint order; empty means declaration order. Rebuilt with presentation geometry.
+  std::vector<std::size_t> child_paint_order;
+
+  [[nodiscard]] std::size_t ChildCount() const noexcept override {
+    return children.size();
+  }
+
+  [[nodiscard]] pingcore::ViewNode& ChildAt(std::size_t index) override {
+    if (index >= children.size()) {
+      throw std::out_of_range("PingCore mounted child index is out of range");
+    }
+    return *children[index];
+  }
+
+  [[nodiscard]] const pingcore::ViewNode& ChildAt(std::size_t index) const override {
+    if (index >= children.size()) {
+      throw std::out_of_range("PingCore mounted child index is out of range");
+    }
+    return *children[index];
+  }
+
+  [[nodiscard]] Size LayoutSize() const noexcept override {
+    return measured_size;
+  }
+
+  [[nodiscard]] Rect Bounds() const noexcept override {
+    return bounds;
+  }
+
+  [[nodiscard]] Rect ContentBounds() const noexcept override {
+    return {
+        bounds.x + resolved_padding.left,
+        bounds.y + resolved_padding.top,
+        std::max(0.0F, bounds.width - resolved_padding.Horizontal()),
+        std::max(0.0F, bounds.height - resolved_padding.Vertical()),
+    };
+  }
+
+  [[nodiscard]] Point LayoutOffset() const noexcept override {
+    return layout_offset;
+  }
+
+  [[nodiscard]] Rect PresentationBounds() const noexcept override {
+    return TransformBounds(presentation.resolved_transform, bounds);
+  }
+
+  [[nodiscard]] Point LocalToWindow(Point point) const noexcept override {
+    return presentation.resolved_transform.Apply(point);
+  }
+
+  [[nodiscard]] std::optional<Point> WindowToLocal(Point point) const noexcept override {
+    return presentation.resolved_transform.Inverse(point);
+  }
+
+  [[nodiscard]] Rect LocalToWindowBounds(Rect local_bounds) const noexcept override {
+    return TransformBounds(presentation.resolved_transform, local_bounds);
+  }
+
+  [[nodiscard]] float PresentationOpacity() const noexcept override {
+    return presentation.resolved_opacity;
+  }
+
+  [[nodiscard]] bool IsEnabled() const noexcept override {
+    return interaction.enabled;
+  }
+
+  bool IsFocusable() const noexcept;
+
+  [[nodiscard]] bool IsFocused() const noexcept override {
+    return interaction.focused;
+  }
+
+  [[nodiscard]] const InteractionState& Interaction() const noexcept override {
+    return interaction;
+  }
+
+  [[nodiscard]] float Spacing() const noexcept override {
+    return properties.spacing;
+  }
+
+  [[nodiscard]] float GrowFactor() const noexcept override {
+    const float* factor = LayoutValue<GrowFactorBinding>();
+    return factor == nullptr ? 0.0F : *factor;
+  }
+
+  [[nodiscard]] MainAxisAlignment MainAlignment() const noexcept override {
+    return properties.main_axis_alignment;
+  }
+
+  [[nodiscard]] CrossAxisAlignment CrossAlignment() const noexcept override {
+    return properties.cross_axis_alignment;
+  }
+
+  [[nodiscard]] HorizontalAlignment HorizontalAlignmentValue() const noexcept override {
+    return properties.horizontal_alignment;
+  }
+
+  [[nodiscard]] VerticalAlignment VerticalAlignmentValue() const noexcept override {
+    return properties.vertical_alignment;
+  }
+
+protected:
+  [[nodiscard]] const std::any* FindLayoutValue(std::type_index key_value) const noexcept override {
+    const auto found = layout_values.find(key_value);
+    if (found != layout_values.end()) {
+      return &found->second.value;
+    }
+    if ((kind == NodeKind::Scope || kind == NodeKind::Environment) && children.size() == 1) {
+      return children.front()->FindLayoutValue(key_value);
+    }
+    return nullptr;
+  }
+
+  std::any& EnsureCacheEntry(std::type_index key_value) override {
+    return layout_cache[key_value];
+  }
+};
+
+
+inline Color InterpolateColor(Color from, Color to, float progress) noexcept {
+  const float value = std::clamp(progress, 0.0F, 1.0F);
+  return {
+      from.red + (to.red - from.red) * value,
+      from.green + (to.green - from.green) * value,
+      from.blue + (to.blue - from.blue) * value,
+      from.alpha + (to.alpha - from.alpha) * value,
+  };
+}
+
+class ScrollConnection : public std::enable_shared_from_this<ScrollConnection> {
+public:
+  ScrollConnection(MountedNode& node, const ScrollController& controller, std::optional<Axis> axis);
+
+  [[nodiscard]] bool Matches(const ScrollController& controller, std::optional<Axis> axis) const noexcept;
+  [[nodiscard]] bool IsCurrent() const noexcept;
+  void Connect();
+  bool ScrollTo(float offset);
+  bool ScrollBy(float delta);
+  bool ScrollToItem(std::size_t index, ScrollAlignment alignment);
+  void CancelPending();
+  void ApplyPending(bool after_layout = false);
+  std::optional<float> PendingItemOffset(float viewport_extent) const;
+  void PublishMetrics();
+
+private:
+  Axis BoundAxis() const noexcept;
+  std::optional<float> ItemOffset(std::size_t index, ScrollAlignment alignment, float viewport_extent) const;
+  [[nodiscard]] float CurrentOffset() const noexcept;
+  bool ScrollToOffset(float offset);
+  void SetCurrentOffset(float offset) noexcept;
+
+  MountedNode* node_;
+  std::shared_ptr<ScrollControllerState> state_;
+  std::optional<Axis> axis_;
+};
+
+void ConfigureScrollAxes(MountedNode& node, Axis axis, bool both_axes);
+void PrepareScrollController(MountedNode& node);
+void CompleteScrollController(MountedNode& node);
+
+struct RenderSlice {
+  std::optional<std::uint64_t> preceding_platform_view;
+  std::optional<std::uint64_t> following_platform_view;
+  std::size_t first_command = 0;
+  std::size_t command_count = 0;
+
+  bool operator==(const RenderSlice&) const = default;
+};
+
+struct PlatformViewPlacement {
+  const PlacePlatformViewCommand* command = nullptr;
+  Rect world_bounds;
+  std::optional<Rect> clip;
+  bool visible = false;
+
+  bool operator==(const PlatformViewPlacement&) const = default;
+};
+
+using RenderCompositionLayer = std::variant<RenderSlice, PlatformViewPlacement>;
+
+struct RenderComposition {
+  std::vector<RenderCompositionLayer> layers;
+};
+
+RenderComposition BuildRenderComposition(const RenderScene& scene);
+
+struct ExternalTextureUseSnapshot {
+  std::shared_ptr<ExternalTexture> texture;
+  std::uint64_t revision = 0;
+  Rect bounds;
+};
+
+struct RenderNodeSnapshot {
+  std::uint64_t content_revision = 0;
+  std::uint64_t foreground_revision = 0;
+  Transform2D world_transform;
+  Transform2D world_children_transform;
+  std::optional<Rect> world_clip;
+  std::optional<Rect> world_child_clip;
+  std::vector<RenderClip> child_clips;
+  Rect own_bounds;
+  Rect subtree_bounds;
+  std::vector<std::uint64_t> children;
+  std::vector<ExternalTextureUseSnapshot> external_textures;
+  float opacity = 1.0F;
+  bool has_own_bounds = false;
+  bool has_subtree_bounds = false;
+  bool visible = false;
+};
+
+// Retains committed geometry and revisions for damage comparison, not visual scene content.
+using RenderDamageSnapshot = std::unordered_map<std::uint64_t, RenderNodeSnapshot>;
+
+Transform2D ResolveChildrenTransform(const MountedNode& node);
+std::vector<RenderClip> ResolveChildClips(const MountedNode& node);
+Rect RenderClipBounds(const RenderClip& clip);
+bool RenderSceneHasPlatformViews(const RenderNode* root);
+
+struct ScrollBarGeometry {
+  Axis axis = Axis::Vertical;
+  Rect track;
+  Rect thumb;
+  ScrollBarStyle style;
+  float scroll_offset = 0.0F;
+  float maximum_offset = 0.0F;
+  float thumb_travel = 0.0F;
+};
+
+inline constexpr float touch_gesture_slop = 6.0F;
+
+MountedNode* FindNode(MountedNode& root, std::uint64_t identity);
+bool FindNodePath(MountedNode& node, std::uint64_t identity, std::vector<MountedNode*>& path);
+NodeExtension* FindExtension(MountedNode& root, const NodeExtensionHandle& handle);
+void ActivateNode(MountedNode& node);
+bool ContainsNodeIdentity(const MountedNode& root, std::uint64_t identity);
+std::optional<bool> DeclaredEnabled(const MountedNode& node, std::uint64_t identity, bool parent_enabled = true);
+void AutoScrollDropTarget(UiWindow& ui_window, const std::unique_ptr<MountedNode>& root,
+                          std::uint64_t target_identity, Point window_position, const FrameInfo& frame);
+
+Size MeasureNode(
+    MountedNode& node,
+    const Constraints& constraints,
+    UiWindow& ui_window,
+    EdgeInsets safe_area = {},
+    const WindowTitleBarMetrics* title_bar_metrics = nullptr
+);
+void LayoutNode(MountedNode& node, Point offset);
+
+inline bool AppliesDisabledAppearance(const pingcore::ViewNode& node) {
+  return static_cast<const MountedNode&>(node).applies_disabled_appearance;
+}
+
+float ToggleLabelLeading(const ToggleLayoutMetrics& metrics) noexcept;
+Rect ResolveToggleControlBounds(const MountedNode& node) noexcept;
+Rect ResolveToggleLabelBounds(const MountedNode& node) noexcept;
+TextSelectionClient* FindTextSelectionClient(MountedNode& node);
+MountedNode* FindTextSelectionOwner(MountedNode& root, std::uint64_t identity);
+void ResolvePresentationTree(MountedNode& node);
+MountedNode& ChildInPaintOrder(const MountedNode& node, std::size_t index);
+void ValidateBorder(const Border& border);
+void UpdateRenderScene(MountedNode& node, Rect clip, const RenderNode* overlay = nullptr);
+DamageRegion ComputeDamageRegion(
+    const RenderNode* root,
+    Size viewport,
+    RenderDamageSnapshot& committed_scene,
+    Size& committed_viewport,
+    bool& has_committed_scene,
+    const std::shared_ptr<ExternalTextureFrameRequester>& texture_frame_requester
+);
+void DeactivateExternalTextures(
+    RenderDamageSnapshot& committed_scene,
+    const std::shared_ptr<ExternalTextureFrameRequester>& texture_frame_requester
+);
+void UpdateInteraction(MountedNode& node, InteractionState state, std::optional<InteractionEvent> event = std::nullopt);
+bool BuildPointerRoute(MountedNode& node, Point position, std::vector<MountedNode*>& route);
+bool BuildPointerCursorRoute(MountedNode& node, Point position, std::vector<MountedNode*>& route);
+bool BuildHoverRoute(MountedNode& node, Point position, std::vector<MountedNode*>& route);
+MountedNode* HitTestPointer(MountedNode& node, Point position);
+bool HitTestWindowDragRegion(MountedNode& node, Point position);
+std::optional<ScrollBarGeometry> ResolveScrollBarGeometry(const MountedNode& node, Axis axis);
+bool IsScrollContainer(const MountedNode& node) noexcept;
+Axis ScrollAxis(const MountedNode& node) noexcept;
+Rect ScrollViewport(const MountedNode& node) noexcept;
+bool AllowsScrollSource(const MountedNode& node, ScrollSource source) noexcept;
+bool CanScrollNode(const MountedNode& node, Axis axis, float delta);
+bool CanOverscrollNode(const MountedNode& node, Axis axis, float delta);
+float ScrollNodeBy(MountedNode& node, Axis axis, float delta, ScrollSource source);
+bool ScrollNodeRectIntoView(MountedNode& node, Rect& rect);
+float AlignedScrollOffset(float start, float extent, float viewport_extent, ScrollAlignment alignment);
+
+ScrollMetrics ResolveScrollMetrics(const MountedNode& node, Axis axis) noexcept;
+const ScrollPhysics& ResolveScrollPhysics(const MountedNode& node);
+void ValidateScrollPhysics(const ScrollPhysics& physics);
+void NotifyScrollNodeActivity(MountedNode& node, Axis axis, ScrollSource source, ScrollPhase phase, float delta);
+void StopScrollNodeMotion(MountedNode& node, Axis axis, ScrollPhase phase = ScrollPhase::Cancel);
+void StopScrollNodeMotion(MountedNode& node, ScrollPhase phase = ScrollPhase::Cancel);
+float ApplyScrollTransaction(const std::vector<MountedNode*>& route, Axis axis, float delta, ScrollSource source,
+                             std::vector<std::uint64_t>* direct_activity_nodes = nullptr,
+                             bool allow_overscroll = false);
+float ApplyPreFling(const std::vector<MountedNode*>& route, Axis axis, float velocity);
+bool AdvanceMountedNodeFrame(MountedNode& node, const FrameInfo& frame);
+
+bool IsVirtualLayoutNode(const MountedNode& node) noexcept;
+
+} // namespace pingcore::detail

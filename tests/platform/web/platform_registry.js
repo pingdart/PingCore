@@ -1,0 +1,151 @@
+"use strict";
+
+const assert = require("node:assert/strict");
+const path = require("node:path");
+
+const runtimePath = process.argv[2];
+if (!runtimePath) {
+  throw new Error("PingCore Web PlatformRegistry test requires the bridge runtime path");
+}
+
+const calls = [];
+global.Module = {
+  pingcoreWebPlatformEmit(handle, event, payload) {
+    calls.push({ operation: "emit", handle, event, payload });
+    if (event === "decision") {
+      return payload;
+    }
+    if (event === "invalid") {
+      return null;
+    }
+    return undefined;
+  },
+  pingcoreWebPlatformReleaseEvent(handle) {
+    calls.push({ operation: "releaseEvent", handle });
+  },
+  pingcoreWebPlatformComplete(handle, payload) {
+    calls.push({ operation: "complete", handle, payload });
+    return true;
+  },
+  pingcoreWebPlatformFail(handle, code, message, details) {
+    calls.push({ operation: "fail", handle, code, message, details });
+    return true;
+  },
+  pingcoreWebPlatformReleaseResult(handle) {
+    calls.push({ operation: "releaseResult", handle });
+  },
+  pingcoreWebFileReferenceRelease(handle) {
+    calls.push({ operation: "releaseFileReference", handle });
+  },
+  pingcoreWebFileReferenceRetain(handle) {
+    calls.push({ operation: "retainFileReference", handle });
+    return handle + 1000;
+  },
+};
+
+require(path.resolve(runtimePath));
+
+const Payload = Module.PingCore.PlatformPayload;
+assert.throws(
+  () => Payload.decode(new Uint8Array([72, 85, 88, 80, 1, 0, 0, 0, 10, 3, 0, 0, 0, 0])),
+  /does not support BufferReference/
+);
+const FileReference = Module.PingCore.FileReference;
+
+const payload = Payload.object({
+  boolean: Payload.booleanValue(true),
+  bytes: Payload.bytes(new Uint8Array([1, 2, 3])),
+  double: Payload.doubleValue(-12.5),
+  integer: Payload.int64(-(1n << 63n)),
+  list: Payload.list([Payload.nullValue(), Payload.string("value")]),
+});
+const decoded = Payload.decode(payload.encode());
+
+assert.equal(decoded.kind, Payload.Kind.OBJECT);
+assert.equal(decoded.requireField("boolean").requireBoolean(), true);
+assert.deepEqual(decoded.requireField("bytes").requireBytes(), new Uint8Array([1, 2, 3]));
+assert.equal(decoded.requireField("double").requireDouble(), -12.5);
+assert.equal(decoded.requireField("integer").requireInt64(), -(1n << 63n));
+assert.equal(decoded.requireField("list").element(1).requireString(), "value");
+assert.deepEqual(
+  Payload.object({ second: Payload.int64(2n), first: Payload.int64(1n) }).encode(),
+  Payload.object({ first: Payload.int64(1n), second: Payload.int64(2n) }).encode(),
+);
+
+const copiedBytes = decoded.requireField("bytes").requireBytes();
+copiedBytes[0] = 9;
+assert.deepEqual(decoded.requireField("bytes").requireBytes(), new Uint8Array([1, 2, 3]));
+const copiedFields = decoded.fields();
+copiedFields.clear();
+assert.equal(decoded.requireField("boolean").requireBoolean(), true);
+assert(Object.isFrozen(decoded));
+assert(Object.isFrozen(Payload.prototype));
+assert.throws(() => Payload.int64(1), /signed 64-bit bigint/);
+assert.throws(() => Payload.doubleValue(Number.POSITIVE_INFINITY), /finite number/);
+assert.throws(() => Payload.object(new Date()), /Map or plain object/);
+assert.throws(() => Payload.list([Object.create(Payload.prototype)]), /requires a PlatformPayload value/);
+assert.throws(() => Payload.decode(payload.encode().subarray(0, 7)), /truncated input/);
+assert.throws(() => decoded.requireField("missing"), /\$\.missing/);
+
+const events = Module.pingcoreWebPlatformBridge.createEvents(41);
+assert.equal(events.emit("changed", Payload.string("next")), undefined);
+assert.equal(events.emit("decision", Payload.booleanValue(true)).requireBoolean(), true);
+assert.throws(() => events.emit("invalid", Payload.nullValue()), /invalid payload/);
+events.close();
+events.close();
+assert.equal(calls[0].operation, "emit");
+assert.equal(calls[0].payload.requireString(), "next");
+assert.deepEqual(calls.at(-1), { operation: "releaseEvent", handle: 41 });
+
+const completion = Module.pingcoreWebPlatformBridge.createResult(42);
+completion.complete(Payload.int64(7n));
+completion.complete(Payload.int64(8n));
+completion.close();
+const completed = calls.find((call) => call.operation === "complete");
+assert.equal(completed.payload.requireInt64(), 7n);
+
+const failure = Module.pingcoreWebPlatformBridge.createResult(43);
+failure.fail("example/error", "failed", Payload.string("details"));
+failure.close();
+const failed = calls.find((call) => call.operation === "fail");
+assert.equal(failed.details.requireString(), "details");
+
+const abandoned = Module.pingcoreWebPlatformBridge.createResult(44);
+abandoned.close();
+abandoned.close();
+assert.deepEqual(calls.find((call) => call.operation === "releaseResult"), { operation: "releaseResult", handle: 44 });
+
+async function testFileReferencePayload() {
+  const bridge = Module.pingcoreWebPlatformBridge;
+  const nativeFile = { name: "clip.mp4" };
+  const source = { file: nativeFile, handle: null };
+  const reference = bridge.createFileReference(51, 61, source, true);
+  assert(reference instanceof FileReference);
+  assert.equal(await reference.getFile(), nativeFile);
+
+  const referencePayload = Payload.fileReference(reference);
+  assert.equal(referencePayload.kind, Payload.Kind.FILE_REFERENCE);
+  assert.equal(referencePayload.requireFileReference(), reference);
+  assert.throws(() => referencePayload.encode(), /platform bridge envelope/);
+
+  const envelope = bridge.encodeEnvelope(Payload.list([referencePayload, referencePayload]));
+  assert.equal(envelope.fileReferences.length, 1);
+  const roundTrip = bridge.decodeEnvelope(envelope.bytes, envelope.fileReferences);
+  assert.equal(roundTrip.element(0).requireFileReference(), reference);
+  assert.throws(() => bridge.decodeEnvelope(envelope.bytes, [reference, reference]), /table is invalid/);
+
+  reference.close();
+  reference.close();
+  assert.deepEqual(calls.find((call) => call.operation === "releaseFileReference"), {
+    operation: "releaseFileReference",
+    handle: 51,
+  });
+  await assert.rejects(referencePayload.requireFileReference().getFile(), /closed/);
+}
+
+testFileReferencePayload()
+  .then(() => console.log("PingCore Web PlatformRegistry tests passed"))
+  .catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });

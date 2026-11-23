@@ -1,0 +1,87 @@
+#pragma once
+
+#include <filesystem>
+#include <iosfwd>
+#include <optional>
+#include <string>
+#include <string_view>
+
+namespace pingcore::cli {
+
+/// Identifies incremental output by the normalized framework location.
+std::string BuildHomeKey(const std::filesystem::path& home);
+
+/// Checks whether a directory contains the PingCore source layout required for application builds.
+bool IsSourceHome(const std::filesystem::path& path);
+
+/// Resolves an explicit SDK installation or source checkout, or validates the default installed SDK.
+std::filesystem::path ResolveBuildHome(const std::filesystem::path& sdk_home,
+    const std::optional<std::filesystem::path>& sdk_override, const std::filesystem::path& working_directory);
+
+/// Identifies how the CLI located the active PingCore SDK.
+enum class SdkLocationSource {
+  /// No usable SDK was found.
+  Missing,
+  /// `PINGCORE_HOME` selected the SDK.
+  Environment,
+  /// The CLI executable's installed layout selected the SDK.
+  Executable,
+};
+
+/// Resolved SDK location and its source of truth.
+struct SdkLocation {
+  /// SDK prefix containing public headers, CMake metadata, tools, and platform artifacts.
+  std::filesystem::path home;
+  /// Mechanism that selected `home`.
+  SdkLocationSource source = SdkLocationSource::Missing;
+};
+
+/// Resolves the running CLI executable path.
+/// @param argument_zero Value received as the process `argv[0]`.
+/// @return An absolute, normalized executable path when the host can resolve it.
+std::filesystem::path ExecutablePath(std::string_view argument_zero);
+
+/// Locates the configured PingCore SDK candidate without validating a build selection.
+///
+/// A defined `PINGCORE_HOME` is authoritative. Otherwise the function inspects the installed layout surrounding the CLI
+/// executable.
+///
+/// @param executable_path Resolved CLI executable path.
+/// @return The configured location, or source `Missing` when no SDK is available.
+/// Environment selections are validated by the consuming command so --sdk can override an invalid SDK path.
+SdkLocation LocatePingCoreHome(const std::filesystem::path& executable_path);
+
+/// Rejects source checkouts, missing installations, and a CLI belonging to another SDK.
+/// @param sdk Selected SDK location.
+/// @param executable_path Running CLI executable, resolved independently of PINGCORE_HOME.
+/// @throws std::runtime_error if SDK management cannot identify the current installation.
+void ValidateManagedSdk(const SdkLocation& sdk, const std::filesystem::path& executable_path);
+
+/// Runs an SDK management command through the embedded installer.
+/// @param sdk Installed SDK selected by the running CLI.
+/// @param command Validated `list`, `use`, or `update` command.
+/// @param target_version Explicit release version for `use`.
+/// @param check_only Query the latest release without selecting an SDK.
+/// @param assume_yes Skip the installer's interactive confirmation.
+/// @param output CLI stream to flush before the installer inherits standard streams.
+/// @return Installer exit code.
+int RunSdkInstaller(const SdkLocation& sdk, std::string_view command, std::string_view target_version,
+    bool check_only, bool assume_yes, std::ostream& output);
+
+/// Locates the canonical application-development Skill in an SDK or source checkout.
+/// @param pingcore_home SDK prefix or repository root.
+/// @return Path to the `pingcore-app-development` Skill directory.
+/// @throws std::runtime_error if the SDK layout is invalid or the Skill is absent.
+std::filesystem::path ResolveApplicationDevelopmentSkill(const std::filesystem::path& pingcore_home);
+
+/// True when `pingcore_home` is a PingCore source checkout that is also an mcpp
+/// package, and can therefore be named by path rather than by published version.
+/// @param pingcore_home Resolved SDK home, which may be empty.
+bool IsMcppSourcePackage(const std::filesystem::path& pingcore_home);
+
+/// Returns the stable diagnostic name for an SDK location source.
+/// @param source Source value to name.
+/// @return `"missing"`, `"environment"`, or `"executable"`.
+std::string_view SdkLocationSourceName(SdkLocationSource source) noexcept;
+
+} // namespace pingcore::cli

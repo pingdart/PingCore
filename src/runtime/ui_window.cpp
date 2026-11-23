@@ -1,0 +1,4106 @@
+#include "ui_window_internal.h"
+#include "transition_internal.h"
+#include "internal_access.h"
+#include "text/text_internal.h"
+#include "application/application_internal.h"
+#include "application/platform_registry_internal.h"
+#include "graphics/external_texture_internal.h"
+#include "resources/resource_internal.h"
+#include "runtime_pointer_internal.h"
+#include "runtime_text_internal.h"
+#include "application/system_tray_internal.h"
+#include "task_internal.h"
+#include "text/text_input_internal.h"
+#include "application/window_internal.h"
+#include "profiling_internal.h"
+#include "macros_internal.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <exception>
+#include <new>
+#include <stdexcept>
+#include <utility>
+
+#include <pingcore/file.h>
+#include <pingcore/http.h>
+#include <pingcore/theme.h>
+
+namespace pingcore::detail {
+
+namespace {
+
+class CompositionFailure final : public std::exception {
+public:
+  explicit CompositionFailure(std::string report) : report_(std::move(report)) {}
+
+  const char* what() const noexcept override { return report_.c_str(); }
+
+private:
+  std::string report_;
+};
+
+std::string DescribeCompositionFailure(bool initial, const char* operation, std::optional<std::size_t> item,
+                                       const char* message) {
+  std::string report = initial ? "PingCore initial composition failed in " : "PingCore recomposition failed in ";
+  report += operation;
+  if (item) {
+    report += " " + std::to_string(*item);
+  }
+  report += ": ";
+
+  if (message == nullptr || *message == '\0') {
+    report += "No exception message is available.";
+    return report;
+  }
+  constexpr std::size_t message_limit = 1024;
+  std::size_t length = 0;
+  while (length < message_limit && message[length] != '\0') {
+    ++length;
+  }
+  const bool truncated = length == message_limit && message[length] != '\0';
+  if (truncated) {
+    while (length > 0 && (static_cast<unsigned char>(message[length]) & 0xC0U) == 0x80U) {
+      --length;
+    }
+  }
+  const std::string_view text(message, length);
+  if (!IsValidUtf8(text)) {
+    report += "The exception message contains invalid UTF-8.";
+    return report;
+  }
+  for (const unsigned char character : text) {
+    report += character < 0x20U || character == 0x7FU ? ' ' : static_cast<char>(character);
+  }
+  if (truncated) {
+    report += "...";
+  }
+  return report;
+}
+
+AttributedText CompositionErrorDetails(std::string details) {
+  constexpr std::string_view state_slot_prefix = ": PingCore state kind or value type changed at ";
+  const std::size_t prefix = details.find(state_slot_prefix);
+  const std::size_t end = details.rfind(" (occurrence ");
+  if (prefix == std::string::npos || end == std::string::npos ||
+      end <= prefix + state_slot_prefix.size() || !details.ends_with(')')) {
+    return AttributedText(std::move(details));
+  }
+
+  const std::size_t start = prefix + state_slot_prefix.size();
+  return AttributedText{
+      TextSpan(details.substr(0, start)),
+      TextSpan(details.substr(start, end - start)).Style({
+          .foreground = Color::Rgb(166, 230, 255),
+          .decoration = TextDecoration::Underline,
+      }),
+      TextSpan(details.substr(end)),
+  };
+}
+
+View CompositionErrorPage(std::string details) {
+  const TextStyle title{.font = Font::System(24.0F).WithWeight(FontWeight::Bold), .foreground = Color::White()};
+  const TextStyle body{.font = Font::System(15.0F), .foreground = Color::Rgb(255, 235, 238)};
+  std::vector<View> content{
+    Text("Unable to display this window").Style(title).Shaping({.locale = "und"}),
+    Text("Close and reopen this window to try again.").Style(body).Shaping({.locale = "und"}),
+  };
+  if (!details.empty()) {
+    content.push_back(Text(CompositionErrorDetails(std::move(details))).Style(body).Shaping({.locale = "und"}));
+  }
+  return Column {
+    WindowTitleBar{},
+    ScrollView(Column(std::move(content)).With(Padding(24.0F), Spacing(10.0F))).With(Grow(1.0F)),
+  }.With(
+      Align(HorizontalAlignment::Stretch, VerticalAlignment::Stretch),
+      CrossAlign(CrossAxisAlignment::Stretch),
+      Background(Color::Rgb(159, 27, 46)),
+      SafeAreaPadding{}
+  );
+}
+
+int LayerLevelRank(LayerLevel level) noexcept {
+  switch (level) {
+  case LayerLevel::Presentation:
+    return 0;
+  case LayerLevel::Notification:
+    return 1;
+  case LayerLevel::System:
+    return 2;
+  }
+  return 0;
+}
+
+bool LayerPaintsAbove(const LayerEntry& candidate, const LayerEntry& current) noexcept {
+  const int candidate_level = LayerLevelRank(candidate.options.level);
+  const int current_level = LayerLevelRank(current.options.level);
+  return candidate_level != current_level ? candidate_level > current_level : candidate.sequence > current.sequence;
+}
+
+bool IsModifierKey(Key key) noexcept {
+  return key == Key::ShiftLeft || key == Key::ShiftRight || key == Key::ControlLeft || key == Key::ControlRight ||
+         key == Key::AltLeft || key == Key::AltRight || key == Key::MetaLeft || key == Key::MetaRight;
+}
+
+bool BuildNodeRoute(MountedNode& node, std::uint64_t identity, std::vector<MountedNode*>& route) {
+  route.push_back(&node);
+  if (node.identity == identity) {
+    return true;
+  }
+  for (const std::unique_ptr<MountedNode>& child : node.children) {
+    if (BuildNodeRoute(*child, identity, route)) {
+      return true;
+    }
+  }
+  route.pop_back();
+  return false;
+}
+
+void ValidateViewportBreakpoints(const ViewportBreakpoints& breakpoints) {
+  if (!std::isfinite(breakpoints.medium_width) || breakpoints.medium_width <= 0.0F ||
+      !std::isfinite(breakpoints.expanded_width) || breakpoints.expanded_width <= breakpoints.medium_width) {
+    throw std::invalid_argument("PingCore viewport breakpoints must be finite, positive, and increasing");
+  }
+}
+
+ViewportClass ResolveViewportClass(float width, const ViewportBreakpoints& breakpoints) noexcept {
+  if (width >= breakpoints.expanded_width) {
+    return ViewportClass::Expanded;
+  }
+  if (width >= breakpoints.medium_width) {
+    return ViewportClass::Medium;
+  }
+  return ViewportClass::Compact;
+}
+
+std::vector<LayerEntry> OrderedLayerEntries(const std::vector<LayerEntry>& entries) {
+  std::vector<LayerEntry> ordered = entries;
+  std::stable_sort(ordered.begin(), ordered.end(), [](const LayerEntry& left, const LayerEntry& right) {
+    return LayerPaintsAbove(right, left);
+  });
+  return ordered;
+}
+
+class RuntimeRootLayout final : public pingcore::Layout<RuntimeRootLayout> {
+public:
+  using Layout::Layout;
+
+  static LayoutResult Measure(LayoutContext& context, pingcore::ViewNode& node, Constraints constraints) {
+    LayoutResult result;
+    for (pingcore::ViewNode& child : node.Children()) {
+      context.Measure(child, constraints);
+      result.Place(child, {});
+    }
+    result.SetSize(constraints.Constrain({
+        constraints.max_width,
+        constraints.max_height,
+    }));
+    return result;
+  }
+};
+
+class ApplicationContentLayout final : public pingcore::Layout<ApplicationContentLayout> {
+public:
+  using Layout::Layout;
+
+  static LayoutResult Measure(LayoutContext& context, pingcore::ViewNode& node, Constraints constraints) {
+    LayoutResult result;
+    if (node.ChildCount() > 1) {
+      throw std::logic_error("PingCore application content container must not contain multiple roots");
+    }
+    if (node.ChildCount() == 1) {
+      context.Measure(node.ChildAt(0), constraints);
+      result.Place(node.ChildAt(0), {});
+    }
+    return result.SetSize(constraints.Constrain({constraints.max_width, constraints.max_height}));
+  }
+};
+
+struct WindowBackplaneValue {
+  using Value = bool;
+};
+
+class LayerStackLayout final : public pingcore::Layout<LayerStackLayout> {
+public:
+  using Layout::Layout;
+
+  static LayoutResult Measure(LayoutContext& context, pingcore::ViewNode& node, Constraints constraints) {
+    LayoutResult result;
+    for (pingcore::ViewNode& child : node.Children()) {
+      context.Measure(child, constraints);
+      result.Place(child, {});
+    }
+    result.SetSize(constraints.Constrain({
+        constraints.max_width,
+        constraints.max_height,
+    }));
+    return result;
+  }
+};
+
+struct LayerTransition {
+  std::shared_ptr<LayerTransitionState> state;
+
+  static const ModifierDescriptor& Descriptor();
+};
+
+class LayerTransitionExtension final : public NodeExtension {
+public:
+  LayerTransitionExtension(pingcore::ViewNode& node, const LayerTransition& modifier) {
+    Update(node, modifier);
+  }
+
+  void Update(pingcore::ViewNode&, const LayerTransition& modifier) {
+    if (state_ == modifier.state) {
+      return;
+    }
+    state_ = modifier.state;
+    initialized_ = false;
+    completion_sent_ = false;
+  }
+
+  FrameResult OnFrame(pingcore::ViewNode& node, const FrameInfo& frame) override {
+    if (!state_) {
+      return {};
+    }
+    if (!initialized_) {
+      if (state_->target_visible && state_->enter_on_mount) {
+        opacity_.Set(state_->hidden_opacity);
+        target_visible_ = false;
+      } else {
+        opacity_.Set(1.0F);
+        target_visible_ = true;
+      }
+      initialized_ = true;
+    }
+    if (target_visible_ != state_->target_visible) {
+      target_visible_ = state_->target_visible;
+      opacity_.AnimateTo(
+          target_visible_ ? 1.0F : state_->hidden_opacity,
+          target_visible_ ? state_->enter : state_->exit
+      );
+      if (target_visible_) {
+        completion_sent_ = false;
+      }
+    }
+
+    auto& mounted = static_cast<MountedNode&>(node);
+    const MotionAdvanceResult result = opacity_.Advance(frame);
+    mounted.presentation.local_opacity *= opacity_.Value();
+    if (!result.needs_frame && !result.wake_after.has_value() && target_visible_) {
+      state_->enter_on_mount = false;
+    }
+    if (!result.needs_frame && !result.wake_after.has_value() && !target_visible_ && !completion_sent_) {
+      completion_sent_ = true;
+      if (state_->on_exit_complete) {
+        state_->on_exit_complete();
+      }
+    }
+    return {result.needs_frame, result.wake_after};
+  }
+
+private:
+  std::shared_ptr<LayerTransitionState> state_;
+  MotionController opacity_;
+  bool initialized_ = false;
+  bool target_visible_ = false;
+  bool completion_sent_ = false;
+};
+
+const ModifierDescriptor& LayerTransition::Descriptor() {
+  return ModifierDescriptorFor<LayerTransition, LayerTransitionExtension>();
+}
+
+bool IsLayerStack(const MountedNode& node) {
+  return node.layout_descriptor != nullptr && node.layout_descriptor->type == typeid(LayerStackLayout);
+}
+
+Color CompositeOver(Color foreground, Color background) noexcept {
+  const float foreground_alpha = std::clamp(foreground.alpha, 0.0F, 1.0F);
+  const float background_alpha = std::clamp(background.alpha, 0.0F, 1.0F);
+  const float alpha = foreground_alpha + background_alpha * (1.0F - foreground_alpha);
+  if (alpha <= 0.0F) {
+    return Color::Transparent();
+  }
+  return {
+      (foreground.red * foreground_alpha + background.red * background_alpha * (1.0F - foreground_alpha)) / alpha,
+      (foreground.green * foreground_alpha + background.green * background_alpha * (1.0F - foreground_alpha)) / alpha,
+      (foreground.blue * foreground_alpha + background.blue * background_alpha * (1.0F - foreground_alpha)) / alpha,
+      alpha,
+  };
+}
+
+float LinearColorChannel(float value) noexcept {
+  value = std::clamp(value, 0.0F, 1.0F);
+  return value <= 0.04045F ? value / 12.92F : std::pow((value + 0.055F) / 1.055F, 2.4F);
+}
+
+SystemBarContentBrightness ResolveBrightness(SystemBarContentBrightness configured, Color background) noexcept {
+  if (configured != SystemBarContentBrightness::Automatic) {
+    return configured;
+  }
+  const float luminance = 0.2126F * LinearColorChannel(background.red) +
+                          0.7152F * LinearColorChannel(background.green) +
+                          0.0722F * LinearColorChannel(background.blue);
+  return luminance > 0.45F ? SystemBarContentBrightness::Dark : SystemBarContentBrightness::Light;
+}
+
+Color ResolveCaptionForeground(Color background) noexcept {
+  return ResolveBrightness(SystemBarContentBrightness::Automatic, background) == SystemBarContentBrightness::Dark
+             ? Color::Rgb(32, 32, 32)
+             : Color::Rgb(245, 245, 245);
+}
+
+void CollectWindowDragRegionBackground(
+    const MountedNode& node, Color inherited_background, float title_bar_height, std::optional<Color>& candidate
+) {
+  if (!node.participates_in_layout) {
+    return;
+  }
+  Color background = inherited_background;
+  if (node.properties.background.has_value()) {
+    if (const Brush* brush = std::get_if<Brush>(&node.properties.background->Get())) {
+      if (const Color* color = std::get_if<Color>(&brush->Get())) {
+        background = CompositeOver(*color, inherited_background);
+      }
+    }
+  }
+  if (node.properties.window_drag_region && node.presentation.resolved_opacity > 0.001F) {
+    const Rect bounds = node.PresentationBounds();
+    if (bounds.y < title_bar_height && bounds.y + bounds.height > 0.0F) {
+      candidate = background;
+    }
+  }
+  for (const auto& child : node.children) {
+    if (child) {
+      CollectWindowDragRegionBackground(*child, background, title_bar_height, candidate);
+    }
+  }
+}
+
+void MarkContentPaintDirtyTree(MountedNode& node) {
+  node.content_paint_dirty = true;
+  for (auto& child : node.children) {
+    if (child) {
+      MarkContentPaintDirtyTree(*child);
+    }
+  }
+}
+
+#if defined(__EMSCRIPTEN__) || (defined(__linux__) && !defined(__ANDROID__))
+void MarkTextMetricsDirtyTree(MountedNode& node) {
+  node.measure_dirty = true;
+  node.layout_dirty = true;
+  node.content_paint_dirty = true;
+  node.foreground_paint_dirty = true;
+  node.cached_paragraph_layout.reset();
+  for (auto& child : node.children) {
+    if (child) MarkTextMetricsDirtyTree(*child);
+  }
+}
+#endif
+
+const SystemBarsAppearance* FindSystemBarsAppearance(const MountedNode& node) {
+  const std::any* value = FindEnvironmentValue(node.environment, typeid(SystemBarsAppearance));
+  if (!value) {
+    return nullptr;
+  }
+  const auto* appearance = std::any_cast<SystemBarsAppearance>(value);
+  if (!appearance) {
+    throw std::logic_error("PingCore system bars appearance environment value has an invalid type");
+  }
+  return appearance;
+}
+
+const SystemBarsAppearance* FindApplicationSystemBarsFallback(const MountedNode& node) {
+  if (!node.participates_in_layout) {
+    return nullptr;
+  }
+  if (const SystemBarsAppearance* appearance = FindSystemBarsAppearance(node)) {
+    return appearance;
+  }
+  for (const auto& child : node.children) {
+    if (child) {
+      if (const SystemBarsAppearance* appearance = FindApplicationSystemBarsFallback(*child)) {
+        return appearance;
+      }
+    }
+  }
+  return nullptr;
+}
+
+struct SystemBarCandidates {
+  std::optional<SystemBarsAppearance> status;
+  std::optional<SystemBarsAppearance> navigation;
+};
+
+void CollectSystemBarCandidates(
+    const MountedNode& node, float status_boundary, float navigation_boundary, SystemBarCandidates& candidates
+) {
+  if (!node.participates_in_layout) {
+    return;
+  }
+  if (node.presentation.resolved_opacity > 0.001F && node.properties.system_bars_appearance.has_value()) {
+    const Rect bounds = node.PresentationBounds();
+    const SystemBarsAppearance& appearance = *node.properties.system_bars_appearance;
+    if (appearance.status_bar_background.alpha > 0.0F && bounds.y <= status_boundary + 0.5F &&
+        bounds.y + bounds.height > status_boundary) {
+      candidates.status = appearance;
+    }
+    if (appearance.navigation_bar_background.alpha > 0.0F && bounds.y < navigation_boundary &&
+        bounds.y + bounds.height >= navigation_boundary - 0.5F) {
+      candidates.navigation = appearance;
+    }
+  }
+  for (const auto& child : node.children) {
+    if (child) {
+      CollectSystemBarCandidates(*child, status_boundary, navigation_boundary, candidates);
+    }
+  }
+}
+
+void ValidateWindowMetrics(const WindowMetrics& metrics) {
+  const bool viewport_valid = std::isfinite(metrics.viewport.width) && metrics.viewport.width >= 0.0F &&
+                              std::isfinite(metrics.viewport.height) && metrics.viewport.height >= 0.0F;
+  const bool safe_area_valid = std::isfinite(metrics.safe_area.top) && metrics.safe_area.top >= 0.0F &&
+                               std::isfinite(metrics.safe_area.right) && metrics.safe_area.right >= 0.0F &&
+                               std::isfinite(metrics.safe_area.bottom) && metrics.safe_area.bottom >= 0.0F &&
+                               std::isfinite(metrics.safe_area.left) && metrics.safe_area.left >= 0.0F;
+  bool title_bar_valid = true;
+  if (metrics.title_bar.has_value()) {
+    const WindowTitleBarMetrics& title_bar = *metrics.title_bar;
+    title_bar_valid =
+        std::isfinite(title_bar.height) && title_bar.height >= 0.0F && title_bar.height <= metrics.viewport.height &&
+        std::isfinite(title_bar.left_inset) && title_bar.left_inset >= 0.0F && std::isfinite(title_bar.right_inset) &&
+        title_bar.right_inset >= 0.0F && title_bar.left_inset + title_bar.right_inset <= metrics.viewport.width;
+  }
+  if (!viewport_valid || !safe_area_valid || !title_bar_valid) {
+    throw std::invalid_argument("PingCore window metrics must contain finite, non-negative values");
+  }
+}
+
+bool HasWindowControlGeometry(const WindowMetrics& metrics) noexcept {
+  return metrics.title_bar.has_value() && metrics.title_bar->height > 0.0F &&
+         metrics.title_bar->right_inset > 0.0F;
+}
+
+bool IsWindowBackplane(const MountedNode& node) {
+  return node.LayoutValueOr<WindowBackplaneValue>(false);
+}
+
+bool IsApplicationContent(const MountedNode& node) {
+  return node.layout_descriptor != nullptr && node.layout_descriptor->type == typeid(ApplicationContentLayout);
+}
+
+MountedNode* FindLayerStack(MountedNode& root) {
+  const auto found =
+      std::ranges::find_if(root.children, [](const auto& child) { return child && IsLayerStack(*child); });
+  return found == root.children.end() ? nullptr : found->get();
+}
+
+MountedNode* FindWindowBackplane(MountedNode& root) {
+  const auto found =
+      std::ranges::find_if(root.children, [](const auto& child) { return child && IsWindowBackplane(*child); });
+  return found == root.children.end() ? nullptr : found->get();
+}
+
+MountedNode* FindApplicationContent(MountedNode& root) {
+  const auto found =
+      std::ranges::find_if(root.children, [](const auto& child) { return child && IsApplicationContent(*child); });
+  return found == root.children.end() ? nullptr : found->get();
+}
+
+MountedNode* FindWindowControls(MountedNode& root) {
+  const auto found =
+      std::ranges::find_if(root.children, [](const auto& child) { return child && IsWindowControlsNode(*child); });
+  return found == root.children.end() ? nullptr : found->get();
+}
+
+MountedNode* FindApplicationRoot(MountedNode& root) {
+  MountedNode* content = FindApplicationContent(root);
+  return content == nullptr || content->children.empty() ? nullptr : content->children.front().get();
+}
+
+MountedNode* FindLayerEntryNode(MountedNode& root, LayerId id) {
+  MountedNode* layer_stack = FindLayerStack(root);
+  if (!layer_stack) {
+    return nullptr;
+  }
+  const auto found = std::ranges::find_if(layer_stack->children, [id](const auto& child) {
+    if (!child) {
+      return false;
+    }
+    const auto* snapshot = child->template LayoutValue<LayerEntrySnapshotValue>();
+    return snapshot != nullptr && snapshot->id == id;
+  });
+  return found == layer_stack->children.end() ? nullptr : found->get();
+}
+
+class LayerEntryLayout final : public pingcore::Layout<LayerEntryLayout> {
+public:
+  using Layout::Layout;
+
+  static LayoutResult Measure(LayoutContext& context, pingcore::ViewNode& node, Constraints constraints) {
+    LayoutResult result;
+    if (node.ChildCount() == 0) {
+      result.SetSize(constraints.Constrain({constraints.max_width, constraints.max_height}));
+      return result;
+    }
+
+    pingcore::ViewNode& child = node.ChildAt(0);
+    const auto* placement_value = node.LayoutValue<LayerPlacementValue>();
+    const LayerPlacement fallback;
+    const LayerPlacement& placement = placement_value && *placement_value ? **placement_value : fallback;
+    const float viewport_width = constraints.max_width;
+    const float viewport_height = constraints.max_height;
+    const Constraints loose = constraints.Loose();
+    const float horizontal_margin =
+        std::min(std::max(0.0F, placement.viewport_margin), std::max(0.0F, viewport_width * 0.5F));
+    const float vertical_margin =
+        std::min(std::max(0.0F, placement.viewport_margin), std::max(0.0F, viewport_height * 0.5F));
+    const Constraints inset_constraints{
+        0.0F,
+        std::max(0.0F, viewport_width - horizontal_margin * 2.0F),
+        0.0F,
+        std::max(0.0F, viewport_height - vertical_margin * 2.0F),
+    };
+
+    Size child_size;
+    Point child_offset;
+    switch (placement.kind) {
+    case LayerPlacementKind::Natural:
+      child_size = context.Measure(child, loose);
+      break;
+    case LayerPlacementKind::Fill:
+      child_size = context.Measure(child, constraints);
+      break;
+    case LayerPlacementKind::Center:
+      child_size = context.Measure(child, inset_constraints);
+      child_offset = {
+          (viewport_width - child_size.width) * 0.5F,
+          (viewport_height - child_size.height) * 0.5F,
+      };
+      break;
+    case LayerPlacementKind::TopCenter:
+      child_size = context.Measure(child, inset_constraints);
+      child_offset = {
+          (viewport_width - child_size.width) * 0.5F,
+          vertical_margin,
+      };
+      break;
+    case LayerPlacementKind::BottomCenter:
+      if (placement.fill_cross_axis) {
+        const float available = std::max(0.0F, viewport_width - horizontal_margin * 2.0F);
+        const float width = std::min(available, std::max(0.0F, placement.maximum_cross_axis_extent));
+        child_size = context.Measure(
+            child,
+            Constraints{width, width, 0.0F, std::max(0.0F, viewport_height - vertical_margin * 2.0F)}
+        );
+      } else {
+        child_size = context.Measure(child, inset_constraints);
+      }
+      child_offset = {
+          (viewport_width - child_size.width) * 0.5F,
+          viewport_height - vertical_margin - child_size.height,
+      };
+      break;
+    case LayerPlacementKind::Positioned: {
+      child_size = context.Measure(child, loose);
+      // LayoutNode adds the safe-area padding back after placing the child.
+      const EdgeInsets layer_padding = static_cast<detail::MountedNode&>(node).resolved_padding;
+      child_offset = {
+          placement.anchor.x - layer_padding.left + placement.offset.x,
+          placement.anchor.y - layer_padding.top + placement.offset.y,
+      };
+      break;
+    }
+    case LayerPlacementKind::Anchored: {
+      // Layer anchors are captured in host-view coordinates. Safe-area padding establishes this layout's local
+      // coordinate space, so subtract only the padding that LayoutNode adds back after placement.
+      child_size = context.Measure(child, inset_constraints);
+      LayerAnchorSide side = placement.preferred_side;
+      Rect anchor = placement.anchor;
+      const EdgeInsets layer_padding = static_cast<detail::MountedNode&>(node).resolved_padding;
+      anchor.x -= layer_padding.left;
+      anchor.y -= layer_padding.top;
+      const float anchor_right = anchor.x + anchor.width;
+      const float anchor_bottom = anchor.y + anchor.height;
+      const float gap = std::max(0.0F, placement.gap);
+      const float below = viewport_height - vertical_margin - anchor_bottom - gap;
+      const float above = anchor.y - vertical_margin - gap;
+      const float right = viewport_width - horizontal_margin - anchor_right - gap;
+      const float left = anchor.x - horizontal_margin - gap;
+      if (side == LayerAnchorSide::Below && child_size.height > below && above > below) {
+        side = LayerAnchorSide::Above;
+      } else if (side == LayerAnchorSide::Above && child_size.height > above && below > above) {
+        side = LayerAnchorSide::Below;
+      } else if (side == LayerAnchorSide::Right && child_size.width > right && left > right) {
+        side = LayerAnchorSide::Left;
+      } else if (side == LayerAnchorSide::Left && child_size.width > left && right > left) {
+        side = LayerAnchorSide::Right;
+      }
+
+      switch (side) {
+      case LayerAnchorSide::Below:
+        child_offset.y = anchor_bottom + gap;
+        break;
+      case LayerAnchorSide::Above:
+        child_offset.y = anchor.y - child_size.height - gap;
+        break;
+      case LayerAnchorSide::Right:
+        child_offset.x = anchor_right + gap;
+        break;
+      case LayerAnchorSide::Left:
+        child_offset.x = anchor.x - child_size.width - gap;
+        break;
+      }
+      if (side == LayerAnchorSide::Below || side == LayerAnchorSide::Above) {
+        switch (placement.alignment) {
+        case LayerAnchorAlignment::Start:
+          child_offset.x = anchor.x;
+          break;
+        case LayerAnchorAlignment::Center:
+          child_offset.x = anchor.x + (anchor.width - child_size.width) * 0.5F;
+          break;
+        case LayerAnchorAlignment::End:
+          child_offset.x = anchor_right - child_size.width;
+          break;
+        }
+      } else {
+        switch (placement.alignment) {
+        case LayerAnchorAlignment::Start:
+          child_offset.y = anchor.y;
+          break;
+        case LayerAnchorAlignment::Center:
+          child_offset.y = anchor.y + (anchor.height - child_size.height) * 0.5F;
+          break;
+        case LayerAnchorAlignment::End:
+          child_offset.y = anchor_bottom - child_size.height;
+          break;
+        }
+      }
+      child_offset.x += placement.offset.x;
+      child_offset.y += placement.offset.y;
+      child_offset.x = std::clamp(
+          child_offset.x,
+          horizontal_margin,
+          std::max(horizontal_margin, viewport_width - horizontal_margin - child_size.width)
+      );
+      child_offset.y = std::clamp(
+          child_offset.y,
+          vertical_margin,
+          std::max(vertical_margin, viewport_height - vertical_margin - child_size.height)
+      );
+      break;
+    }
+    }
+    result.Place(child, child_offset);
+    result.SetSize(constraints.Constrain({viewport_width, viewport_height}));
+    return result;
+  }
+};
+
+bool ContainsStateSlots(const VirtualItemState& state) {
+  if (state.state_slots.has_value() && !state.state_slots->slots.empty()) {
+    return true;
+  }
+  return std::ranges::any_of(state.children, ContainsStateSlots);
+}
+
+bool IsCompatibleLayout(const LayoutDescriptor* left, const LayoutDescriptor* right) {
+  if (left == nullptr || right == nullptr) {
+    return left == right;
+  }
+  return left->type == right->type;
+}
+
+bool IsCompatibleVirtualLayout(const VirtualLayoutDescriptor* left, const VirtualLayoutDescriptor* right) {
+  if (left == nullptr || right == nullptr) {
+    return left == right;
+  }
+  return left->type == right->type;
+}
+
+bool IsCompatibleNode(const MountedNode& mounted, const ViewSpec& incoming) {
+  return mounted.kind == incoming.kind && IsCompatibleLayout(mounted.layout_descriptor, incoming.layout_descriptor) &&
+         IsCompatibleVirtualLayout(mounted.virtual_layout_descriptor, incoming.virtual_layout_descriptor) &&
+         (incoming.kind != NodeKind::PlatformView ||
+          (mounted.platform_view && incoming.platform_view &&
+           mounted.platform_view->type == incoming.platform_view->type));
+}
+
+void ValidateEnvironmentDeclaration(const ViewSpec& declaration) {
+  if (!declaration.local_environment) {
+    throw std::logic_error("PingCore Environment node has no declared values");
+  }
+  if (declaration.children.size() != 1 || !declaration.children.front()) {
+    throw std::logic_error("PingCore Environment node must have exactly one child");
+  }
+  if (declaration.scope_factory || !declaration.modifiers.empty() || !declaration.layout_values.empty() ||
+      !declaration.event_bindings.empty() || declaration.activation || declaration.author_semantics.has_value() ||
+      !declaration.pointer_events_enabled || !declaration.local_enabled || declaration.focusable ||
+      declaration.trap_focus) {
+    throw std::logic_error("PingCore Environment node cannot declare view behavior");
+  }
+}
+
+bool IsCompatibleVirtualItemState(const MountedNode& mounted, const VirtualItemState& state) {
+  return mounted.kind == state.kind && IsCompatibleLayout(mounted.layout_descriptor, state.layout_descriptor) &&
+         IsCompatibleVirtualLayout(mounted.virtual_layout_descriptor, state.virtual_layout_descriptor);
+}
+
+bool LayoutValuesEquivalent(
+    const std::unordered_map<std::type_index, ErasedLayoutValue>& left,
+    const std::unordered_map<std::type_index, ErasedLayoutValue>& right
+) {
+  if (left.size() != right.size()) {
+    return false;
+  }
+  return std::ranges::all_of(left, [&right](const auto& entry) {
+    const auto found = right.find(entry.first);
+    return found != right.end() && entry.second.EquivalentForReconciliation(found->second);
+  });
+}
+
+bool ContentPaintInputsEqual(const MountedNode& mounted, const ViewSpec& incoming) {
+  if (incoming.kind == NodeKind::Canvas) {
+    return false;
+  }
+  return TextPaintInputsEqual(mounted.text, mounted.properties.text_style, std::get<AttributedText>(incoming.text),
+                              incoming.properties.text_style) &&
+         mounted.image_properties == incoming.image_properties &&
+         PlatformViewPropertiesEqual(mounted.platform_view, incoming.platform_view) &&
+         PlatformViewControllerEqual(mounted.platform_view, incoming.platform_view) &&
+         mounted.properties.ContentPaintEquals(incoming.properties);
+}
+
+bool ForegroundPaintInputsEqual(const MountedNode& mounted, const ViewSpec& incoming) {
+  return mounted.properties.ForegroundPaintEquals(incoming.properties);
+}
+
+bool LayoutInputsEqual(const MountedNode& mounted, const ViewSpec& incoming) {
+  return TextLayoutInputsEqual(mounted.text, mounted.properties.text_style.font,
+                               std::get<AttributedText>(incoming.text), incoming.properties.text_style.font) &&
+         mounted.image_properties.LayoutEquals(incoming.image_properties) &&
+         mounted.properties.LayoutEquals(incoming.properties) &&
+         LayoutValuesEquivalent(mounted.layout_values, incoming.layout_values);
+}
+
+bool ExtensionNodeInputsEqual(const MountedNode& mounted, const ViewSpec& incoming,
+    const std::shared_ptr<const Environment>& environment) {
+  return mounted.text == std::get<AttributedText>(incoming.text) && mounted.image_properties == incoming.image_properties &&
+         PlatformViewPropertiesEqual(mounted.platform_view, incoming.platform_view) &&
+         mounted.properties == incoming.properties && mounted.component_semantics == incoming.component_semantics &&
+         mounted.author_semantics == incoming.author_semantics &&
+         LayoutValuesEquivalent(mounted.layout_values, incoming.layout_values) &&
+         mounted.event_bindings == incoming.event_bindings && mounted.environment == environment &&
+         mounted.pointer_events_enabled == incoming.pointer_events_enabled &&
+         mounted.local_enabled == incoming.local_enabled && mounted.declared_focusable == incoming.focusable &&
+         mounted.trap_focus == incoming.trap_focus;
+}
+
+// Child structure, virtual sources, and node extensions reconcile separately because they carry mounted state.
+void ApplyViewDeclaration(MountedNode& mounted, ViewSpec& compiled, std::shared_ptr<const Environment> environment) {
+  AttributedText compiled_text = std::get<AttributedText>(std::move(compiled.text));
+  if (!PlatformViewPropertiesEqual(mounted.platform_view, compiled.platform_view)) {
+    ++mounted.platform_view_properties_revision;
+  }
+  if (!PlatformViewControllerEqual(mounted.platform_view, compiled.platform_view)) {
+    ++mounted.platform_view_controller_revision;
+  }
+  mounted.kind = compiled.kind;
+  mounted.key = std::move(compiled.key);
+  mounted.text = std::move(compiled_text);
+  mounted.resolved_border = compiled.properties.border;
+  mounted.resolved_corner_radii = compiled.properties.corner_radii;
+  mounted.properties = std::move(compiled.properties);
+  mounted.foreground_indication = std::move(compiled.foreground_indication);
+  mounted.component_semantics = std::move(compiled.component_semantics);
+  mounted.author_semantics = std::move(compiled.author_semantics);
+  mounted.scope_factory = std::move(compiled.scope_factory);
+#if defined(PINGCORE_ENABLE_PROFILING) && PINGCORE_ENABLE_PROFILING
+  mounted.profile_source = compiled.profile_source;
+#endif
+  mounted.canvas_painter = std::move(compiled.canvas_painter);
+  mounted.image_properties = std::move(compiled.image_properties);
+  mounted.platform_view = std::move(compiled.platform_view);
+  mounted.layout_descriptor = compiled.layout_descriptor;
+  mounted.virtual_layout_descriptor = compiled.virtual_layout_descriptor;
+  mounted.layout_values = std::move(compiled.layout_values);
+  mounted.event_bindings = std::move(compiled.event_bindings);
+  if (!mounted.event_bindings.empty()) {
+    if (const auto context = CurrentExecutionContext()) {
+      mounted.event_bindings.execution_context = std::make_shared<ExecutionContext>(*context);
+      mounted.event_bindings.execution_context->environment = environment;
+    }
+  }
+  mounted.activation = std::move(compiled.activation);
+  mounted.environment = std::move(environment);
+  mounted.reduced_motion = ResolveThemeSpec(mounted.environment).motion.reduced_motion;
+  mounted.pointer_events_enabled = compiled.pointer_events_enabled;
+  mounted.local_enabled = compiled.local_enabled;
+  mounted.declared_focusable = compiled.focusable;
+  if (mounted.view_handle != compiled.view_handle) {
+    if (mounted.view_handle && mounted.view_handle->node_identity == mounted.identity) {
+      mounted.view_handle->node_identity = 0;
+      mounted.view_handle->geometry.reset();
+    }
+    mounted.view_handle = std::move(compiled.view_handle);
+  }
+  mounted.trap_focus = compiled.trap_focus;
+}
+
+bool MarkLayoutDirtyPath(MountedNode& node, std::uint64_t identity) {
+  if (node.identity == identity) {
+    node.measure_dirty = true;
+    return true;
+  }
+  for (auto& child : node.children) {
+    if (child && MarkLayoutDirtyPath(*child, identity)) {
+      node.measure_dirty = true;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool PropagateVirtualLayoutInvalidation(MountedNode& node) {
+  bool subtree_dirty = node.virtual_state && node.virtual_state->viewport_dirty;
+  for (auto& child : node.children) {
+    subtree_dirty = PropagateVirtualLayoutInvalidation(*child) || subtree_dirty;
+  }
+  if (subtree_dirty) {
+    node.measure_dirty = true;
+  }
+  // Retain pending work inside unplaced subtrees until they participate in layout again.
+  return subtree_dirty && node.participates_in_layout;
+}
+
+struct ModifierChanges {
+  bool changed = false;
+  bool layout_changed = false;
+  bool structure_changed = false;
+};
+
+ModifierChanges ReconcileNodeExtensions(
+    MountedNode& mounted, const std::vector<ModifierSpec>& modifiers, bool node_inputs_equal
+) {
+  std::vector<std::unique_ptr<NodeExtension>> created(modifiers.size());
+  std::vector<NodeExtensionEntry> next;
+  next.reserve(modifiers.size());
+  ModifierChanges changes{
+      mounted.extensions.size() != modifiers.size(),
+      false,
+      mounted.extensions.size() != modifiers.size(),
+  };
+  for (std::size_t index = 0; index < modifiers.size(); ++index) {
+    const ModifierSpec& spec = modifiers[index];
+    if (index < mounted.extensions.size() && mounted.extensions[index].descriptor == spec.descriptor) {
+      if (!mounted.extensions[index].extension) {
+        throw std::logic_error("PingCore node extension entry must not be empty");
+      }
+      continue;
+    }
+    changes.changed = true;
+    changes.structure_changed = true;
+    changes.layout_changed =
+        changes.layout_changed || spec.descriptor->layout_affecting ||
+        (index < mounted.extensions.size() && mounted.extensions[index].descriptor->layout_affecting);
+    created[index] = spec.descriptor->create_extension(mounted, spec.value.get());
+    if (!created[index]) {
+      throw std::logic_error("PingCore modifier must create a node extension");
+    }
+  }
+
+  for (std::size_t index = 0; index < modifiers.size(); ++index) {
+    const ModifierSpec& spec = modifiers[index];
+    if (index >= mounted.extensions.size() || mounted.extensions[index].descriptor != spec.descriptor ||
+        spec.descriptor->update_extension == nullptr) {
+      continue;
+    }
+    const bool equal = node_inputs_equal && spec.descriptor->equals != nullptr && mounted.extensions[index].value &&
+                       spec.descriptor->equals(mounted.extensions[index].value.get(), spec.value.get());
+    if (equal) {
+      continue;
+    }
+    changes.changed = true;
+    const bool layout_equal =
+        !spec.descriptor->layout_affecting ||
+        (spec.descriptor->layout_equals != nullptr && mounted.extensions[index].value &&
+         spec.descriptor->layout_equals(mounted.extensions[index].value.get(), spec.value.get()));
+    changes.layout_changed = changes.layout_changed || !layout_equal;
+    spec.descriptor->update_extension(*mounted.extensions[index].extension, mounted, spec.value.get());
+  }
+
+  for (std::size_t index = modifiers.size(); index < mounted.extensions.size(); ++index) {
+    if (mounted.extensions[index].descriptor != nullptr) {
+      changes.layout_changed = changes.layout_changed || mounted.extensions[index].descriptor->layout_affecting;
+    }
+  }
+
+  for (std::size_t index = 0; index < modifiers.size(); ++index) {
+    const ModifierSpec& spec = modifiers[index];
+    if (index < mounted.extensions.size() && mounted.extensions[index].descriptor == spec.descriptor) {
+      next.push_back(std::move(mounted.extensions[index]));
+      next.back().value = spec.value;
+    } else {
+      next.push_back({
+          spec.descriptor,
+          std::move(created[index]),
+          spec.value,
+      });
+    }
+  }
+  mounted.extensions = std::move(next);
+  return changes;
+}
+
+void DispatchScrollActivity(MountedNode& node, const ScrollActivity& activity) {
+  for (NodeExtensionEntry& entry : node.extensions) {
+    if (entry.extension) {
+      entry.extension->OnScrollActivity(node, activity);
+    }
+  }
+}
+
+// Traversal direction lets composite extensions choose their entry item without exposing their structure to UiWindow.
+void DispatchFocusChanged(MountedNode& node, bool focused, bool reverse = false) {
+  for (NodeExtensionEntry& entry : node.extensions) {
+    if (entry.extension) {
+      entry.extension->OnFocusChanged(node, focused, reverse);
+    }
+  }
+  EmitEvent<ViewEvents::FocusChanged>(node.event_bindings, focused);
+}
+
+bool DispatchKey(MountedNode& node, const KeyEvent& event) {
+  for (NodeExtensionEntry& entry : node.extensions) {
+    if (entry.extension && entry.extension->OnKey(node, event)) {
+      return true;
+    }
+  }
+  if (event.type == KeyEventType::Down) {
+    return EmitEvent<ViewEvents::KeyDown>(node.event_bindings, event).value_or(false);
+  }
+  return EmitEvent<ViewEvents::KeyUp>(node.event_bindings, event).value_or(false);
+}
+
+bool RefreshExtensionPresence(MountedNode& node) {
+  if (node.extensions.empty()) {
+    node.presentation.children_clips.clear();
+    node.presentation.children_fragments.clear();
+    node.presentation.z_index = 0;
+    node.presentation.suppress_render = false;
+    node.exclude_input = false;
+    node.presentation.overlay = nullptr;
+  }
+  bool subtree_has_extensions = !node.extensions.empty();
+  for (auto& child : node.children) {
+    subtree_has_extensions = RefreshExtensionPresence(*child) || subtree_has_extensions;
+  }
+  node.subtree_has_extensions = subtree_has_extensions;
+  return subtree_has_extensions;
+}
+
+void PrepareExtensionGeometry(MountedNode& node, TextMeasurer& text_measurer) {
+  if (!node.participates_in_layout) {
+    return;
+  }
+  if (!node.subtree_has_extensions) {
+    if (node.indication_bounds_override.has_value()) {
+      node.indication_bounds_override.reset();
+      node.content_paint_dirty = true;
+      node.foreground_paint_dirty = true;
+    }
+    return;
+  }
+  const std::optional<Rect> previous_indication_bounds = node.indication_bounds_override;
+  node.indication_bounds_override.reset();
+  for (NodeExtensionEntry& entry : node.extensions) {
+    if (!entry.extension) {
+      continue;
+    }
+    switch (entry.extension->PrepareGeometry(node, text_measurer)) {
+    case NodeExtension::PaintInvalidation::None:
+      break;
+    case NodeExtension::PaintInvalidation::Content:
+      node.content_paint_dirty = true;
+      break;
+    case NodeExtension::PaintInvalidation::Foreground:
+      node.foreground_paint_dirty = true;
+      break;
+    case NodeExtension::PaintInvalidation::Both:
+      node.content_paint_dirty = true;
+      node.foreground_paint_dirty = true;
+      break;
+    }
+  }
+  if (node.indication_bounds_override != previous_indication_bounds) {
+    node.content_paint_dirty = true;
+    node.foreground_paint_dirty = true;
+  }
+  for (const std::unique_ptr<MountedNode>& child : node.children) {
+    PrepareExtensionGeometry(*child, text_measurer);
+  }
+}
+
+void ResolveEnabledTree(MountedNode& node, bool parent_enabled) {
+  // Publish targets after reconciliation so replacement and keyed movement cannot overlap previous bindings.
+  if (node.view_handle) {
+    node.PublishViewBinding();
+  }
+  const bool enabled = parent_enabled && node.participates_in_layout && node.local_enabled &&
+      !node.exclude_input;
+  const bool applies_disabled_appearance = parent_enabled && node.participates_in_layout && !node.local_enabled;
+  const bool disabled_appearance_changed = node.applies_disabled_appearance != applies_disabled_appearance;
+  if (disabled_appearance_changed) {
+    node.content_paint_dirty = true;
+    node.foreground_paint_dirty = true;
+    node.resolved_border = applies_disabled_appearance && node.properties.disabled_border.has_value()
+                               ? node.properties.disabled_border
+                               : node.properties.border;
+    node.resolved_corner_radii = node.properties.corner_radii;
+  }
+  node.applies_disabled_appearance = applies_disabled_appearance;
+  if (node.interaction.enabled && !enabled && node.scroll_state) {
+    StopScrollNodeMotion(node);
+  }
+  InteractionState interaction = node.interaction;
+  interaction.enabled = enabled;
+  if (!enabled) {
+    node.active_press_count = 0;
+    interaction.pressed = false;
+    interaction.hovered = false;
+  }
+  UpdateInteraction(node, interaction);
+  for (auto& child : node.children) {
+    ResolveEnabledTree(*child, node.interaction.enabled);
+  }
+}
+
+void ResolveFocusedFlags(MountedNode& node, const std::optional<std::uint64_t>& focused_identity, bool focus_visible) {
+  const bool focused = focused_identity.has_value() && node.identity == *focused_identity;
+  const bool resolved_focus_visible = focused && focus_visible;
+  if (node.interaction.focused != focused || node.interaction.focus_visible != resolved_focus_visible) {
+    node.foreground_paint_dirty = true;
+    InteractionState interaction = node.interaction;
+    interaction.focused = focused;
+    interaction.focus_visible = resolved_focus_visible;
+    UpdateInteraction(node, interaction);
+  }
+  for (auto& child : node.children) {
+    ResolveFocusedFlags(*child, focused_identity, focus_visible);
+  }
+}
+
+bool RevealFocusInTwoAxes(MountedNode& root, std::uint64_t identity) {
+  std::vector<MountedNode*> path;
+  if (!FindNodePath(root, identity, path)) {
+    return false;
+  }
+  Rect target = path.back()->PresentationBounds();
+  path.pop_back();
+  if (std::ranges::none_of(path, [](const MountedNode* node) {
+        return node->scroll_state && node->scroll_state->both_axes;
+      })) {
+    return false;
+  }
+
+  bool revealed = false;
+  for (auto ancestor = path.rbegin(); ancestor != path.rend(); ++ancestor) {
+    auto& node = **ancestor;
+    if (node.scroll_state && !node.scroll_state->allows_automatic_reveal) {
+      break;
+    }
+    revealed |= ScrollNodeRectIntoView(node, target);
+  }
+  return revealed;
+}
+
+void CollectFocusableNodes(MountedNode& node, std::vector<MountedNode*>& nodes) {
+  if (node.interaction.enabled && node.IsFocusable()) {
+    nodes.push_back(&node);
+  }
+  for (auto& child : node.children) {
+    CollectFocusableNodes(*child, nodes);
+  }
+}
+
+MountedNode* FindTopmostFocusTrap(MountedNode& node) {
+  if (!node.interaction.enabled) {
+    return nullptr;
+  }
+  for (std::size_t index = node.children.size(); index > 0; --index) {
+    if (MountedNode* root = FindTopmostFocusTrap(ChildInPaintOrder(node, index - 1))) {
+      return root;
+    }
+  }
+  return node.trap_focus ? &node : nullptr;
+}
+
+bool RouteBackTarget(MountedNode& node, const BackEvent& event, BackTarget& target, bool& already_dispatched) {
+  if (!node.interaction.enabled) {
+    return false;
+  }
+  for (std::size_t index = node.children.size(); index > 0; --index) {
+    if (RouteBackTarget(ChildInPaintOrder(node, index - 1), event, target, already_dispatched)) {
+      return true;
+    }
+  }
+  if (HasEventBinding<ViewEvents::BackRequested>(node.event_bindings)) {
+    target.kind = BackTargetKind::Event;
+    target.node_identity = node.identity;
+    return true;
+  }
+  for (std::size_t index = node.extensions.size(); index > 0; --index) {
+    NodeExtensionEntry& entry = node.extensions[index - 1];
+    if (entry.extension && entry.extension->OnBack(node, event)) {
+      target.kind = BackTargetKind::Extension;
+      target.extension = NodeExtensionHandle{node.identity, index - 1, entry.descriptor};
+      already_dispatched = true;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool IsActivatable(const MountedNode& node) {
+  return static_cast<bool>(node.activation) || HasEventBinding<ViewEvents::Click>(node.event_bindings);
+}
+
+} // namespace
+
+bool ContainsNodeIdentity(const MountedNode& node, std::uint64_t identity) {
+  if (node.identity == identity) {
+    return true;
+  }
+  return std::ranges::any_of(node.children, [identity](const auto& child) {
+    return ContainsNodeIdentity(*child, identity);
+  });
+}
+
+std::optional<bool> DeclaredEnabled(const MountedNode& node, std::uint64_t identity, bool parent_enabled) {
+  const bool enabled = parent_enabled && node.participates_in_layout && node.local_enabled;
+  if (node.identity == identity) {
+    return enabled;
+  }
+  for (const auto& child : node.children) {
+    if (const std::optional<bool> child_enabled = DeclaredEnabled(*child, identity, enabled);
+        child_enabled.has_value()) {
+      return child_enabled;
+    }
+  }
+  return std::nullopt;
+}
+
+bool IsVirtualLayoutNode(const MountedNode& node) noexcept {
+  return node.kind == NodeKind::VirtualLayout;
+}
+
+void InternalAccess::InvalidateRoot(UiWindow& ui_window) {
+  ui_window.InvalidateRoot();
+}
+
+const MountedNode* InternalAccess::RootNode(const UiWindow& ui_window) noexcept {
+  return ui_window.RootNode();
+}
+
+const MountedNode* InternalAccess::MountedRoot(const UiWindow& ui_window) noexcept {
+  return ui_window.state_->mounted_root_.get();
+}
+
+#if defined(__EMSCRIPTEN__) || (defined(__linux__) && !defined(__ANDROID__))
+std::uint64_t InternalAccess::TextMetricsRevision(const UiWindow& ui_window) noexcept {
+  return ui_window.state_ ? ui_window.state_->text_metrics_revision_ : 0;
+}
+
+void InternalAccess::InvalidateTextMetrics(UiWindow& ui_window) {
+  const auto& state = ui_window.state_;
+  if (!state || !state->initialized_ || state->retired_) {
+    throw std::logic_error("PingCore text metrics invalidation requires an initialized window");
+  }
+  ExecutionGuard execution_guard(state->execution_);
+  // Platform font metrics can change without changing Font values, including composition-time measurements.
+  BeginDependencyChange(state->text_metrics_dependency_);
+  ++state->text_metrics_revision_;
+  state->text_layout_cache_.clear();
+  state->text_layout_cache_bytes_ = 0;
+  CommitDependencyChange(state->text_metrics_dependency_);
+  if (state->mounted_root_) MarkTextMetricsDirtyTree(*state->mounted_root_);
+  state->extension_tree_dirty_ = true;
+  state->text_->InvalidateOverlay();
+  ui_window.RequestFrame();
+}
+#endif
+
+const ScrollPhysics& InternalAccess::DefaultScrollPhysics(const UiWindow& ui_window) noexcept {
+  return ui_window.state_->default_scroll_physics_;
+}
+
+void InternalAccess::NotifyScrollActivity(UiWindow& ui_window, MountedNode& node, const ScrollActivity& activity) {
+  ui_window.NotifyScrollActivity(node, activity);
+}
+
+void InternalAccess::RequestFrame(UiWindow& ui_window) {
+  ui_window.RequestFrame();
+}
+
+void InternalAccess::FocusNode(UiWindow& ui_window, std::uint64_t identity) {
+  ui_window.SetFocusedNode(identity, true);
+}
+
+std::optional<std::uint64_t> InternalAccess::FocusedNodeIdentity(const UiWindow& ui_window) noexcept {
+  return ui_window.state_->focused_node_identity_;
+}
+
+void InternalAccess::InvalidateLayout(UiWindow& ui_window, MountedNode& node) {
+  ui_window.InvalidateLayout(node);
+}
+
+std::optional<std::uint64_t> InternalAccess::HitTestPlatformView(const UiWindow& ui_window, Point position) {
+  return ui_window.HitTestPlatformView(position);
+}
+
+std::optional<std::uint64_t> InternalAccess::FocusedPlatformView(const UiWindow& ui_window) {
+  return ui_window.FocusedPlatformView();
+}
+
+void
+InternalAccess::SynchronizePlatformViewFocus(UiWindow& ui_window, std::optional<std::uint64_t> identity, bool focus_visible) {
+  ui_window.SynchronizePlatformViewFocus(identity, focus_visible);
+}
+
+bool InternalAccess::MoveFocusFromPlatformView(UiWindow& ui_window, std::uint64_t identity, bool reverse) {
+  return ui_window.MoveFocusFromPlatformView(identity, reverse);
+}
+
+std::optional<PlatformPayload> InternalAccess::DispatchPlatformViewEvent(
+    UiWindow& ui_window, std::uint64_t identity, std::string_view name, const PlatformPayload& payload
+) {
+  return ui_window.DispatchPlatformViewEvent(identity, name, payload);
+}
+
+std::optional<PlatformValue> InternalAccess::DispatchPlatformViewEvent(
+    UiWindow& ui_window, std::uint64_t identity, std::type_index key, const PlatformValue& value
+) {
+  return ui_window.DispatchPlatformViewEvent(identity, key, value);
+}
+
+bool FindNodePath(MountedNode& node, std::uint64_t identity, std::vector<MountedNode*>& path) {
+  path.push_back(&node);
+  if (node.identity == identity) {
+    return true;
+  }
+  for (const std::unique_ptr<MountedNode>& child : node.children) {
+    if (FindNodePath(*child, identity, path)) {
+      return true;
+    }
+  }
+  path.pop_back();
+  return false;
+}
+
+} // namespace pingcore::detail
+
+namespace pingcore {
+
+bool ViewHandle::RequestFocus(bool focus_visible) const {
+  if (detail::Composer::Current()) {
+    throw std::logic_error("PingCore cannot request focus during composition");
+  }
+  if (!binding_ || !binding_->source->application.lock()) return false;
+  detail::ValidateApplicationCall(binding_->source);
+  const auto window = binding_->source->ui.lock();
+  if (!window || !window->ui_window || binding_->node_identity == 0) return false;
+  detail::ExecutionGuard guard(binding_->source);
+  return window->ui_window->RequestFocus(binding_->node_identity, focus_visible);
+}
+
+ViewHandle UseViewHandle(const std::source_location& location) {
+  if (!detail::Composer::Current()) {
+    throw std::logic_error("PingCore UseViewHandle() requires window composition");
+  }
+  auto* window = detail::CurrentUiWindow();
+  if (!window) throw std::logic_error("PingCore UseViewHandle() requires window composition");
+  auto source = detail::CapturePresentationContext(detail::InternalAccess::WindowExecution(*window));
+  return UseState(ViewHandle{std::make_shared<detail::ViewHandleBinding>(std::move(source))}, location);
+}
+
+Runtime& UiWindow::ApplicationRuntime() const {
+  if (!application_runtime_)
+    throw std::logic_error("PingCore UI window is not initialized");
+  return *application_runtime_;
+}
+
+detail::PlatformRegistry& UiWindow::PlatformRegistry() {
+  return ApplicationRuntime().state_->registry;
+}
+
+void UiWindow::DispatchToUiThread(std::function<void()> task) const {
+  ApplicationRuntime().DispatchToApplicationThread(std::move(task));
+}
+
+double UiWindow::Now() const noexcept {
+  return application_runtime_
+             ? std::chrono::duration<double>(application_runtime_->TimerNow().time_since_epoch()).count()
+             : 0;
+}
+
+GestureSettings UiWindow::GestureDefaults() const noexcept {
+  return {};
+}
+
+ScrollPhysics UiWindow::ScrollDefaults() const noexcept {
+  return {};
+}
+
+ThemeBrightness UiWindow::QuerySystemThemeBrightness() const {
+  return ThemeBrightness::Light;
+}
+
+void UiWindow::UpdateSystemThemeBrightness(ThemeBrightness brightness) {
+  if (!IsInitialized()) {
+    throw std::logic_error("PingCore system theme update requires an initialized window");
+  }
+  state_->application_->RequireThread();
+  if (brightness != ThemeBrightness::Light && brightness != ThemeBrightness::Dark) {
+    throw std::invalid_argument("PingCore system theme brightness is invalid");
+  }
+  detail::ExecutionGuard execution_guard(state_->execution_);
+  PINGCORE_DISCARD(state_->root_environment_->Update(detail::SystemThemeEnvironment{brightness}));
+}
+
+std::shared_ptr<detail::FilePickerTransport> UiWindow::CreateFilePickerTransport() {
+  return {};
+}
+
+TextLayout UiWindow::CreateTextLayout(const AttributedText& text, const TextStyle& style, float width,
+                                     const TextLayoutOptions& options) {
+  if (!std::isfinite(width) || width <= 0.0F) {
+    throw std::invalid_argument("PingCore text layout width must be finite and greater than zero");
+  }
+  if (!state_ || state_->retired_) {
+    throw std::logic_error("PingCore text layout requires a live window");
+  }
+  TextLayoutOptions shaping = options;
+  shaping.vertical_align = TextVerticalAlign::Top;
+  auto& cache = state_->text_layout_cache_;
+  for (auto entry = cache.begin(); entry != cache.end(); ++entry) {
+    const auto& data = *entry->data_;
+    if (data.width == width && data.options == shaping && data.style == style && data.text == text) {
+      std::rotate(entry, entry + 1, cache.end());
+      return cache.back();
+    }
+  }
+  auto data = std::make_shared<TextLayout::Data>();
+  data->backend = CreatePlatformTextLayout(text, style, width, shaping);
+  if (!data->backend) {
+    throw std::logic_error("PingCore window has no text layout backend");
+  }
+  data->text = text;
+  data->style = style;
+  data->options = std::move(shaping);
+  data->width = width;
+  data->lines = data->backend->LineMetrics();
+  const TextOffset length = text.Length();
+  if (data->lines.empty() && length != 0) {
+    throw std::logic_error("PingCore text layout backend returned no visual lines");
+  }
+  const bool trailing_break = data->NormalizeLineRanges();
+  if (data->lines.empty() || (trailing_break && data->lines.back().range.start != length)) {
+    const FontMetrics font = Metrics(style.font);
+    const float top = data->lines.empty() ? 0.0F : data->backend->Measure().height;
+    const bool rtl = options.shaping.direction == TextDirection::RightToLeft;
+    const bool right = rtl ? options.align == TextAlign::Leading : options.align == TextAlign::Trailing;
+    const float x = options.align == TextAlign::Center ? width * 0.5F : right ? width : 0.0F;
+    data->lines.push_back({{length, length}, {x, top, 0.0F, font.LineHeight()}, top + font.ascent});
+    data->synthesized_last_line = true;
+  }
+  if (!text.InlineObjects().empty()) {
+    data->inline_objects = data->backend->InlineObjectPlacements(text.InlineObjects(), data->lines);
+    if (data->inline_objects.size() != text.InlineObjects().size()) {
+      throw std::logic_error("PingCore text layout backend did not place every inline object");
+    }
+  }
+  Size size = data->backend->Measure();
+  size.width = std::min(size.width, width);
+  const auto& last = data->lines.back().bounds;
+  if (data->synthesized_last_line) {
+    size.height = std::max(size.height, last.y + last.height);
+  }
+  data->metrics = {size, data->lines.front().baseline, data->lines.back().baseline, data->lines.size()};
+  data->cache_cost = detail::ParagraphCacheCost(text);
+  TextLayout layout(data);
+  if (data->cache_cost <= detail::paragraph_cache_budget) {
+    while (!cache.empty() && (cache.size() >= 64 ||
+           state_->text_layout_cache_bytes_ + data->cache_cost > detail::paragraph_cache_budget)) {
+      state_->text_layout_cache_bytes_ -= cache.front().data_->cache_cost;
+      cache.erase(cache.begin());
+    }
+    cache.push_back(layout);
+    state_->text_layout_cache_bytes_ += data->cache_cost;
+  }
+  return layout;
+}
+
+std::unique_ptr<detail::TextLayoutBackend> UiWindow::CreatePlatformTextLayout(
+    std::string_view text, const TextStyle& style, float max_width, const TextLayoutOptions& options) {
+  return CreatePlatformTextLayout(AttributedText(std::string(text)), style, max_width, options);
+}
+
+std::unique_ptr<detail::TextLayoutBackend> UiWindow::CreatePlatformTextLayout(const AttributedText&, const TextStyle&,
+                                                               float, const TextLayoutOptions&) {
+  return {};
+}
+
+using namespace detail;
+
+UiWindow::State::State(UiWindow& owner, const AppOptions& application, ViewFactory content,
+                       const WindowOptions& options)
+    : owner_(owner), root_factory_(std::move(content)),
+      viewport_breakpoints_(application.viewport_breakpoints),
+      window_(std::make_shared<WindowState>(options)),
+      root_scope_(std::make_shared<RecomposeScope>(owner, NextCompositionIdentity())), layer_controller_(owner) {}
+
+UiWindow::State::~State() = default;
+
+UiWindow::UiWindow() = default;
+
+bool UiWindow::IsInitialized() const noexcept {
+  return state_ && state_->initialized_ && !state_->closing_ && !state_->retired_ && !state_->retiring_content_;
+}
+
+void UiWindow::InitializeWindow(Runtime& application_runtime, ViewFactory content, const WindowOptions& window_options,
+                                std::optional<ResourceConfiguration> configuration,
+                                WindowLifecycleState initial_lifecycle, std::shared_ptr<WindowService> window_service) {
+  if (state_)
+    throw std::logic_error("PingCore UI window has already been initialized");
+  const auto application_state = application_runtime.state_;
+  if (!application_state)
+    throw std::logic_error("PingCore UI window requires an initialized Runtime");
+  application_state->RequireThread();
+  if (application_state->phase != ApplicationRuntimeState::Phase::Running) {
+    throw std::logic_error("PingCore UI requires a running application Runtime");
+  }
+  const Application& application = *application_state->declaration;
+  if (configuration && (!std::isfinite(configuration->display_scale) || configuration->display_scale <= 0)) {
+    throw std::invalid_argument("PingCore UI resource display scale must be finite and positive");
+  }
+  ExecutionGuard application_guard(application_state->execution);
+  ValidateViewportBreakpoints(application.options.viewport_breakpoints);
+  const GestureSettings gesture_settings = GestureDefaults();
+  detail::ValidateGestureSettings(gesture_settings);
+  const ScrollPhysics scroll_physics = ScrollDefaults();
+  detail::ValidateScrollPhysics(scroll_physics);
+  ValidateWindowOptions(window_options);
+  if (!content) throw std::invalid_argument("PingCore window content must not be empty");
+  ++application_state->window_installations;
+  try {
+    application_runtime_ = &application_runtime;
+    external_texture_frame_requester_ =
+        std::make_shared<ExternalTextureFrameRequester>(*this, application_state->Dispatcher());
+    state_ = std::make_unique<State>(*this, application.options, std::move(content), window_options);
+    state_->application_ = application_state;
+    state_->ui_execution_ = std::make_shared<UiExecutionState>();
+    state_->ui_execution_->ui_window = this;
+    state_->execution_ = std::make_shared<ExecutionContext>();
+    state_->execution_->application = application_state;
+    state_->execution_->ui = state_->ui_execution_;
+    state_->execution_->requires_ui = true;
+    ExecutionGuard ui_guard(state_->execution_);
+    state_->gesture_settings_ = gesture_settings;
+    state_->default_scroll_physics_ = scroll_physics;
+    state_->root_environment_ = std::make_shared<Environment>();
+    state_->execution_->environment = state_->root_environment_;
+    state_->root_environment_->Set(detail::ViewportEnvironment{state_->viewport_class_});
+    const ThemeBrightness brightness = QuerySystemThemeBrightness();
+    if (brightness != ThemeBrightness::Light && brightness != ThemeBrightness::Dark) {
+      throw std::invalid_argument("PingCore system theme brightness is invalid");
+    }
+    state_->root_environment_->Set(detail::SystemThemeEnvironment{brightness});
+    WindowContext root{
+        state_->layer_controller_,
+        *state_->root_environment_,
+        state_->root_service_types_,
+        state_->root_services_,
+    };
+    state_->app_resources_ = application_state->resources;
+    state_->text_ = std::make_unique<TextInteraction>(*state_);
+    state_->pointer_ = std::make_unique<PointerInteraction>(*state_);
+    state_->file_drop_ = std::make_unique<FileDropReceiver>(*state_);
+    state_->semantics_ = std::make_unique<SemanticTree>(*state_);
+    const ResourceConfiguration resource_configuration =
+        configuration.value_or(state_->app_resources_->Configuration());
+    state_->ui_execution_->configuration = resource_configuration;
+    state_->root_environment_->Set(resource_configuration.locale);
+
+#if defined(PINGCORE_ENABLE_PROFILING) && PINGCORE_ENABLE_PROFILING
+    if (auto profiler = CreateRuntimeProfiler()) {
+      root.Provide(std::move(profiler));
+    }
+#endif
+    auto text_measurer = std::make_shared<TextMeasurerService>();
+    text_measurer->measurer = this;
+#if defined(__EMSCRIPTEN__) || (defined(__linux__) && !defined(__ANDROID__))
+    text_measurer->dependency = state_->text_metrics_dependency_;
+#endif
+    root.Provide(std::move(text_measurer));
+    if (window_service) {
+      window_service->Attach(*this);
+      state_->window_service_ = std::move(window_service);
+    } else {
+      state_->window_service_ = std::make_shared<WindowService>(*this);
+    }
+    state_->window_service_->UpdateLifecycleState(initial_lifecycle);
+    root.Provide(state_->window_service_);
+    state_->scene_transition_service_ = std::make_shared<SceneTransitionService>(*state_);
+    root.Provide(state_->scene_transition_service_);
+    root.Provide(
+        std::shared_ptr<FilePicker>(new FilePicker(CreateFilePickerTransport(), application_state->Dispatcher()))
+    );
+
+    InstallBuiltinPresentation(root);
+    for (const WindowHook& hook : application.options.window_hooks) {
+      if (!hook) {
+        throw std::invalid_argument("PingCore root hook must not be empty");
+      }
+      hook(root);
+    }
+    if (application.options.show_debug_overlay) {
+      state_->debug_metrics_ = std::make_shared<DebugMetricsSampler>(*application_state->owner);
+      InstallDebugOverlay(root, state_->debug_metrics_);
+    }
+    std::erase_if(application_state->uis, [](const auto& weak) {
+      const auto ui = weak.lock();
+      return !ui || !ui->ui_window;
+    });
+    application_state->uis.push_back(state_->ui_execution_);
+    state_->initialized_ = true;
+    state_->window_service_->Open();
+    --application_state->window_installations;
+  } catch (...) {
+    Retire();
+    --application_state->window_installations;
+    application_runtime.ResumeWindowMaintenance();
+    throw;
+  }
+}
+
+void UiWindow::CloseWindow() {
+  ApplicationRuntime().CloseWindow(*this);
+}
+
+UiWindow::~UiWindow() {
+  Retire();
+  if (external_texture_frame_requester_)
+    external_texture_frame_requester_->Close();
+}
+
+void UiWindow::Retire() noexcept {
+  if (!state_ || state_->retired_) {
+    return;
+  }
+  ExecutionGuard guard(state_->execution_);
+  state_->retired_ = true;
+  RetireContent();
+  state_->root_environment_.reset();
+  if (state_->execution_) {
+    state_->execution_->environment.reset();
+  }
+  if (state_->ui_execution_) {
+    state_->ui_execution_->ui_window = nullptr;
+  }
+}
+
+void UiWindow::RetireContent() noexcept {
+  // Withdraw all routes before calling client cleanup, which may pump native input or change application state.
+  state_->frame_commit_.render_frame.scene.root = nullptr;
+  auto mounted_root = std::move(state_->mounted_root_);
+  state_->focused_node_identity_.reset();
+  state_->focus_visible_ = false;
+  state_->focus_trap_stack_.clear();
+  state_->keyboard_activation_identity_.reset();
+  state_->keyboard_press_id_.reset();
+  state_->back_target_.reset();
+  state_->scroll_motion_active_ = false;
+  if (state_->window_service_ && !state_->retired_) {
+    state_->window_service_->ClearHandlers();
+  }
+  if (state_->pointer_) {
+    state_->pointer_->Disconnect();
+  }
+  state_->layer_controller_.Disconnect();
+  if (state_->scene_transition_service_) {
+    state_->scene_transition_service_->Disconnect();
+  }
+  state_->text_layout_cache_.clear();
+  state_->text_layout_cache_bytes_ = 0;
+  if (state_->file_drop_) {
+    state_->file_drop_->DisconnectFileDrop();
+  }
+  if (state_->text_) {
+    state_->text_->HideTextSelectionOverlay();
+    const auto reason = state_->retired_ ? TextInputEndReason::RuntimeDestroyed : TextInputEndReason::ClientRemoved;
+    try {
+      state_->text_->StopTextInputSession(reason);
+    } catch (...) {
+    }
+  }
+  DeactivateExternalTextures(state_->committed_scene_snapshot_, state_->owner_.external_texture_frame_requester_);
+  external_texture_frame_requester_->Close();
+  state_->has_committed_scene_snapshot_ = false;
+  if (state_->window_service_ && state_->retired_) {
+    state_->window_service_->Disconnect();
+  }
+  DiscardLifecycleCommits();
+  mounted_root.reset();
+  state_->root_scope_.reset();
+  state_->root_factory_ = {};
+  for (detail::LifecycleCleanup& cleanup : state_->retired_lifecycle_cleanups_) {
+    cleanup.Run();
+  }
+  state_->retired_lifecycle_cleanups_.clear();
+  CommitTaskScopes();
+  // Retained callback environments must not keep their own root services alive after UI retirement.
+  if (state_->root_environment_) {
+    for (const auto type : state_->root_service_types_) {
+      if (PeekLocalEnvironmentValue(*state_->root_environment_, type)) {
+        SetEnvironmentValue(*state_->root_environment_, type, {});
+      }
+    }
+  }
+  for (auto service = state_->root_services_.rbegin(); service != state_->root_services_.rend(); ++service) {
+    service->reset();
+  }
+  state_->root_services_.clear();
+  state_->root_service_types_.clear();
+  state_->debug_metrics_.reset();
+}
+
+TextInputApplyResult UiWindow::HandleTextInputCommands(const TextInputCommandBatch& batch) {
+  ExecutionGuard execution_guard(state_->execution_);
+  return state_->text_->DispatchWithKeyboardRequests([&] { return state_->text_->HandleTextInputCommands(batch); });
+}
+
+bool UiWindow::PerformTextInputAction(TextInputSessionId session_id, TextInputAction action) {
+  ExecutionGuard execution_guard(state_->execution_);
+  return state_->text_->DispatchWithKeyboardRequests([&] {
+    return state_->text_->PerformTextInputAction(session_id, action);
+  });
+}
+
+TextInputContext
+UiWindow::QueryTextInputContext(TextInputSessionId session_id, TextOffset start, TextOffset length) const {
+  return state_->text_->QueryTextInputContext(session_id, start, length);
+}
+
+TextInputGeometry UiWindow::QueryTextInputGeometry(TextInputSessionId session_id, TextRange range) const {
+  return state_->text_->QueryTextInputGeometry(session_id, range);
+}
+
+TextInputPositionResult UiWindow::QueryTextInputPosition(TextInputSessionId session_id, Point point) const {
+  return state_->text_->QueryTextInputPosition(session_id, point);
+}
+
+bool UiWindow::CanPerformTextEditingAction(TextEditingAction action) const {
+  return state_->text_->CanPerformTextEditingAction(action);
+}
+
+bool UiWindow::PerformTextEditingAction(TextEditingAction action) {
+  ExecutionGuard execution_guard(state_->execution_);
+  return state_->text_->DispatchWithKeyboardRequests([&] { return state_->text_->PerformTextEditingAction(action); });
+}
+
+std::uint64_t UiWindow::BeginInteraction(detail::MountedNode& node, InteractionEvent::Source source,
+                                        std::optional<Point> position) {
+  const std::uint64_t press_id = state_->next_press_id_++;
+  ++node.active_press_count;
+  InteractionState interaction = node.interaction;
+  interaction.pressed = true;
+  UpdateInteraction(node, interaction, InteractionEvent{InteractionEvent::Type::Press, source, press_id, position});
+  return press_id;
+}
+
+void UiWindow::EndInteraction(detail::MountedNode& node, InteractionEvent::Type type,
+                             InteractionEvent::Source source, std::uint64_t press_id,
+                             std::optional<Point> position) {
+  if (node.active_press_count > 0) {
+    --node.active_press_count;
+  }
+  InteractionState interaction = node.interaction;
+  interaction.pressed = node.active_press_count != 0;
+  UpdateInteraction(node, interaction, InteractionEvent{type, source, press_id, position});
+}
+
+void UiWindow::HandlePointerEvent(const PointerEvent& event) {
+  ExecutionGuard execution_guard(state_->execution_);
+  detail::TextInteraction::KeyboardDispatch keyboard_dispatch(*state_->text_);
+  state_->pointer_->HandlePointerEvent(event);
+  keyboard_dispatch.Finish();
+}
+
+void UiWindow::RequestKeyboard(bool show) {
+  if (state_->focused_node_identity_) {
+    state_->text_->RequestKeyboardForNode(*state_->focused_node_identity_, show);
+  }
+}
+
+bool UiWindow::HasContextMenuHandler(Point position) const {
+  return state_->pointer_->HasContextMenuHandler(position);
+}
+
+bool UiWindow::HandleFileDragEntered(std::uint64_t session, FileDropOffer offer, Point position) {
+  ExecutionGuard execution_guard(state_->execution_);
+  return state_->file_drop_->HandleFileDragEntered(session, std::move(offer), position);
+}
+
+bool UiWindow::HandleFileDragMoved(std::uint64_t session, FileDropOffer offer, Point position) {
+  ExecutionGuard execution_guard(state_->execution_);
+  return state_->file_drop_->HandleFileDragMoved(session, std::move(offer), position);
+}
+
+void UiWindow::HandleFileDragExited(std::uint64_t session) {
+  ExecutionGuard execution_guard(state_->execution_);
+  state_->file_drop_->HandleFileDragExited(session);
+}
+
+bool UiWindow::HandleFileDrop(std::uint64_t session, FileDropOffer offer, Point position,
+                             detail::FileDropPreparation prepare) {
+  ExecutionGuard execution_guard(state_->execution_);
+  return state_->file_drop_->HandleFileDrop(session, std::move(offer), position, std::move(prepare));
+}
+
+void UiWindow::BuildSemantics() {
+  state_->semantics_->BuildSemantics();
+  state_->frame_commit_.semantic_frame = state_->semantics_->Frame();
+}
+
+bool UiWindow::PerformSemanticAction(SemanticNodeId node_id, const SemanticAction& action) {
+  ExecutionGuard execution_guard(state_->execution_);
+  return state_->text_->DispatchWithKeyboardRequests([&] {
+    return state_->semantics_->PerformSemanticAction(node_id, action);
+  });
+}
+
+void UiWindow::QueueLifecycleCommit(const std::shared_ptr<detail::RecomposeScope>& scope) {
+  state_->lifecycle_commits_.push_back(scope);
+}
+
+void UiWindow::RetireLifecycles(detail::RecomposeScope& scope) noexcept {
+  for (auto key = scope.lifecycle_order_.rbegin(); key != scope.lifecycle_order_.rend(); ++key) {
+    auto slot = scope.lifecycle_slots_.find(*key);
+    if (slot == scope.lifecycle_slots_.end()) {
+      continue;
+    }
+    try {
+      state_->retired_lifecycle_cleanups_.push_back(std::move(slot->second.cleanup));
+    } catch (...) {
+      slot->second.cleanup.Run();
+    }
+  }
+  scope.lifecycle_slots_.clear();
+  scope.lifecycle_order_.clear();
+}
+
+void UiWindow::CommitLifecycles() {
+  std::vector<std::weak_ptr<detail::RecomposeScope>> commits = std::move(state_->lifecycle_commits_);
+  state_->lifecycle_commits_.clear();
+
+  try {
+    for (const std::weak_ptr<detail::RecomposeScope>& scope : commits) {
+      if (auto active = scope.lock()) {
+        active->PrepareLifecycleCommit();
+      }
+    }
+    for (detail::LifecycleCleanup& cleanup : state_->retired_lifecycle_cleanups_) {
+      cleanup.Run();
+    }
+    state_->retired_lifecycle_cleanups_.clear();
+    for (auto scope = commits.rbegin(); scope != commits.rend(); ++scope) {
+      if (auto active = scope->lock()) {
+        active->CommitLifecycleCleanups();
+      }
+    }
+    for (const std::weak_ptr<detail::RecomposeScope>& scope : commits) {
+      if (auto active = scope.lock()) active->CommitLifecycleSetups();
+    }
+  } catch (...) {
+    for (const std::weak_ptr<detail::RecomposeScope>& scope : commits) {
+      if (auto active = scope.lock()) {
+        active->DiscardLifecycleCommit();
+      }
+    }
+    throw;
+  }
+}
+
+void UiWindow::DiscardLifecycleCommits() noexcept {
+  for (const std::weak_ptr<detail::RecomposeScope>& scope : state_->lifecycle_commits_) {
+    if (auto active = scope.lock()) {
+      active->DiscardLifecycleCommit();
+    }
+  }
+  state_->lifecycle_commits_.clear();
+}
+
+std::shared_ptr<detail::TaskScopeImpl> UiWindow::CreateTaskScope() {
+  return detail::MakeTaskScopeState(state_->application_->Dispatcher(), detail::CurrentExecutionContext());
+}
+
+detail::PlatformChannelEndpoint detail::MakePlatformChannelEndpoint(UiWindow& ui_window) {
+  // Window hooks can create channels before initialization admits native callbacks.
+  if (!ui_window.state_ || ui_window.state_->retired_ || !ui_window.state_->ui_execution_) {
+    throw std::logic_error("PingCore PlatformChannel requires a live UiWindow");
+  }
+  ui_window.state_->application_->RequireThread();
+  auto source = CurrentExecutionContext();
+  if (!source || !source->requires_ui || source->ui.lock() != ui_window.state_->ui_execution_) {
+    source = ui_window.state_->execution_;
+  }
+  return MakePlatformChannelEndpoint(ui_window.state_->application_->native_dispatcher,
+                                      std::make_shared<ExecutionContext>(*source));
+}
+
+void UiWindow::RetireTaskScope(std::shared_ptr<detail::TaskScopeImpl> scope) noexcept {
+  if (!scope) {
+    return;
+  }
+  try {
+    state_->retired_task_scopes_.push_back(scope);
+  } catch (...) {
+    detail::CloseTaskScope(scope);
+  }
+}
+
+void UiWindow::CommitTaskScopes() noexcept {
+  for (const std::shared_ptr<detail::TaskScopeImpl>& scope : state_->retired_task_scopes_) {
+    detail::CloseTaskScope(scope);
+  }
+  state_->retired_task_scopes_.clear();
+}
+
+void UiWindow::SetWindowMetrics(WindowMetrics metrics) {
+  ExecutionGuard execution_guard(state_->execution_);
+  ValidateWindowMetrics(metrics);
+  if (state_->window_->metrics == metrics) {
+    return;
+  }
+  const bool window_controls_visibility_changed =
+      HasWindowControlGeometry(state_->window_->metrics) != HasWindowControlGeometry(metrics);
+  const bool previous_maximized =
+      state_->window_->metrics.title_bar.has_value() && state_->window_->metrics.title_bar->maximized;
+  const bool maximized = metrics.title_bar.has_value() && metrics.title_bar->maximized;
+  const bool maximize_state_changed = previous_maximized != maximized;
+  state_->window_->metrics = metrics;
+  if (state_->mounted_root_) {
+    state_->mounted_root_->measure_dirty = true;
+    if ((window_controls_visibility_changed || maximize_state_changed) &&
+        state_->window_->chrome_mode == WindowChromeMode::Custom) {
+      ReconcileWindowControls();
+    }
+    if (detail::MountedNode* backplane = FindWindowBackplane(*state_->mounted_root_)) {
+      backplane->content_paint_dirty = true;
+    }
+  }
+  state_->text_->InvalidateOverlay();
+  const ViewportClass viewport_class = ResolveViewportClass(metrics.viewport.width, state_->viewport_breakpoints_);
+  if (viewport_class != state_->viewport_class_) {
+    state_->viewport_class_ = viewport_class;
+    PINGCORE_DISCARD(state_->root_environment_->Update(detail::ViewportEnvironment{viewport_class}));
+    return;
+  }
+  RequestFrame();
+}
+
+bool UiWindow::IsWindowDragRegion(Point position) const {
+  const auto& window = *state_->window_;
+  return (window.metrics.title_bar.has_value() || window.chrome_mode == WindowChromeMode::None) &&
+         state_->mounted_root_ && detail::HitTestWindowDragRegion(*state_->mounted_root_, position);
+}
+
+std::optional<std::uint64_t> UiWindow::HitTestPlatformView(Point position) const {
+  if (!state_->mounted_root_) {
+    return std::nullopt;
+  }
+  std::vector<detail::MountedNode*> route;
+  if (!detail::BuildPointerRoute(*state_->mounted_root_, position, route) || route.empty()) {
+    return std::nullopt;
+  }
+  const detail::MountedNode* target = route.back();
+  return target->kind == detail::NodeKind::PlatformView ? std::optional{target->identity} : std::nullopt;
+}
+
+std::optional<std::uint64_t> UiWindow::FocusedPlatformView() const {
+  if (!state_->focused_node_identity_.has_value() || !state_->mounted_root_) {
+    return std::nullopt;
+  }
+  const detail::MountedNode* focused = FindNode(*state_->mounted_root_, *state_->focused_node_identity_);
+  if (focused == nullptr || focused->kind != detail::NodeKind::PlatformView) {
+    return std::nullopt;
+  }
+  return state_->focused_node_identity_;
+}
+
+void UiWindow::SynchronizePlatformViewFocus(std::optional<std::uint64_t> identity, bool focus_visible) {
+  if (identity.has_value()) {
+    if (!state_->mounted_root_) {
+      return;
+    }
+    const detail::MountedNode* node = FindNode(*state_->mounted_root_, *identity);
+    if (node == nullptr || node->kind != detail::NodeKind::PlatformView) {
+      return;
+    }
+    SetFocusedNode(identity, focus_visible);
+    return;
+  }
+  if (FocusedPlatformView().has_value()) {
+    SetFocusedNode(std::nullopt, focus_visible);
+  }
+}
+
+bool UiWindow::MoveFocusFromPlatformView(std::uint64_t identity, bool reverse) {
+  if (FocusedPlatformView() != identity) {
+    return false;
+  }
+  return HandleKeyEvent({
+      .type = KeyEventType::Down,
+      .key = Key::Tab,
+      .modifiers = {.shift = reverse},
+  });
+}
+
+std::optional<PlatformPayload> UiWindow::DispatchPlatformViewEvent(
+    std::uint64_t identity, std::string_view name, const PlatformPayload& payload
+) {
+  ExecutionGuard execution_guard(state_->execution_);
+  if (!state_->mounted_root_) {
+    return std::nullopt;
+  }
+  detail::MountedNode* node = FindNode(*state_->mounted_root_, identity);
+  if (node == nullptr || node->kind != detail::NodeKind::PlatformView || !node->platform_view ||
+      !node->interaction.enabled) {
+    return std::nullopt;
+  }
+  const auto event = std::ranges::find(node->platform_view->events, name, &detail::PlatformEventDescriptor::name);
+  if (event == node->platform_view->events.end() || !node->event_bindings.contains(event->key)) {
+    return std::nullopt;
+  }
+  try {
+    if (event->dispatch_payload == nullptr) {
+      return std::nullopt;
+    }
+    return event->dispatch_payload(payload, node->event_bindings);
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+std::optional<PlatformValue> UiWindow::DispatchPlatformViewEvent(
+    std::uint64_t identity, std::type_index key, const PlatformValue& value
+) {
+  ExecutionGuard execution_guard(state_->execution_);
+  if (!state_->mounted_root_) {
+    return std::nullopt;
+  }
+  detail::MountedNode* node = FindNode(*state_->mounted_root_, identity);
+  if (node == nullptr || node->kind != detail::NodeKind::PlatformView || !node->platform_view ||
+      !node->interaction.enabled) {
+    return std::nullopt;
+  }
+  const auto event = std::ranges::find(node->platform_view->events, key, &detail::PlatformEventDescriptor::key);
+  if (event == node->platform_view->events.end() || !node->event_bindings.contains(event->key) ||
+      event->argument_type != value.Type()) {
+    return std::nullopt;
+  }
+  try {
+    return event->dispatch_direct(value, node->event_bindings);
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+// Requests raised while a frame is being built are retained for its FrameCommit instead of re-entering the platform
+// scheduler. Requests raised outside a build notify the platform immediately.
+void UiWindow::RequestFrame() {
+  const double now = state_->owner_.Now();
+  if (!state_->frame_requested_ || state_->frame_request_deadline_ > now) {
+    state_->frame_requested_ = true;
+    state_->frame_request_deadline_ = now;
+    if (!state_->building_frame_) {
+      state_->owner_.RequestFrameAt(now);
+    }
+  }
+}
+
+void UiWindow::RequestFrameAfter(double delay_seconds) {
+  if (!std::isfinite(delay_seconds)) {
+    return;
+  }
+  delay_seconds = std::max(0.0, delay_seconds);
+  const double deadline = state_->owner_.Now() + delay_seconds;
+  if (!state_->frame_requested_ || deadline < state_->frame_request_deadline_) {
+    state_->frame_requested_ = true;
+    state_->frame_request_deadline_ = deadline;
+    if (!state_->building_frame_) {
+      state_->owner_.RequestFrameAt(deadline);
+    }
+  }
+}
+
+void UiWindow::NotifyScrollActivity(detail::MountedNode& node, const ScrollActivity& activity) {
+  DispatchScrollActivity(node, activity);
+  state_->text_->NotifyScrollActivity(node, activity);
+  RequestFrame();
+}
+
+const FrameCommit& UiWindow::BuildFrame() {
+  return BuildFrame(false);
+}
+
+const FrameCommit& UiWindow::BuildFrame(bool present_composition_errors) {
+  const double timestamp = state_->owner_.Now();
+  const double delta_time = state_->previous_frame_timestamp_.has_value()
+                                ? std::clamp(timestamp - *state_->previous_frame_timestamp_, 0.0, 0.25)
+                                : 0.0;
+  const bool previous_policy = std::exchange(state_->present_composition_errors_, present_composition_errors);
+  state_->building_frame_ = true;
+  try {
+    const FrameCommit& frame = BuildFrame({timestamp, delta_time});
+    state_->present_composition_errors_ = previous_policy;
+    return frame;
+  } catch (...) {
+    state_->present_composition_errors_ = previous_policy;
+    DiscardLifecycleCommits();
+    state_->building_frame_ = false;
+    state_->frame_requested_ = false;
+    throw;
+  }
+}
+
+[[noreturn]] void UiWindow::State::PropagateCompositionFailure(const char* operation, std::optional<std::size_t> item) {
+  if (!present_composition_errors_) {
+    throw;
+  }
+  const bool initial = frame_commit_.render_frame.revision == 0;
+  try {
+    throw;
+  } catch (const CompositionFailure&) {
+    throw;
+  } catch (const std::bad_alloc&) {
+    throw;
+  } catch (const std::exception& error) {
+    throw CompositionFailure(DescribeCompositionFailure(initial, operation, item, error.what()));
+  } catch (...) {
+    throw CompositionFailure(DescribeCompositionFailure(initial, operation, item, nullptr));
+  }
+}
+
+const FrameCommit& UiWindow::BuildFrameOrErrorPage(void (*report_error)(const char*) noexcept) {
+  if (!state_->root_factory_) {
+    return BuildFrame();
+  }
+
+  ExecutionGuard guard(state_->execution_);
+  try {
+    return BuildFrame(true);
+  } catch (const CompositionFailure& failure) {
+    state_->retiring_content_ = true;
+    state_->building_frame_ = true;
+    RetireContent();
+    state_->building_frame_ = false;
+    state_->application_dirty_ = false;
+    state_->layers_dirty_ = false;
+
+    const char* report = failure.what();
+    if (report_error != nullptr) {
+      report_error(report);
+    } else {
+      std::fprintf(stderr, "%s\n", report);
+    }
+
+    try {
+      state_->root_environment_ = std::make_shared<Environment>();
+      state_->execution_->environment = state_->root_environment_;
+      state_->window_->caption_labels = {"Minimize", "Maximize or restore", "Close"};
+      const bool show_details = state_->application_->declaration->options.show_composition_error_details;
+      ReconcileApplicationContent(CompositionErrorPage(show_details ? report : ""));
+    } catch (...) {
+      state_->retiring_content_ = false;
+      throw;
+    }
+    state_->retiring_content_ = false;
+    return BuildFrame();
+  }
+}
+
+void UiWindow::UpdateResourceConfiguration(ResourceConfiguration configuration) {
+  ExecutionGuard execution_guard(state_->execution_);
+  if (!std::isfinite(configuration.display_scale) || configuration.display_scale <= 0) {
+    throw std::invalid_argument("PingCore resource display scale must be finite and positive");
+  }
+  if (state_->ui_execution_->configuration == configuration) {
+    return;
+  }
+  BeginDependencyChange(state_->ui_execution_->configuration_dependency);
+  state_->ui_execution_->configuration = configuration;
+  CommitDependencyChange(state_->ui_execution_->configuration_dependency);
+  PINGCORE_DISCARD(state_->root_environment_->Update(configuration.locale));
+  ReconcileWindowControls();
+  state_->text_->InvalidateOverlay();
+}
+
+const FrameCommit& UiWindow::BuildFrame(FrameInfo frame) {
+  if (state_->retired_) {
+    return state_->frame_commit_;
+  }
+  ExecutionGuard execution_guard(state_->execution_);
+  detail::TextInteraction::KeyboardDispatch keyboard_dispatch(*state_->text_);
+  PINGCORE_PROFILE_FRAME(*state_->root_environment_);
+  PINGCORE_PROFILE_STAGE(profile_stage, Compose);
+  detail::DebugMetricsSampler* const debug_metrics = state_->debug_metrics_.get();
+  const double build_started_at = debug_metrics != nullptr ? state_->owner_.Now() : 0.0;
+  const auto record_debug_commit = [&] {
+    if (debug_metrics == nullptr) {
+      return;
+    }
+    debug_metrics->RecordCommit(
+        std::max(0.0, state_->owner_.Now() - build_started_at),
+        state_->frame_commit_.render_frame.damage,
+        state_->window_->metrics.viewport
+    );
+  };
+  if (!std::isfinite(frame.timestamp)) {
+    frame.timestamp = state_->owner_.Now();
+  }
+  if (!std::isfinite(frame.delta_time)) {
+    frame.delta_time = 0.0;
+  }
+  frame.delta_time = std::clamp(frame.delta_time, 0.0, 0.25);
+  // Consume the scheduled frame before callbacks run so callbacks can retain a new request in this commit.
+  state_->frame_requested_ = false;
+
+
+  state_->previous_frame_timestamp_ = frame.timestamp;
+  // Application and LayerStack composition are independent so transient presentation never executes the root factory.
+  if (state_->application_dirty_) {
+    ComposeApplication();
+  }
+  if (state_->mounted_root_) {
+    try {
+      RecomposeDirtyScopes(*state_->mounted_root_);
+    } catch (...) {
+      state_->PropagateCompositionFailure("component scope");
+    }
+  }
+  if (state_->layers_dirty_) {
+    ComposeLayers();
+  }
+
+  if (!state_->mounted_root_ || state_->window_->metrics.viewport.width <= 0.0F ||
+      state_->window_->metrics.viewport.height <= 0.0F) {
+    if (state_->mounted_root_) { PrepareSharedTransitions(*state_->mounted_root_, false); }
+    PINGCORE_PROFILE_NEXT(profile_stage, Input);
+    state_->pointer_->RefreshCursor();
+    state_->pointer_->RefreshHover(false);
+    RefreshInteractionTree();
+    if (state_->layer_controller_.RefreshAnchors(false)) {
+      ComposeLayers();
+      RefreshInteractionTree();
+    }
+    state_->file_drop_->AdvanceFileDrop(frame);
+    state_->text_->RefreshTextInputSession();
+    PINGCORE_PROFILE_NEXT(profile_stage, Semantics);
+    BuildSemantics();
+    PINGCORE_PROFILE_NEXT(profile_stage, Commit);
+    state_->frame_commit_.render_frame.scene.root = nullptr;
+    state_->frame_commit_.render_frame.damage = {};
+    DeactivateExternalTextures(
+        state_->committed_scene_snapshot_, state_->owner_.external_texture_frame_requester_
+    );
+    state_->has_committed_scene_snapshot_ = false;
+    ++state_->frame_commit_.render_frame.revision;
+    CommitLifecycles();
+    CommitTaskScopes();
+    state_->frame_commit_.next_frame_deadline =
+        state_->frame_requested_ ? std::optional{state_->frame_request_deadline_} : std::nullopt;
+    record_debug_commit();
+    state_->building_frame_ = false;
+    keyboard_dispatch.Finish();
+    return state_->frame_commit_;
+  }
+
+  PINGCORE_PROFILE_NEXT(profile_stage, MeasureStage);
+  bool needs_frame = false;
+  if (state_->scroll_motion_active_) {
+    state_->scroll_motion_active_ = detail::AdvanceMountedNodeFrame(*state_->mounted_root_, frame);
+    needs_frame = state_->scroll_motion_active_;
+  }
+  const Constraints constraints{
+      state_->window_->metrics.viewport.width,
+      state_->window_->metrics.viewport.width,
+      state_->window_->metrics.viewport.height,
+      state_->window_->metrics.viewport.height,
+  };
+  PropagateVirtualLayoutInvalidation(*state_->mounted_root_);
+  MeasureNode(
+      *state_->mounted_root_,
+      constraints,
+      *this,
+      state_->window_->metrics.safe_area,
+      state_->window_->metrics.title_bar ? &*state_->window_->metrics.title_bar : nullptr
+  );
+  PINGCORE_PROFILE_NEXT(profile_stage, PlaceStage);
+  LayoutNode(*state_->mounted_root_, {0.0F, 0.0F});
+  PINGCORE_PROFILE_NEXT(profile_stage, Interaction);
+  RefreshInteractionTree();
+
+  PINGCORE_PROFILE_NEXT(profile_stage, Extensions);
+  std::optional<double> next_wakeup;
+  if (UpdateNodeExtensions(*state_->mounted_root_, frame, needs_frame, next_wakeup, state_->extension_tree_dirty_)) {
+    // Retained behavior may end an input exclusion in this frame; publish that change with its final visual sample.
+    RefreshInteractionTree();
+  }
+  state_->extension_tree_dirty_ = false;
+  ResolvePresentationTree(*state_->mounted_root_);
+
+  PINGCORE_PROFILE_NEXT(profile_stage, Geometry);
+  // The first layout establishes resolved caret geometry. Revealing that caret can change ancestor scroll offsets and
+  // virtual realization, so the incremental layout pipeline must settle those changes before geometry is published.
+  const bool focus_revealed = std::exchange(state_->focus_reveal_pending_, false) &&
+                              state_->focused_node_identity_ && !state_->text_->HasSession() &&
+                              RevealFocusInTwoAxes(*state_->mounted_root_, *state_->focused_node_identity_);
+  if (state_->text_->BringTextInputIntoView() || focus_revealed) {
+    if (PropagateVirtualLayoutInvalidation(*state_->mounted_root_)) {
+      MeasureNode(
+          *state_->mounted_root_,
+          constraints,
+          *this,
+          state_->window_->metrics.safe_area,
+          state_->window_->metrics.title_bar ? &*state_->window_->metrics.title_bar : nullptr
+      );
+    }
+    LayoutNode(*state_->mounted_root_, {0.0F, 0.0F});
+    ResolvePresentationTree(*state_->mounted_root_);
+  }
+  // Extensions prepare node-local geometry after the final layout. Text input geometry is then converted to host-view
+  // coordinates while the platform IME session is synchronized.
+  PrepareExtensionGeometry(*state_->mounted_root_, state_->owner_);
+  bool anchor_layers_dismissed = state_->layer_controller_.RefreshAnchors(true);
+  if (anchor_layers_dismissed) {
+    ComposeLayers();
+  }
+  // Anchors can be nested inside other anchored layers. Settle the bounded dependency chain in this commit so a child
+  // presentation does not retain geometry from its parent's previous placement.
+  const detail::MountedNode* const committed_layer_stack = FindLayerStack(*state_->mounted_root_);
+  const std::size_t maximum_geometry_layout_passes =
+      (committed_layer_stack == nullptr ? 0 : committed_layer_stack->children.size()) + 1;
+  std::size_t geometry_layout_passes = 0;
+  while (state_->mounted_root_->measure_dirty && geometry_layout_passes < maximum_geometry_layout_passes) {
+    ++geometry_layout_passes;
+    PropagateVirtualLayoutInvalidation(*state_->mounted_root_);
+    MeasureNode(
+        *state_->mounted_root_,
+        constraints,
+        *this,
+        state_->window_->metrics.safe_area,
+        state_->window_->metrics.title_bar ? &*state_->window_->metrics.title_bar : nullptr
+    );
+    LayoutNode(*state_->mounted_root_, {0.0F, 0.0F});
+    if (anchor_layers_dismissed) {
+      RefreshInteractionTree();
+    }
+    ResolvePresentationTree(*state_->mounted_root_);
+    PrepareExtensionGeometry(*state_->mounted_root_, state_->owner_);
+    anchor_layers_dismissed = state_->layer_controller_.RefreshAnchors(true);
+    if (anchor_layers_dismissed) {
+      ComposeLayers();
+    }
+  }
+  if (state_->mounted_root_->measure_dirty) {
+    RequestFrame();
+  }
+  if (PrepareSharedTransitions(*state_->mounted_root_)) {
+    RefreshInteractionTree();
+  }
+  PINGCORE_PROFILE_NEXT(profile_stage, Input);
+  state_->pointer_->RefreshCursor();
+  state_->pointer_->RefreshHover(false);
+  state_->text_->RefreshTextInputSession();
+  state_->pointer_->AdvancePointerRecognition(frame.timestamp);
+  state_->pointer_->AdvanceDragDrop(frame);
+  state_->file_drop_->AdvanceFileDrop(frame);
+  // Selection re-hits use the prepared geometry above; any new auto-scroll is realized by the following frame.
+  state_->text_->AdvanceTextSelectionDrag(frame);
+  // A completed long press can focus a client and change its selection. Resolve it before building the shared overlay
+  // so the handles and editing toolbar use the resulting selection geometry in this commit.
+  state_->pointer_->AdvanceTextSelectionLongPress(frame.timestamp);
+  PINGCORE_PROFILE_NEXT(profile_stage, Semantics);
+  BuildSemantics();
+
+  PINGCORE_PROFILE_NEXT(profile_stage, Scene);
+  state_->text_->AdvanceTextSelectionOverlay(frame);
+  state_->text_->PaintTextSelectionOverlay();
+  CommitWindowAppearance();
+  UpdateRenderScene(
+      *state_->mounted_root_,
+      state_->mounted_root_->bounds,
+      &state_->text_->Overlay()
+  );
+  const RenderNode* scene_root = &state_->mounted_root_->render_node;
+  const bool scene_transition_was_active = state_->scene_transition_service_->IsActive();
+  const MotionAdvanceResult transition_result = state_->scene_transition_service_->Advance(frame);
+  needs_frame = needs_frame || transition_result.needs_frame;
+  if (transition_result.wake_after.has_value() &&
+      (!next_wakeup.has_value() || *transition_result.wake_after < *next_wakeup)) {
+    next_wakeup = transition_result.wake_after;
+  }
+  scene_root = state_->scene_transition_service_->Compose(scene_root);
+  state_->frame_commit_.render_frame.scene.root = scene_root;
+  PINGCORE_PROFILE_NEXT(profile_stage, Damage);
+  state_->frame_commit_.render_frame.damage = ComputeDamageRegion(
+      state_->frame_commit_.render_frame.scene.root,
+      state_->window_->metrics.viewport,
+      state_->committed_scene_snapshot_,
+      state_->committed_viewport_,
+      state_->has_committed_scene_snapshot_,
+      state_->owner_.external_texture_frame_requester_
+  );
+  if (scene_transition_was_active) {
+    state_->frame_commit_.render_frame.damage.full = true;
+    state_->frame_commit_.render_frame.damage.rects.clear();
+  }
+  PINGCORE_PROFILE_NEXT(profile_stage, Commit);
+  ++state_->frame_commit_.render_frame.revision;
+  if (needs_frame) {
+    RequestFrame();
+  } else if (next_wakeup.has_value()) {
+    RequestFrameAfter(*next_wakeup);
+  }
+  CommitLifecycles();
+  CommitTaskScopes();
+  state_->frame_commit_.next_frame_deadline =
+      state_->frame_requested_ ? std::optional{state_->frame_request_deadline_} : std::nullopt;
+  record_debug_commit();
+  state_->building_frame_ = false;
+  keyboard_dispatch.Finish();
+  return state_->frame_commit_;
+}
+
+void UiWindow::UpdateWindowLifecycleState(WindowLifecycleState lifecycle_state) {
+  state_->application_->RequireThread();
+  if (state_->retired_) return;
+  ExecutionGuard guard(state_->execution_);
+  state_->window_service_->UpdateLifecycleState(lifecycle_state);
+}
+
+void UiWindow::UpdateFullscreen(bool fullscreen) {
+  if (!IsInitialized()) return;
+  state_->application_->RequireThread();
+  ExecutionGuard guard(state_->execution_);
+  state_->window_service_->UpdateFullscreen(fullscreen);
+}
+
+bool UiWindow::HandleFullscreenShortcut(const KeyEvent& event) {
+  if (!IsInitialized() || event.type != KeyEventType::Down || event.key != Key::F11 || event.repeat ||
+      event.modifiers != KeyModifiers{}) {
+    return false;
+  }
+  const auto& window = state_->window_service_;
+  window->RequestFullscreen(!window->IsFullscreen());
+  return true;
+}
+
+bool UiWindow::HandleWindowRequest(WindowCommand command) {
+  ExecutionGuard execution_guard(state_->execution_);
+  return state_->window_service_->HandleRequest(command);
+}
+
+const detail::MountedNode* UiWindow::RootNode() const noexcept {
+  if (!state_->mounted_root_) {
+    return nullptr;
+  }
+  return FindApplicationRoot(*state_->mounted_root_);
+}
+
+void UiWindow::RefreshInteractionTree() {
+  if (!state_->mounted_root_) {
+    state_->focused_node_identity_.reset();
+    state_->focus_visible_ = false;
+    state_->keyboard_activation_identity_.reset();
+    state_->keyboard_press_id_.reset();
+    state_->pointer_->ValidateTargets();
+    return;
+  }
+
+  state_->pointer_->ValidateTargets();
+  if (state_->keyboard_activation_identity_.has_value() && state_->keyboard_press_id_.has_value()) {
+    const std::optional<bool> enabled =
+        DeclaredEnabled(*state_->mounted_root_, *state_->keyboard_activation_identity_);
+    if (!enabled.value_or(false)) {
+      if (detail::MountedNode* pressed = FindNode(*state_->mounted_root_, *state_->keyboard_activation_identity_)) {
+        EndInteraction(*pressed, InteractionEvent::Type::Cancel, InteractionEvent::Source::Keyboard,
+                       *state_->keyboard_press_id_);
+      }
+      state_->keyboard_activation_identity_.reset();
+      state_->keyboard_press_id_.reset();
+    }
+  }
+  ResolveEnabledTree(*state_->mounted_root_, true);
+  detail::MountedNode* focus_root = ActiveFocusTrapRoot();
+  const std::optional<std::uint64_t> focus_identity =
+      focus_root == nullptr ? std::nullopt : std::optional{focus_root->identity};
+  const std::optional<std::uint64_t> previous_focus_identity =
+      state_->focus_trap_stack_.empty() ? std::nullopt : std::optional{state_->focus_trap_stack_.back().identity};
+  if (previous_focus_identity != focus_identity) {
+    // Nested traps retain the focus that each one displaced so removing the topmost trap restores in stack order.
+    const auto existing = focus_identity.has_value()
+                              ? std::ranges::find(state_->focus_trap_stack_, *focus_identity, &FocusTrapFrame::identity)
+                              : state_->focus_trap_stack_.end();
+    if (existing == state_->focus_trap_stack_.end() && focus_identity.has_value()) {
+      state_->focus_trap_stack_.push_back({*focus_identity, state_->focused_node_identity_});
+      if (!focus_root->initial_focus_consumed) {
+        focus_root->initial_focus_consumed = true;
+        const auto* snapshot = focus_root->LayoutValue<LayerEntrySnapshotValue>();
+        if (snapshot && snapshot->initial_focus) {
+          const auto& target = snapshot->initial_focus->binding_;
+          const auto window = target ? target->source->ui.lock() : nullptr;
+          const auto* candidate = window && window->ui_window == this
+              ? FindNode(*focus_root, target->node_identity) : nullptr;
+          if (candidate && candidate->interaction.enabled && candidate->IsFocusable()) {
+            SetFocusedNode(candidate->identity);
+          }
+        }
+      }
+    } else {
+      std::optional<std::uint64_t> restore_identity;
+      while (!state_->focus_trap_stack_.empty() &&
+             (!focus_identity.has_value() || state_->focus_trap_stack_.back().identity != *focus_identity)) {
+        restore_identity = state_->focus_trap_stack_.back().restore_identity;
+        state_->focus_trap_stack_.pop_back();
+      }
+      SetFocusedNode(restore_identity);
+    }
+  }
+  focus_root = ActiveFocusTrapRoot();
+  if (state_->focused_node_identity_.has_value()) {
+    detail::MountedNode* focused = FindNode(*state_->mounted_root_, *state_->focused_node_identity_);
+    if (!focused || !focused->interaction.enabled || !focused->IsFocusable() ||
+        (focus_root && !ContainsNodeIdentity(*focus_root, focused->identity))) {
+      SetFocusedNode(std::nullopt);
+    }
+  }
+  if (focus_root && !state_->focused_node_identity_.has_value()) {
+    std::vector<detail::MountedNode*> layer_focusable;
+    CollectFocusableNodes(*focus_root, layer_focusable);
+    if (!layer_focusable.empty()) {
+      SetFocusedNode(layer_focusable.front()->identity);
+    }
+  }
+
+  ResolveFocusedFlags(*state_->mounted_root_, state_->focused_node_identity_, state_->focus_visible_);
+}
+
+detail::MountedNode* UiWindow::ActiveFocusTrapRoot() {
+  if (!state_->mounted_root_) {
+    return nullptr;
+  }
+  return FindTopmostFocusTrap(*state_->mounted_root_);
+}
+
+std::optional<std::uint64_t> UiWindow::ResolvePointerFocusTarget(const std::vector<detail::MountedNode*>& route) {
+  std::optional<std::uint64_t> candidate;
+  for (auto node = route.rbegin(); node != route.rend(); ++node) {
+    if ((*node)->interaction.enabled && (*node)->IsFocusable()) {
+      candidate = (*node)->identity;
+      break;
+    }
+  }
+
+  if (!candidate.has_value() && state_->focused_node_identity_.has_value()) {
+    // Outside-press barriers terminate at the layer root; only a descendant content hit may retain anchor focus.
+    const detail::MountedNode* pointer_target = route.empty() ? nullptr : route.back();
+    const bool retains_focus = std::ranges::any_of(route, [this, pointer_target](const detail::MountedNode* node) {
+      const auto* snapshot = node->LayoutValue<detail::LayerEntrySnapshotValue>();
+      return node != pointer_target && snapshot != nullptr &&
+             snapshot->retained_focus_target && snapshot->retained_focus_target->binding_ &&
+             snapshot->retained_focus_target->binding_->node_identity == state_->focused_node_identity_;
+    });
+    if (retains_focus) {
+      return state_->focused_node_identity_;
+    }
+  }
+
+  detail::MountedNode* focus_root = ActiveFocusTrapRoot();
+  if (!focus_root || (candidate.has_value() && ContainsNodeIdentity(*focus_root, *candidate))) {
+    return candidate;
+  }
+  if (state_->focused_node_identity_.has_value() &&
+      ContainsNodeIdentity(*focus_root, *state_->focused_node_identity_)) {
+    return state_->focused_node_identity_;
+  }
+
+  std::vector<detail::MountedNode*> focusable;
+  CollectFocusableNodes(*focus_root, focusable);
+  return focusable.empty() ? std::nullopt : std::optional{focusable.front()->identity};
+}
+
+bool UiWindow::HandleBack() {
+  ExecutionGuard execution_guard(state_->execution_);
+  return HandleBack(BackEvent{});
+}
+
+bool UiWindow::HandleBack(const BackEvent& incoming) {
+  ExecutionGuard execution_guard(state_->execution_);
+  BackEvent event = incoming;
+  if (!std::isfinite(event.progress)) {
+    event.progress = event.phase == BackPhase::Commit ? 1.0F : 0.0F;
+  }
+  event.progress = std::clamp(event.progress, 0.0F, 1.0F);
+
+  const auto dispatch_captured = [this, &event](const detail::BackTarget& target) {
+    switch (target.kind) {
+    case detail::BackTargetKind::SelectionOverlay:
+      if (event.phase == BackPhase::Commit) {
+        state_->text_->HideTextSelectionOverlay();
+      }
+      return true;
+    case detail::BackTargetKind::Layer: {
+      if (event.phase != BackPhase::Commit) {
+        return true;
+      }
+      const auto found = std::ranges::find(state_->layer_controller_.state_->entries, target.layer_id, &LayerEntry::id);
+      if (found == state_->layer_controller_.state_->entries.end()) {
+        return true;
+      }
+      if (found->options.cancel_policy == LayerCancelPolicy::Consume) {
+        return true;
+      }
+      PINGCORE_DISCARD(state_->layer_controller_.RequestDismiss(found->id).handled);
+      return true;
+    }
+    case detail::BackTargetKind::Event: {
+      if (event.phase != BackPhase::Commit || !state_->mounted_root_) {
+        return true;
+      }
+      detail::MountedNode* node = FindNode(*state_->mounted_root_, target.node_identity);
+      if (node != nullptr && node->interaction.enabled) {
+        EmitEvent<ViewEvents::BackRequested>(node->event_bindings);
+      }
+      return true;
+    }
+    case detail::BackTargetKind::Extension: {
+      if (!state_->mounted_root_) {
+        return true;
+      }
+      detail::MountedNode* node = FindNode(*state_->mounted_root_, target.extension.node_identity);
+      NodeExtension* extension = FindExtension(*state_->mounted_root_, target.extension);
+      if (node != nullptr && node->interaction.enabled && extension != nullptr) {
+        PINGCORE_DISCARD(extension->OnBack(*node, event));
+      }
+      // A target captured at Begin owns the whole transaction even when it disappears before Commit.
+      return true;
+    }
+    }
+    return false;
+  };
+
+  if (event.phase == BackPhase::Begin && state_->back_target_.has_value()) {
+    const BackEvent begin = event;
+    event = {BackPhase::Cancel, 0.0F};
+    PINGCORE_DISCARD(dispatch_captured(*state_->back_target_));
+    state_->back_target_.reset();
+    event = begin;
+  }
+
+  if (event.phase != BackPhase::Begin && state_->back_target_.has_value()) {
+    const detail::BackTarget target = *state_->back_target_;
+    const bool handled = dispatch_captured(target);
+    if (event.phase == BackPhase::Cancel || event.phase == BackPhase::Commit || !handled) {
+      state_->back_target_.reset();
+    }
+    if (handled) {
+      RequestFrame();
+    }
+    return handled;
+  }
+
+  if (event.phase == BackPhase::Update || event.phase == BackPhase::Cancel) {
+    return false;
+  }
+  state_->back_target_.reset();
+  if (!state_->mounted_root_) {
+    return false;
+  }
+  detail::MountedNode* application_root = FindApplicationRoot(*state_->mounted_root_);
+  if (!application_root) {
+    return false;
+  }
+
+  detail::BackTarget target;
+  bool already_dispatched = false;
+  if (state_->text_->OverlayVisible()) {
+    target.kind = detail::BackTargetKind::SelectionOverlay;
+  } else {
+    const LayerEntry* topmost = nullptr;
+    for (const LayerEntry& entry : state_->layer_controller_.state_->entries) {
+      const bool exiting = entry.transition && !entry.transition->target_visible;
+      if (!exiting && entry.options.cancel_policy != LayerCancelPolicy::PassThrough &&
+          (topmost == nullptr || LayerPaintsAbove(entry, *topmost))) {
+        topmost = &entry;
+      }
+    }
+    if (topmost != nullptr) {
+      target.kind = detail::BackTargetKind::Layer;
+      target.layer_id = topmost->id;
+    } else if (!RouteBackTarget(*application_root, event, target, already_dispatched)) {
+      return false;
+    }
+  }
+
+  if (event.phase == BackPhase::Begin) {
+    state_->back_target_ = target;
+    RequestFrame();
+    return true;
+  }
+  if (already_dispatched) {
+    RequestFrame();
+    return true;
+  }
+  const bool handled = dispatch_captured(target);
+  if (handled) {
+    RequestFrame();
+  }
+  return handled;
+}
+
+bool UiWindow::RequestFocus(std::uint64_t identity, bool focus_visible) {
+  if (state_->retired_ || state_->closing_ || state_->focus_change_in_progress_ || !state_->mounted_root_) return false;
+  const auto* target = FindNode(*state_->mounted_root_, identity);
+  if (!target || !target->interaction.enabled || !target->IsFocusable()) return false;
+  if (const auto* root = ActiveFocusTrapRoot(); root && !ContainsNodeIdentity(*root, identity)) return false;
+  detail::TextInteraction::KeyboardDispatch keyboard_dispatch(*state_->text_);
+  SetFocusedNode(identity, focus_visible);
+  keyboard_dispatch.Finish();
+  return !state_->retired_ && !state_->closing_ && state_->focused_node_identity_ == identity;
+}
+
+void UiWindow::SetFocusedNode(std::optional<std::uint64_t> identity, std::optional<bool> focus_visible, bool reverse) {
+  if (state_->focus_change_in_progress_) return;
+  if (identity.has_value()) {
+    if (!state_->window_->activatable || !state_->mounted_root_) {
+      identity.reset();
+    } else {
+      detail::MountedNode* candidate = FindNode(*state_->mounted_root_, *identity);
+      if (!candidate || !candidate->interaction.enabled || !candidate->IsFocusable()) {
+        identity.reset();
+      }
+    }
+  }
+  const bool next_focus_visible = focus_visible.value_or(state_->focus_visible_);
+  if (state_->focused_node_identity_ == identity && state_->focus_visible_ == next_focus_visible) {
+    return;
+  }
+  if (state_->focused_node_identity_ == identity) {
+    state_->focus_visible_ = next_focus_visible;
+    if (identity.has_value() && state_->mounted_root_) {
+      if (detail::MountedNode* focused = FindNode(*state_->mounted_root_, *identity)) {
+        InteractionState interaction = focused->interaction;
+        interaction.focus_visible = state_->focus_visible_;
+        focused->foreground_paint_dirty = true;
+        UpdateInteraction(*focused, interaction);
+      }
+    }
+    RequestFrame();
+    return;
+  }
+
+  struct FocusChangeGuard {
+    bool& changing;
+    ~FocusChangeGuard() { changing = false; }
+  } focus_change{state_->focus_change_in_progress_};
+  focus_change.changing = true;
+  state_->text_->HideTextSelectionOverlay();
+  if (state_->focused_node_identity_.has_value() && state_->mounted_root_) {
+    if (detail::MountedNode* previous = FindNode(*state_->mounted_root_, *state_->focused_node_identity_)) {
+      InteractionState interaction = previous->interaction;
+      interaction.focused = false;
+      interaction.focus_visible = false;
+      previous->foreground_paint_dirty = true;
+      UpdateInteraction(*previous, interaction);
+      DispatchFocusChanged(*previous, false);
+    }
+  }
+  if (state_->keyboard_activation_identity_.has_value() && state_->keyboard_press_id_.has_value() &&
+      state_->mounted_root_) {
+    if (detail::MountedNode* pressed = FindNode(*state_->mounted_root_, *state_->keyboard_activation_identity_)) {
+      EndInteraction(*pressed, InteractionEvent::Type::Cancel, InteractionEvent::Source::Keyboard,
+                     *state_->keyboard_press_id_);
+    }
+  }
+  state_->keyboard_activation_identity_.reset();
+  state_->keyboard_press_id_.reset();
+  state_->focused_node_identity_ = identity;
+  state_->focus_reveal_pending_ = identity.has_value();
+  state_->focus_visible_ = next_focus_visible;
+  if (state_->focused_node_identity_.has_value() && state_->mounted_root_) {
+    if (detail::MountedNode* next = FindNode(*state_->mounted_root_, *state_->focused_node_identity_)) {
+      InteractionState interaction = next->interaction;
+      interaction.focused = true;
+      interaction.focus_visible = state_->focus_visible_;
+      next->foreground_paint_dirty = true;
+      UpdateInteraction(*next, interaction);
+      DispatchFocusChanged(*next, true, reverse);
+    }
+  }
+  RequestFrame();
+}
+
+void UiWindow::MoveFocus(bool reverse, bool wrap) {
+  if (!state_->mounted_root_) {
+    return;
+  }
+  std::vector<detail::MountedNode*> focusable;
+  detail::MountedNode* root = ActiveFocusTrapRoot();
+  CollectFocusableNodes(root ? *root : *state_->mounted_root_, focusable);
+  if (focusable.empty()) {
+    SetFocusedNode(std::nullopt, true);
+    return;
+  }
+
+  auto current = focusable.end();
+  if (state_->focused_node_identity_.has_value()) {
+    current = std::find_if(focusable.begin(), focusable.end(), [this](const detail::MountedNode* node) {
+      return node->identity == *state_->focused_node_identity_;
+    });
+  }
+
+  if (current == focusable.end()) {
+    SetFocusedNode((reverse ? focusable.back() : focusable.front())->identity, true, reverse);
+    return;
+  }
+  if (reverse) {
+    if (current == focusable.begin()) {
+      if (!wrap) {
+        return;
+      }
+      current = focusable.end();
+    }
+    --current;
+  } else {
+    ++current;
+    if (current == focusable.end()) {
+      if (!wrap) {
+        return;
+      }
+      current = focusable.begin();
+    }
+  }
+  SetFocusedNode((*current)->identity, true, reverse);
+}
+
+bool UiWindow::UpdateNodeExtensions(
+    detail::MountedNode& node,
+    const FrameInfo& frame,
+    bool& needs_frame,
+    std::optional<double>& next_wakeup,
+    bool rebuild_cache
+) {
+  // Extension presence is a structural cache. Layout participation gates this frame's callbacks without discarding
+  // retained extensions, allowing them to resume when their subtree participates again.
+  if (rebuild_cache) {
+    RefreshExtensionPresence(node);
+  }
+  if (!rebuild_cache && !node.subtree_has_extensions) {
+    return false;
+  }
+  if (!node.participates_in_layout) {
+    return false;
+  }
+
+  const bool was_enabled = node.local_enabled;
+  const bool was_excluded = node.exclude_input;
+  node.presentation.suppress_render = false;
+  node.exclude_input = false;
+  node.presentation.overlay = nullptr;
+  node.presentation.local_transform = {};
+  node.presentation.children_transform = {};
+  node.presentation.children_clips.clear();
+  node.presentation.children_fragments.clear();
+  node.presentation.z_index = 0;
+  node.presentation.local_opacity = 1.0F;
+  FrameInfo node_frame = frame;
+  if (!node.extensions.empty()) {
+    node_frame.reduced_motion = node_frame.reduced_motion || node.reduced_motion;
+  }
+  for (NodeExtensionEntry& entry : node.extensions) {
+    if (!entry.extension) {
+      continue;
+    }
+    if (entry.interaction_sync_pending) {
+      entry.extension->OnInteraction(node, node.interaction, std::nullopt);
+      entry.interaction_sync_pending = false;
+    }
+    const NodeExtension::FrameResult result = entry.extension->OnFrame(node, node_frame);
+    needs_frame = needs_frame || result.needs_frame;
+    if (result.wake_after.has_value() && (!next_wakeup.has_value() || *result.wake_after < *next_wakeup)) {
+      next_wakeup = *result.wake_after;
+    }
+  }
+
+  bool interaction_changed = was_enabled != node.local_enabled || was_excluded != node.exclude_input;
+  for (auto& child : node.children) {
+    interaction_changed = UpdateNodeExtensions(*child, frame, needs_frame, next_wakeup, false) || interaction_changed;
+  }
+  return interaction_changed;
+}
+
+void UiWindow::BindExtensions(detail::MountedNode& node) {
+  for (NodeExtensionEntry& entry : node.extensions) {
+    if (!entry.extension) {
+      continue;
+    }
+    entry.extension->BindEvents(node.event_bindings);
+    entry.extension->BindPaintInvalidation([this, owner = &node](NodeExtension::PaintInvalidation invalidation) {
+      if (invalidation == NodeExtension::PaintInvalidation::Content ||
+          invalidation == NodeExtension::PaintInvalidation::Both) {
+        owner->content_paint_dirty = true;
+      }
+      if (invalidation == NodeExtension::PaintInvalidation::Foreground ||
+          invalidation == NodeExtension::PaintInvalidation::Both) {
+        owner->foreground_paint_dirty = true;
+      }
+      if (!state_->building_frame_) {
+        RequestFrame();
+      }
+    });
+    entry.extension->BindSemanticsInvalidation([this] {
+      if (!state_->building_frame_) {
+        RequestFrame();
+      }
+    });
+    entry.extension->BindKeyboardRequest([this, identity = node.identity](bool show) {
+      state_->text_->RequestKeyboardForNode(identity, show);
+    });
+  }
+}
+
+Point UiWindow::HandleScrollInput(const ScrollInputEvent& event) {
+  ExecutionGuard execution_guard(state_->execution_);
+  if (!state_->mounted_root_) {
+    return {};
+  }
+  if (!std::isfinite(event.position.x) || !std::isfinite(event.position.y) || !std::isfinite(event.delta_x) ||
+      !std::isfinite(event.delta_y)) {
+    throw std::invalid_argument("PingCore scroll input values must be finite");
+  }
+
+  std::vector<detail::MountedNode*> route;
+  if (!BuildPointerRoute(*state_->mounted_root_, event.position, route) || route.empty() ||
+      route.back()->kind == detail::NodeKind::PlatformView) {
+    return {};
+  }
+  detail::InteractionOriginScope interaction_origin(state_->current_interaction_origin_, event.position, true);
+  for (auto target = route.rbegin(); target != route.rend(); ++target) {
+    if ((*target)->interaction.enabled && HasEventBinding<ViewEvents::ScrollInput>((*target)->event_bindings)) {
+      if (EmitEvent<ViewEvents::ScrollInput>((*target)->event_bindings, event).value_or(false)) {
+        return {event.delta_x, event.delta_y};
+      }
+      break;
+    }
+  }
+
+  Point consumed;
+  const auto apply_axis = [&](Axis axis, float delta) {
+    if (delta == 0.0F) {
+      return 0.0F;
+    }
+    for (detail::MountedNode* node : route) {
+      if (node->interaction.enabled && IsScrollContainer(*node) && node->scroll_state->Supports(axis)) {
+        StopScrollNodeMotion(*node, axis);
+      }
+    }
+    return ApplyScrollTransaction(route, axis, delta, ScrollSource::Wheel);
+  };
+  consumed.x = apply_axis(Axis::Horizontal, event.delta_x);
+  consumed.y = apply_axis(Axis::Vertical, event.delta_y);
+  return consumed;
+}
+
+bool UiWindow::HandleKeyEvent(const KeyEvent& event) {
+  ExecutionGuard execution_guard(state_->execution_);
+  return state_->text_->DispatchWithKeyboardRequests([&] { return DispatchKeyEvent(event); });
+}
+
+bool UiWindow::DispatchKeyEvent(const KeyEvent& event) {
+  if (!state_->mounted_root_) {
+    return false;
+  }
+
+  detail::MountedNode* focused = nullptr;
+  if (state_->focused_node_identity_.has_value()) {
+    focused = FindNode(*state_->mounted_root_, *state_->focused_node_identity_);
+  }
+  if (focused && (!focused->interaction.enabled || !focused->IsFocusable())) {
+    SetFocusedNode(std::nullopt);
+    state_->text_->RefreshTextInputSession();
+    focused = nullptr;
+  }
+
+  std::optional<detail::InteractionOriginScope> interaction_origin;
+  if (focused) {
+    const Rect focused_bounds = focused->PresentationBounds();
+    interaction_origin.emplace(
+        state_->current_interaction_origin_,
+        Point{
+            focused_bounds.x + focused_bounds.width * 0.5F,
+            focused_bounds.y + focused_bounds.height * 0.5F,
+        },
+        false
+    );
+  }
+
+  if (event.type == KeyEventType::Down && !IsModifierKey(event.key)) {
+    if (focused) {
+      SetFocusedNode(focused->identity, true);
+    }
+  }
+
+  const auto cancel_keyboard_activation = [this, &event] {
+    if (event.type != KeyEventType::Up || event.key != Key::Space ||
+        !state_->keyboard_activation_identity_.has_value()) {
+      return;
+    }
+    if (state_->keyboard_press_id_.has_value()) {
+      if (detail::MountedNode* pressed = FindNode(*state_->mounted_root_, *state_->keyboard_activation_identity_)) {
+        EndInteraction(*pressed, InteractionEvent::Type::Cancel, InteractionEvent::Source::Keyboard,
+                       *state_->keyboard_press_id_);
+      }
+    }
+    state_->keyboard_activation_identity_.reset();
+    state_->keyboard_press_id_.reset();
+  };
+  const auto finish_handled = [this, &cancel_keyboard_activation] {
+    cancel_keyboard_activation();
+    RequestFrame();
+    state_->text_->RefreshTextInputSession();
+    return true;
+  };
+
+  detail::MountedNode* active_focus_root = ActiveFocusTrapRoot();
+  detail::MountedNode* focus_root = active_focus_root ? active_focus_root : state_->mounted_root_.get();
+  std::vector<detail::MountedNode*> focus_route;
+  if (focused) {
+    if (!detail::BuildNodeRoute(*focus_root, focused->identity, focus_route)) {
+      focus_route.push_back(focus_root);
+    }
+  } else if (active_focus_root) {
+    focus_route.push_back(active_focus_root);
+  } else if (detail::MountedNode* application = FindApplicationRoot(*state_->mounted_root_)) {
+    focus_route.push_back(application);
+  }
+  for (detail::MountedNode* node : focus_route) {
+    if (detail::EmitEvent<ViewEvents::KeyIntercept>(node->event_bindings, event).value_or(false)) {
+      return finish_handled();
+    }
+  }
+
+  if (focused && event.type == KeyEventType::Down && !event.modifiers.alt &&
+      (event.modifiers.control || event.modifiers.meta)) {
+    std::optional<TextEditingAction> action;
+    switch (event.key) {
+    case Key::A:
+      action = TextEditingAction::SelectAll;
+      break;
+    case Key::C:
+      action = TextEditingAction::Copy;
+      break;
+    case Key::V:
+      action = TextEditingAction::Paste;
+      break;
+    case Key::X:
+      action = TextEditingAction::Cut;
+      break;
+    default:
+      break;
+    }
+    using EditingActionSource = detail::TextInteraction::EditingActionSource;
+    const auto source = event.repeat ? EditingActionSource::ShortcutRepeat : EditingActionSource::Shortcut;
+    if (action.has_value() && state_->text_->PerformTextEditingAction(*action, source)) {
+      return finish_handled();
+    }
+  }
+  if (focused && state_->text_->HandleFocusedTextInputKey(event)) {
+    return finish_handled();
+  }
+  if (focused && detail::DispatchKey(*focused, event)) {
+    return finish_handled();
+  }
+
+  if (focused && detail::IsActivatable(*focused)) {
+    if (event.type == KeyEventType::Down) {
+      if (event.key == Key::Enter) {
+        if (!event.repeat) {
+          ActivateNode(*focused);
+        }
+        return finish_handled();
+      }
+      if (event.key == Key::Space) {
+        if (!event.repeat && !state_->keyboard_activation_identity_.has_value()) {
+          state_->keyboard_activation_identity_ = focused->identity;
+          state_->keyboard_press_id_ = BeginInteraction(*focused, InteractionEvent::Source::Keyboard);
+        }
+        return finish_handled();
+      }
+    } else if (event.key == Key::Enter) {
+      return finish_handled();
+    } else if (event.key == Key::Space) {
+      if (state_->keyboard_activation_identity_.has_value() &&
+          *state_->keyboard_activation_identity_ == focused->identity) {
+        if (state_->keyboard_press_id_.has_value()) {
+          EndInteraction(*focused, InteractionEvent::Type::Release, InteractionEvent::Source::Keyboard,
+                         *state_->keyboard_press_id_);
+        }
+        ActivateNode(*focused);
+        state_->keyboard_activation_identity_.reset();
+        state_->keyboard_press_id_.reset();
+      }
+      return finish_handled();
+    }
+  }
+
+  const bool shortcut_handled = state_->window_service_->HandleShortcut(event);
+  if (!IsInitialized()) return true;
+  if (shortcut_handled) return finish_handled();
+
+  const bool cancel_key = event.type == KeyEventType::Down && event.key == Key::Escape && !event.repeat &&
+                          !event.modifiers.shift && !event.modifiers.control && !event.modifiers.alt &&
+                          !event.modifiers.meta;
+  if (cancel_key && HandleBack()) {
+    return finish_handled();
+  }
+  if (event.type == KeyEventType::Down && event.key == Key::Tab) {
+    if (!event.repeat) {
+      MoveFocus(event.modifiers.shift);
+    }
+    return finish_handled();
+  }
+  const bool context_menu_key = event.key == Key::ContextMenu && !event.modifiers.shift &&
+                                !event.modifiers.control && !event.modifiers.alt && !event.modifiers.meta;
+  const bool shift_f10 = event.key == Key::F10 && event.modifiers.shift && !event.modifiers.control &&
+                         !event.modifiers.alt && !event.modifiers.meta;
+  if (event.type == KeyEventType::Down && !event.repeat && (context_menu_key || shift_f10) &&
+      DispatchKeyboardContextMenu()) {
+    return finish_handled();
+  }
+  return false;
+}
+
+bool UiWindow::DispatchKeyboardContextMenu() {
+  if (!state_->mounted_root_ || !state_->focused_node_identity_.has_value()) {
+    return false;
+  }
+  detail::MountedNode* focus_root = ActiveFocusTrapRoot();
+  if (!focus_root) {
+    focus_root = state_->mounted_root_.get();
+  }
+  std::vector<detail::MountedNode*> route;
+  if (!BuildNodeRoute(*focus_root, *state_->focused_node_identity_, route)) {
+    return false;
+  }
+  const Rect focused_bounds = route.back()->PresentationBounds();
+  const Point origin{
+      focused_bounds.x + focused_bounds.width * 0.5F,
+      focused_bounds.y + focused_bounds.height * 0.5F,
+  };
+  for (auto node = route.rbegin(); node != route.rend(); ++node) {
+    if (!(*node)->interaction.enabled ||
+        !detail::HasEventBinding<ViewEvents::ContextMenuRequested>((*node)->event_bindings)) {
+      continue;
+    }
+    return detail::EmitEvent<ViewEvents::ContextMenuRequested>((*node)->event_bindings, origin);
+  }
+  return false;
+}
+
+void UiWindow::InvalidateRoot() {
+  if (!state_->root_factory_ || state_->retiring_content_) {
+    return;
+  }
+  state_->application_dirty_ = true;
+  RequestFrame();
+}
+
+void UiWindow::InvalidateLayers() {
+  state_->layers_dirty_ = true;
+  RequestFrame();
+}
+
+void UiWindow::DeactivateLayerInput(LayerId id) {
+  if (!state_->mounted_root_) {
+    return;
+  }
+  detail::MountedNode* layer = FindLayerEntryNode(*state_->mounted_root_, id);
+  if (!layer) {
+    return;
+  }
+
+  state_->pointer_->DeactivateSubtree(*layer);
+
+  const bool text_input_belongs_to_layer =
+      state_->text_->SessionBelongsTo(*layer);
+  if (state_->focused_node_identity_.has_value() && ContainsNodeIdentity(*layer, *state_->focused_node_identity_)) {
+    SetFocusedNode(std::nullopt);
+  }
+  if (text_input_belongs_to_layer) {
+    state_->text_->StopTextInputSession(TextInputEndReason::FocusLost);
+  }
+}
+
+void UiWindow::InvalidateLayerPlacement(LayerId id) {
+  if (state_->mounted_root_) {
+    if (detail::MountedNode* layer = FindLayerEntryNode(*state_->mounted_root_, id)) {
+      // The entry scope owns a layout child whose placement may change without recomposition.
+      const auto identity = layer->children.empty() ? layer->identity : layer->children.front()->identity;
+      MarkLayoutDirtyPath(*state_->mounted_root_, identity);
+      if (!state_->building_frame_) {
+        RequestFrame();
+      }
+      return;
+    }
+  }
+  RequestFrame();
+}
+
+void UiWindow::InvalidateScope(std::uint64_t scope_id) {
+  if (state_->root_scope_ && scope_id == state_->root_scope_->Id()) {
+    state_->application_dirty_ = true;
+  }
+  RequestFrame();
+}
+
+void UiWindow::InvalidateLayout(detail::MountedNode& mounted) {
+  if (state_->mounted_root_) {
+    MarkLayoutDirtyPath(*state_->mounted_root_, mounted.identity);
+  }
+  RequestFrame();
+}
+
+bool UiWindow::RecomposeDirtyScopes(detail::MountedNode& mounted) {
+  if (mounted.kind == NodeKind::Scope && mounted.recompose_scope && mounted.recompose_scope->IsDirty()) {
+    const bool layout_changed = ComposeScope(mounted);
+    mounted.render_structure_dirty = mounted.render_structure_dirty || layout_changed;
+    return layout_changed;
+  }
+
+  bool layout_changed = false;
+  for (auto& child : mounted.children) {
+    layout_changed = RecomposeDirtyScopes(*child) || layout_changed;
+  }
+  if (layout_changed) {
+    mounted.measure_dirty = true;
+    mounted.render_structure_dirty = true;
+  }
+  return layout_changed;
+}
+
+void UiWindow::EnsureRootStructure() {
+  if (state_->mounted_root_) {
+    if (!FindWindowBackplane(*state_->mounted_root_) || !FindApplicationContent(*state_->mounted_root_) ||
+        !FindLayerStack(*state_->mounted_root_) ||
+        (state_->window_->chrome_mode == WindowChromeMode::Custom && !FindWindowControls(*state_->mounted_root_))) {
+      throw std::logic_error("PingCore RuntimeRoot has an invalid child structure");
+    }
+    return;
+  }
+
+  View root = RuntimeRootLayout{};
+  state_->mounted_root_ = Mount(root.spec_, state_->root_environment_);
+  View backplane = Canvas([window = state_->window_](PaintContext& context, Size size) {
+                     const float top = std::min(std::max(0.0F, window->metrics.safe_area.top), size.height);
+                     const float bottom =
+                         std::min(std::max(0.0F, window->metrics.safe_area.bottom), std::max(0.0F, size.height - top));
+                     if (top > 0.0F) {
+                       context.DrawRect({0.0F, 0.0F, size.width, top}, window->appearance.status_bar_background);
+                     }
+                     if (bottom > 0.0F) {
+                       context.DrawRect(
+                           {0.0F, size.height - bottom, size.width, bottom},
+                           window->appearance.navigation_bar_background
+                       );
+                     }
+                   }).LayoutValue<WindowBackplaneValue>(true);
+  // The backplane records only system-bar rectangles and must not subscribe the application root to text Locale.
+  backplane.SetTextShaping({.locale = "und"});
+  View application = ApplicationContentLayout{};
+  if (state_->window_->content_mode == WindowContentMode::SafeArea) {
+    application = std::move(application).With(SafeAreaPadding{});
+  }
+  View layers = LayerStackLayout{};
+  state_->mounted_root_->children.push_back(Mount(backplane.spec_, state_->root_environment_));
+  state_->mounted_root_->children.push_back(Mount(application.spec_, state_->root_environment_));
+  state_->mounted_root_->children.push_back(Mount(layers.spec_, state_->root_environment_));
+  if (state_->window_->chrome_mode == WindowChromeMode::Custom) {
+    View controls = MakeWindowControls(
+        state_->window_service_,
+        state_->window_,
+        state_->root_environment_,
+        HasWindowControlGeometry(state_->window_->metrics)
+    );
+    state_->mounted_root_->children.push_back(Mount(controls.spec_, state_->root_environment_));
+  }
+}
+
+void UiWindow::ReconcileWindowControls() {
+  if (!state_->mounted_root_ || state_->window_->chrome_mode != WindowChromeMode::Custom) {
+    return;
+  }
+  const auto found = std::ranges::find_if(state_->mounted_root_->children, [](const auto& child) {
+    return child && IsWindowControlsNode(*child);
+  });
+  if (found == state_->mounted_root_->children.end()) {
+    return;
+  }
+  View controls = MakeWindowControls(
+      state_->window_service_,
+      state_->window_,
+      state_->root_environment_,
+      HasWindowControlGeometry(state_->window_->metrics)
+  );
+  Reconcile(*found, controls.spec_, state_->root_environment_);
+}
+
+void UiWindow::CommitWindowAppearance() {
+  if (!state_->mounted_root_) {
+    return;
+  }
+  const detail::MountedNode* application = FindApplicationRoot(*state_->mounted_root_);
+  const SystemBarsAppearance* theme_appearance =
+      application == nullptr ? nullptr : FindApplicationSystemBarsFallback(*application);
+  const SystemBarsAppearance fallback =
+      theme_appearance == nullptr ? SystemBarsAppearance::Default() : *theme_appearance;
+  if (!IsValidSystemBarsAppearance(fallback)) {
+    throw std::invalid_argument("PingCore system bars appearance is invalid");
+  }
+
+  const WindowMetrics& metrics = state_->window_->metrics;
+  const float status_boundary =
+      state_->window_->content_mode == WindowContentMode::SafeArea ? metrics.safe_area.top : 0.0F;
+  const float navigation_boundary = state_->window_->content_mode == WindowContentMode::SafeArea
+                                        ? metrics.viewport.height - metrics.safe_area.bottom
+                                        : metrics.viewport.height;
+  SystemBarCandidates candidates;
+  CollectSystemBarCandidates(*state_->mounted_root_, status_boundary, navigation_boundary, candidates);
+
+  SystemBarsAppearance resolved = fallback;
+  if (candidates.status.has_value()) {
+    if (!IsValidSystemBarsAppearance(*candidates.status)) {
+      throw std::invalid_argument("PingCore system bars appearance is invalid");
+    }
+    resolved.status_bar_background = candidates.status->status_bar_background;
+    resolved.status_bar_content = candidates.status->status_bar_content;
+  }
+  if (candidates.navigation.has_value()) {
+    if (!IsValidSystemBarsAppearance(*candidates.navigation)) {
+      throw std::invalid_argument("PingCore system bars appearance is invalid");
+    }
+    resolved.navigation_bar_background = candidates.navigation->navigation_bar_background;
+    resolved.navigation_bar_content = candidates.navigation->navigation_bar_content;
+  }
+
+  const Color status_background = CompositeOver(resolved.status_bar_background, fallback.status_bar_background);
+  const Color navigation_background =
+      CompositeOver(resolved.navigation_bar_background, fallback.navigation_bar_background);
+  const auto brightness = std::pair{
+      ResolveBrightness(resolved.status_bar_content, status_background),
+      ResolveBrightness(resolved.navigation_bar_content, navigation_background),
+  };
+  if (state_->window_->committed_system_bar_brightness != brightness) {
+    state_->window_->committed_system_bar_brightness = brightness;
+    state_->owner_.SetSystemBarsContentBrightness(brightness.first, brightness.second);
+  }
+  std::optional<Color> title_bar_background;
+  if (application != nullptr && metrics.title_bar.has_value()) {
+    CollectWindowDragRegionBackground(*application, status_background, metrics.title_bar->height, title_bar_background);
+  }
+  const Color caption_background = title_bar_background.value_or(status_background);
+  const Color caption_foreground = ResolveCaptionForeground(caption_background);
+  const bool appearance_changed = state_->window_->appearance != resolved;
+  const bool caption_foreground_changed = state_->window_->caption_foreground != caption_foreground;
+  if (appearance_changed) {
+    state_->window_->appearance = resolved;
+    if (detail::MountedNode* backplane = FindWindowBackplane(*state_->mounted_root_)) {
+      backplane->content_paint_dirty = true;
+    }
+  }
+  if (caption_foreground_changed) {
+    state_->window_->caption_foreground = caption_foreground;
+    if (detail::MountedNode* controls = FindWindowControls(*state_->mounted_root_)) {
+      MarkContentPaintDirtyTree(*controls);
+    }
+  }
+}
+
+void UiWindow::ComposeApplication() {
+  state_->application_dirty_ = false;
+  bool scope_composing = false;
+
+  try {
+    state_->root_scope_->BeginComposition();
+    scope_composing = true;
+    Composer composer{state_->root_scope_, state_->root_environment_};
+    Composer::Guard guard{composer};
+
+    ReconcileApplicationContent(state_->root_factory_());
+    state_->root_scope_->EndComposition();
+    scope_composing = false;
+  } catch (...) {
+    if (scope_composing) {
+      state_->root_scope_->AbortComposition();
+    } else {
+      state_->root_scope_->Invalidate();
+    }
+    InvalidateRoot();
+    state_->PropagateCompositionFailure("application root");
+  }
+}
+
+void UiWindow::ReconcileApplicationContent(View content) {
+  EnsureRootStructure();
+  detail::MountedNode* application_content = FindApplicationContent(*state_->mounted_root_);
+  if (!application_content) {
+    throw std::logic_error("PingCore RuntimeRoot is missing its application content container");
+  }
+  std::vector<View> children;
+  if (content) {
+    children.push_back(std::move(content));
+  }
+  application_content->child_paint_order.clear();
+  if (ReconcileChildren(application_content->children, children, state_->root_environment_)) {
+    application_content->measure_dirty = true;
+    application_content->render_structure_dirty = true;
+    state_->mounted_root_->measure_dirty = true;
+    state_->mounted_root_->render_structure_dirty = true;
+  }
+}
+
+void UiWindow::ComposeLayers() {
+  state_->layers_dirty_ = false;
+  try {
+    EnsureRootStructure();
+    detail::MountedNode* layer_stack = FindLayerStack(*state_->mounted_root_);
+    if (!layer_stack) {
+      throw std::logic_error("PingCore RuntimeRoot is missing its LayerStack");
+    }
+    // Factories may mutate the controller while composing; those mutations mark layers dirty for the next frame.
+    const std::vector<LayerEntry> ordered = OrderedLayerEntries(state_->layer_controller_.state_->entries);
+    std::vector<std::pair<View, std::shared_ptr<const Environment>>> layer_children;
+    layer_children.reserve(ordered.size());
+    for (const LayerEntry& entry : ordered) {
+      const auto environment = entry.environment ? entry.environment : state_->root_environment_;
+      const bool barrier = entry.options.pointer_policy == LayerPointerPolicy::Barrier;
+      const bool exiting = entry.transition && !entry.transition->target_visible;
+      View layer = Scope([entry, barrier, exiting]() -> View {
+        View content = entry.content();
+        LayerPresentation presentation;
+        if (content.spec_) {
+          const auto found = content.spec_->layout_values.find(typeid(LayerPresentationValue));
+          if (found != content.spec_->layout_values.end()) {
+            presentation = std::any_cast<LayerPresentation>(found->second.value);
+          }
+        }
+        content = Scope([content = std::move(content)] { return content; });
+        if (exiting) {
+          content.spec_->pointer_events_enabled = false;
+          content.spec_->local_enabled = false;
+        }
+        if (barrier) {
+          content = std::move(content).On<ViewEvents::Pointer>([](const PointerEvent&) {});
+        }
+        const auto placement = presentation.placement.has_value()
+            ? std::make_shared<LayerPlacement>(*presentation.placement) : entry.placement;
+        View result = LayerEntryLayout{std::move(content)}.LayoutValue<LayerPlacementValue>(placement);
+        if (placement->safe_area_policy == LayerSafeAreaPolicy::Constrain) {
+          result = std::move(result).With(SafeAreaPadding{});
+        } else if (placement->safe_area_policy == LayerSafeAreaPolicy::ExtendBottom) {
+          result = std::move(result).With(SafeAreaPadding{.bottom = false});
+        }
+        const auto color = presentation.barrier_color.has_value() ? presentation.barrier_color
+                                                                 : entry.options.barrier_color;
+        if (barrier && color.has_value()) {
+          result = std::move(result).With(Background{*color});
+        }
+        if (entry.transition) {
+          result = std::move(result).With(LayerTransition{entry.transition});
+        }
+        return result;
+      }).LayoutValue<LayerEntrySnapshotValue>(LayerEntrySnapshot{
+          .id = entry.id,
+          .revision = entry.revision,
+          .exiting = exiting,
+          .semantic_modal_group = entry.semantic_modal_group,
+          .retained_focus_target = entry.retained_focus_target,
+          .initial_focus = entry.initial_focus,
+      });
+      // An exiting modal keeps its focus barrier until removal so input cannot fall through while its content fades.
+      layer.spec_->trap_focus = entry.options.trap_focus;
+      if (barrier) {
+        layer = std::move(layer).On<ViewEvents::Pointer>([controller = state_->layer_controller_,
+                                                          id = entry.id,
+                                                          dismiss = entry.options.dismiss_on_outside_press &&
+                                                                    !exiting](const PointerEvent& event) {
+          if (dismiss && event.type == PointerEventType::Down) {
+            PINGCORE_DISCARD(controller.RequestDismiss(id).handled);
+          }
+        });
+      } else if (entry.options.pointer_policy == LayerPointerPolicy::PassThrough) {
+        layer.spec_->pointer_events_enabled = false;
+      }
+      layer_children.emplace_back(std::move(layer), environment);
+    }
+
+    layer_stack->child_paint_order.clear();
+    if (ReconcileLayerChildren(layer_stack->children, layer_children)) {
+      layer_stack->measure_dirty = true;
+      layer_stack->render_structure_dirty = true;
+      state_->mounted_root_->measure_dirty = true;
+      state_->mounted_root_->render_structure_dirty = true;
+    }
+  } catch (...) {
+    InvalidateLayers();
+    state_->PropagateCompositionFailure("layer content");
+  }
+}
+
+bool UiWindow::ComposeScope(detail::MountedNode& mounted) {
+  mounted.child_paint_order.clear();
+  if (!mounted.scope_factory) {
+    const bool layout_changed = !mounted.children.empty();
+    mounted.children.clear();
+    mounted.measure_dirty = mounted.measure_dirty || layout_changed;
+    return layout_changed;
+  }
+  PINGCORE_PROFILE_COMPONENT(mounted);
+  PINGCORE_PROFILE_SCOPE(profile_scope, Scope, mounted.identity);
+  PINGCORE_PROFILE_FLAG(
+      profile_scope,
+      !mounted.recompose_scope ? ProfileFlag::InitialComposition
+          : mounted.recompose_scope->IsDirty() ? ProfileFlag::Invalidated : ProfileFlag::ParentRecomposition
+  );
+  PINGCORE_PROFILE_COUNT(Scopes);
+  if (!mounted.recompose_scope) {
+    mounted.recompose_scope = std::make_shared<RecomposeScope>(*this, NextCompositionIdentity());
+  }
+  mounted.recompose_scope->SetEventBindings(mounted.event_bindings);
+
+  bool scope_composing = false;
+  try {
+    mounted.recompose_scope->BeginComposition();
+    scope_composing = true;
+    Composer composer{mounted.recompose_scope, mounted.environment ? mounted.environment : state_->root_environment_};
+    Composer::Guard guard{composer};
+
+    PINGCORE_PROFILE_SCOPE(profile_factory, Factory, mounted.identity);
+    View content = mounted.scope_factory();
+    PINGCORE_PROFILE_END(profile_factory);
+
+    std::vector<View> children;
+    if (content) {
+      children.push_back(std::move(content));
+    }
+    const bool layout_changed = ReconcileChildren(mounted.children, children, mounted.environment);
+    mounted.recompose_scope->EndComposition();
+    scope_composing = false;
+    mounted.measure_dirty = mounted.measure_dirty || layout_changed;
+    return layout_changed;
+  } catch (...) {
+    if (scope_composing) {
+      mounted.recompose_scope->AbortComposition();
+      InvalidateScope(mounted.recompose_scope->Id());
+    } else {
+      mounted.recompose_scope->Invalidate();
+    }
+    throw;
+  }
+}
+
+bool UiWindow::Reconcile(std::unique_ptr<detail::MountedNode>& mounted, const std::shared_ptr<ViewSpec>& incoming,
+                        const std::shared_ptr<const Environment>& environment) {
+  PINGCORE_PROFILE_SCOPE(profile_reconcile, Reconcile, mounted ? mounted->identity : 0);
+  PINGCORE_PROFILE_COUNT(Reconciles);
+  state_->text_->InvalidateOverlay();
+  const bool compatible = mounted && IsCompatibleNode(*mounted, *incoming) && mounted->key == incoming->key;
+  if (!compatible) {
+    state_->extension_tree_dirty_ = true;
+    mounted = Mount(incoming, environment);
+    return true;
+  }
+
+  std::shared_ptr<const Environment> mounted_environment = environment;
+  std::optional<EnvironmentTransaction> environment_transaction;
+  if (incoming->kind == NodeKind::Environment) {
+    ValidateEnvironmentDeclaration(*incoming);
+    if (!mounted->owned_environment) {
+      throw std::logic_error("PingCore mounted Environment node has no owned values");
+    }
+    environment_transaction.emplace(*mounted->owned_environment, *incoming->local_environment, environment);
+    mounted_environment = mounted->owned_environment;
+  }
+  ViewSpec compiled = CompileViewSpec(*incoming, mounted_environment, *state_->app_resources_);
+  if (environment_transaction.has_value()) {
+    environment_transaction->Commit();
+    environment_transaction.reset();
+  }
+
+  bool layout_changed = !LayoutInputsEqual(*mounted, compiled);
+  if (!ContentPaintInputsEqual(*mounted, compiled)) {
+    mounted->content_paint_dirty = true;
+  }
+  if (!ForegroundPaintInputsEqual(*mounted, compiled)) {
+    mounted->foreground_paint_dirty = true;
+  }
+  std::vector<const ModifierDescriptor*> previous_extension_descriptors;
+  previous_extension_descriptors.reserve(mounted->extensions.size());
+  for (const NodeExtensionEntry& entry : mounted->extensions) {
+    previous_extension_descriptors.push_back(entry.descriptor);
+  }
+  const bool extension_node_inputs_equal = ExtensionNodeInputsEqual(*mounted, compiled, mounted_environment);
+  ApplyViewDeclaration(*mounted, compiled, mounted_environment);
+  const ModifierChanges modifier_changes =
+      ReconcileNodeExtensions(*mounted, compiled.modifiers, extension_node_inputs_equal);
+  layout_changed = layout_changed || modifier_changes.layout_changed;
+  if (modifier_changes.changed) {
+    mounted->foreground_paint_dirty = true;
+  }
+  if (modifier_changes.structure_changed) {
+    std::erase_if(
+        mounted->virtual_semantic_identities,
+        [&previous_extension_descriptors, owner = mounted.get()](const auto& entry) {
+          const std::size_t index = entry.first.extension_index;
+          return index >= owner->extensions.size() || index >= previous_extension_descriptors.size() ||
+                 owner->extensions[index].descriptor != previous_extension_descriptors[index];
+        }
+    );
+    state_->extension_tree_dirty_ = true;
+    BindExtensions(*mounted);
+  }
+  if (mounted->kind == NodeKind::Scope) {
+    layout_changed = ComposeScope(*mounted) || layout_changed;
+  } else if (IsVirtualLayoutNode(*mounted)) {
+    mounted->virtual_state->dependency_capture->Clear();
+    mounted->virtual_state->source = incoming->virtual_items;
+    mounted->virtual_state->item_declarations.clear();
+    mounted->virtual_state->pending_scroll_offset.reset();
+    if (mounted->virtual_state->item_state_cache) {
+      std::erase_if(
+          mounted->virtual_state->item_state_cache->indexed,
+          [item_count = incoming->virtual_items.size](const auto& entry) { return entry.first >= item_count; }
+      );
+      if (mounted->virtual_state->item_state_cache->keyed.empty() &&
+          mounted->virtual_state->item_state_cache->indexed.empty()) {
+        mounted->virtual_state->item_state_cache.reset();
+      }
+    }
+    layout_changed = true;
+  } else {
+    mounted->child_paint_order.clear();
+    layout_changed = ReconcileChildren(mounted->children, incoming->children, mounted->environment) || layout_changed;
+  }
+  mounted->measure_dirty = mounted->measure_dirty || layout_changed;
+  mounted->render_structure_dirty = mounted->render_structure_dirty || layout_changed;
+  return layout_changed;
+}
+
+std::unique_ptr<detail::MountedNode>
+UiWindow::Mount(const std::shared_ptr<ViewSpec>& incoming, const std::shared_ptr<const Environment>& environment) {
+  PINGCORE_PROFILE_SCOPE(profile_mount, Mount, 0);
+  PINGCORE_PROFILE_COUNT(Mounts);
+  std::shared_ptr<Environment> owned_environment;
+  std::shared_ptr<const Environment> mounted_environment = environment;
+  if (incoming->kind == NodeKind::Environment) {
+    ValidateEnvironmentDeclaration(*incoming);
+    owned_environment = std::make_shared<Environment>(*incoming->local_environment);
+    owned_environment->parent_ = environment;
+    mounted_environment = owned_environment;
+  }
+  ViewSpec compiled = CompileViewSpec(*incoming, mounted_environment, *state_->app_resources_);
+  auto mounted = std::make_unique<detail::MountedNode>();
+  mounted->ui_window = this;
+  mounted->identity = state_->next_node_identity_++;
+  PINGCORE_PROFILE_NODE(profile_mount, mounted->identity);
+  mounted->owned_environment = std::move(owned_environment);
+  ApplyViewDeclaration(*mounted, compiled, mounted_environment);
+  if (mounted->kind == NodeKind::ScrollView || mounted->kind == NodeKind::VirtualLayout) {
+    mounted->scroll_state = std::make_unique<ScrollNodeState>();
+  }
+  PINGCORE_DISCARD(ReconcileNodeExtensions(*mounted, compiled.modifiers, false));
+  BindExtensions(*mounted);
+  if (mounted->kind == NodeKind::Scope) {
+    PINGCORE_DISCARD(ComposeScope(*mounted));
+  } else if (IsVirtualLayoutNode(*mounted)) {
+    mounted->virtual_state = std::make_unique<VirtualNodeState>();
+    mounted->virtual_state->source = incoming->virtual_items;
+    std::shared_ptr<RecomposeScope> dependency_scope;
+    if (Composer* composer = Composer::Current()) {
+      dependency_scope = composer->Scope();
+    } else if (VirtualItemDependencyCapture* capture = VirtualItemDependencyCapture::Current()) {
+      dependency_scope = capture->Scope();
+    }
+    mounted->virtual_state->dependency_capture =
+        std::make_unique<VirtualItemDependencyCapture>(std::move(dependency_scope), mounted->identity);
+  } else {
+    PINGCORE_DISCARD(ReconcileChildren(mounted->children, incoming->children, mounted->environment));
+  }
+  return mounted;
+}
+
+bool UiWindow::ReconcileChildren(
+    std::vector<std::unique_ptr<detail::MountedNode>>& mounted_children, const std::vector<View>& incoming_children,
+    const std::shared_ptr<const Environment>& environment
+) {
+  std::unordered_set<ViewKey> incoming_keys;
+  for (const auto& child_view : incoming_children) {
+    if (!child_view.spec_ || !child_view.spec_->key.has_value()) {
+      continue;
+    }
+    if (!incoming_keys.insert(*child_view.spec_->key).second) {
+      throw std::logic_error("PingCore sibling views must not use duplicate keys");
+    }
+  }
+
+  std::vector<std::unique_ptr<detail::MountedNode>> next;
+  std::vector<std::optional<std::size_t>> origins;
+  next.reserve(incoming_children.size());
+  origins.reserve(incoming_children.size());
+  auto previous = std::move(mounted_children);
+  bool layout_changed = false;
+  bool structure_changed = previous.size() != incoming_children.size();
+
+  try {
+    for (std::size_t index = 0; index < incoming_children.size(); ++index) {
+      const auto& child_view = incoming_children[index];
+      if (!child_view.spec_) {
+        continue;
+      }
+
+      std::optional<std::size_t> origin;
+      if (child_view.spec_->key.has_value()) {
+        for (std::size_t previous_index = 0; previous_index < previous.size(); ++previous_index) {
+          const auto& old_child = previous[previous_index];
+          if (old_child && IsCompatibleNode(*old_child, *child_view.spec_) && old_child->key == child_view.spec_->key) {
+            origin = previous_index;
+            break;
+          }
+        }
+      } else if (
+          index < previous.size() && previous[index] && !previous[index]->key.has_value() &&
+          IsCompatibleNode(*previous[index], *child_view.spec_)
+      ) {
+        origin = index;
+      }
+
+      if (origin.has_value()) {
+        layout_changed = Reconcile(previous[*origin], child_view.spec_, environment) || layout_changed;
+        layout_changed = *origin != next.size() || layout_changed;
+        structure_changed = *origin != next.size() || structure_changed;
+        next.push_back(std::move(previous[*origin]));
+      } else {
+        std::unique_ptr<detail::MountedNode> child;
+        layout_changed = Reconcile(child, child_view.spec_, environment) || layout_changed;
+        structure_changed = true;
+        next.push_back(std::move(child));
+      }
+      origins.push_back(origin);
+    }
+  } catch (...) {
+    for (std::size_t index = 0; index < next.size(); ++index) {
+      if (origins[index].has_value()) {
+        previous[*origins[index]] = std::move(next[index]);
+      }
+    }
+    mounted_children = std::move(previous);
+    throw;
+  }
+
+  const bool removed = std::ranges::any_of(previous, [](const auto& child) { return child != nullptr; });
+  layout_changed = previous.size() != next.size() || removed || layout_changed;
+  structure_changed = previous.size() != next.size() || removed || structure_changed;
+  mounted_children = std::move(next);
+  state_->extension_tree_dirty_ = state_->extension_tree_dirty_ || structure_changed;
+  return layout_changed;
+}
+
+bool UiWindow::ReconcileLayerChildren(
+    std::vector<std::unique_ptr<detail::MountedNode>>& mounted_children,
+    const std::vector<std::pair<View, std::shared_ptr<const Environment>>>& incoming_children
+) {
+  const auto declaration_snapshot = [](const View& view) {
+    if (!view.spec_) {
+      throw std::logic_error("PingCore LayerStack child is missing its entry identity");
+    }
+    const auto found = view.spec_->layout_values.find(typeid(LayerEntrySnapshotValue));
+    const auto* snapshot =
+        found == view.spec_->layout_values.end() ? nullptr : std::any_cast<LayerEntrySnapshot>(&found->second.value);
+    if (!snapshot) {
+      throw std::logic_error("PingCore LayerStack child is missing its entry identity");
+    }
+    return *snapshot;
+  };
+
+  std::vector<std::unique_ptr<detail::MountedNode>> next;
+  std::vector<std::optional<std::size_t>> origins;
+  next.reserve(incoming_children.size());
+  origins.reserve(incoming_children.size());
+  auto previous = std::move(mounted_children);
+  bool layout_changed = previous.size() != incoming_children.size();
+  bool structure_changed = layout_changed;
+
+  try {
+    for (std::size_t incoming_index = 0; incoming_index < incoming_children.size(); ++incoming_index) {
+      const auto& [incoming, environment] = incoming_children[incoming_index];
+      const LayerEntrySnapshot incoming_snapshot = declaration_snapshot(incoming);
+      std::optional<std::size_t> origin;
+      for (std::size_t index = 0; index < previous.size(); ++index) {
+        const auto* snapshot = previous[index] ? previous[index]->LayoutValue<LayerEntrySnapshotValue>() : nullptr;
+        if (snapshot != nullptr && snapshot->id == incoming_snapshot.id) {
+          origin = index;
+          break;
+        }
+      }
+
+      if (!origin.has_value()) {
+        std::unique_ptr<detail::MountedNode> child;
+        layout_changed = Reconcile(child, incoming.spec_, environment) || layout_changed;
+        next.push_back(std::move(child));
+        structure_changed = true;
+      } else if (previous[*origin]->LayoutValue<LayerEntrySnapshotValue>()->revision == incoming_snapshot.revision) {
+        layout_changed = *origin != next.size() || layout_changed;
+        structure_changed = *origin != next.size() || structure_changed;
+        next.push_back(std::move(previous[*origin]));
+      } else {
+        layout_changed = Reconcile(previous[*origin], incoming.spec_, environment) || layout_changed;
+        layout_changed = *origin != next.size() || layout_changed;
+        structure_changed = *origin != next.size() || structure_changed;
+        next.push_back(std::move(previous[*origin]));
+      }
+      origins.push_back(origin);
+    }
+  } catch (...) {
+    for (std::size_t index = 0; index < next.size(); ++index) {
+      if (origins[index].has_value()) {
+        previous[*origins[index]] = std::move(next[index]);
+      }
+    }
+    mounted_children = std::move(previous);
+    throw;
+  }
+
+  const bool removed = std::ranges::any_of(previous, [](const auto& child) { return child != nullptr; });
+  layout_changed = removed || layout_changed;
+  structure_changed = removed || structure_changed;
+  mounted_children = std::move(next);
+  state_->extension_tree_dirty_ = state_->extension_tree_dirty_ || structure_changed;
+  return layout_changed;
+}
+
+} // namespace pingcore
+
+namespace pingcore::detail {
+
+MountedNode::~MountedNode() {
+  if (view_handle && view_handle->node_identity == identity) {
+    view_handle->node_identity = 0;
+    view_handle->geometry.reset();
+  }
+}
+
+void MountedNode::PublishViewBinding() {
+  const auto window = view_handle->source->ui.lock();
+  if (!window || window->ui_window != ui_window) {
+    throw std::logic_error("PingCore ViewHandle belongs to another window");
+  }
+  if (view_handle->node_identity != 0 && view_handle->node_identity != identity) {
+    throw std::logic_error("PingCore ViewHandle is bound to multiple mounted Views");
+  }
+  view_handle->node_identity = identity;
+}
+
+VirtualMeasureSession::VirtualMeasureSession(UiWindow& ui_window, MountedNode& owner)
+    : ui_window_(&ui_window), owner_(&owner), previous_nodes_(std::move(owner.children)),
+      previous_realized_indices_(std::move(owner.virtual_state->realized_indices)) {
+  previous_node_identities_.reserve(previous_nodes_.size());
+  for (const auto& node : previous_nodes_) {
+    previous_node_identities_.push_back(node ? node->identity : 0);
+  }
+}
+
+VirtualMeasureSession::~VirtualMeasureSession() {
+  if (!committed_) {
+    RestoreOwner();
+  }
+}
+
+VirtualItemState VirtualMeasureSession::CaptureItemState(MountedNode& mounted) {
+  VirtualItemState state{
+      mounted.kind,
+      mounted.key,
+      mounted.layout_descriptor,
+      mounted.virtual_layout_descriptor,
+      mounted.recompose_scope ? std::optional<StateSlotStorage>{mounted.recompose_scope->TakeStateSlots()}
+                              : std::nullopt,
+      {},
+  };
+  state.children.reserve(mounted.children.size());
+  for (auto& child : mounted.children) {
+    state.children.push_back(CaptureItemState(*child));
+  }
+  return state;
+}
+
+void VirtualMeasureSession::RestoreItemState(MountedNode& mounted, VirtualItemState& state) {
+  if (!IsCompatibleVirtualItemState(mounted, state) || mounted.key != state.key) {
+    return;
+  }
+
+  if (mounted.kind == NodeKind::Scope && state.state_slots) {
+    mounted.recompose_scope = std::make_shared<RecomposeScope>(
+        *ui_window_,
+        NextCompositionIdentity(),
+        std::move(*state.state_slots)
+    );
+    ui_window_->ComposeScope(mounted);
+  }
+
+  std::vector<bool> restored(state.children.size(), false);
+  for (std::size_t index = 0; index < mounted.children.size(); ++index) {
+    MountedNode& child = *mounted.children[index];
+    VirtualItemState* child_state = nullptr;
+    std::size_t state_index = 0;
+
+    if (child.key.has_value()) {
+      for (; state_index < state.children.size(); ++state_index) {
+        if (!restored[state_index] && IsCompatibleVirtualItemState(child, state.children[state_index]) &&
+            state.children[state_index].key == child.key) {
+          child_state = &state.children[state_index];
+          break;
+        }
+      }
+    } else if (
+        index < state.children.size() && !restored[index] && !state.children[index].key.has_value() &&
+        IsCompatibleVirtualItemState(child, state.children[index])
+    ) {
+      state_index = index;
+      child_state = &state.children[index];
+    }
+
+    if (child_state) {
+      restored[state_index] = true;
+      RestoreItemState(child, *child_state);
+    }
+  }
+}
+
+std::size_t VirtualMeasureSession::ItemCount() const noexcept {
+  return owner_->virtual_state->source.size;
+}
+
+MountedNode& VirtualMeasureSession::Item(std::size_t index) {
+  if (index >= ItemCount()) {
+    throw std::out_of_range("PingCore virtual item index is out of range");
+  }
+  if (const auto found = requested_positions_by_index_.find(index); found != requested_positions_by_index_.end()) {
+    return *requested_nodes_[found->second];
+  }
+  try {
+    return RealizeItem(index);
+  } catch (...) {
+    ui_window_->state_->PropagateCompositionFailure("virtual item", index);
+  }
+}
+
+MountedNode& VirtualMeasureSession::RealizeItem(std::size_t index) {
+  auto& state = *owner_->virtual_state;
+  bool declaration_created = false;
+  auto item_declaration = state.item_declarations.find(index);
+  if (item_declaration == state.item_declarations.end()) {
+    if (!state.source.factory) {
+      throw std::logic_error("PingCore virtual item factory must not be empty");
+    }
+    item_declaration = state.item_declarations.emplace(index, state.source.factory(index)).first;
+    declaration_created = true;
+  }
+  const View& item = item_declaration->second;
+  if (!item.spec_) {
+    throw std::logic_error("PingCore virtual item factory must return a non-empty view");
+  }
+  if (item.spec_->key.has_value() && !requested_item_keys_.insert(*item.spec_->key).second) {
+    throw std::logic_error("PingCore mounted virtual items must not use duplicate keys");
+  }
+
+  std::unique_ptr<MountedNode> node;
+  if (item.spec_->key.has_value()) {
+    for (auto& previous : previous_nodes_) {
+      if (previous && IsCompatibleNode(*previous, *item.spec_) && previous->key == item.spec_->key) {
+        node = std::move(previous);
+        break;
+      }
+    }
+  } else {
+    for (std::size_t position = 0; position < previous_nodes_.size(); ++position) {
+      if (previous_nodes_[position] && !previous_nodes_[position]->key.has_value() &&
+          position < previous_realized_indices_.size() && previous_realized_indices_[position] == index) {
+        node = std::move(previous_nodes_[position]);
+        break;
+      }
+    }
+  }
+
+  std::optional<VirtualItemState> retained_state;
+  if (!node && state.item_state_cache) {
+    if (item.spec_->key.has_value()) {
+      const auto found = state.item_state_cache->keyed.find(*item.spec_->key);
+      if (found != state.item_state_cache->keyed.end()) {
+        retained_state.emplace(std::move(found->second));
+        state.item_state_cache->keyed.erase(found);
+      }
+    } else {
+      const auto found = state.item_state_cache->indexed.find(index);
+      if (found != state.item_state_cache->indexed.end()) {
+        retained_state.emplace(std::move(found->second));
+        state.item_state_cache->indexed.erase(found);
+      }
+    }
+    if (state.item_state_cache->keyed.empty() && state.item_state_cache->indexed.empty()) {
+      state.item_state_cache.reset();
+    }
+  }
+
+  if (!node || declaration_created) {
+    VirtualItemDependencyCapture::Guard dependency_guard{*state.dependency_capture};
+    ui_window_->Reconcile(node, item.spec_, owner_->environment);
+  }
+  if (retained_state.has_value()) {
+    RestoreItemState(*node, *retained_state);
+  }
+
+  const std::size_t position = requested_nodes_.size();
+  requested_positions_by_index_.emplace(index, position);
+  requested_nodes_.push_back(std::move(node));
+  requested_item_indices_.push_back(index);
+  return *requested_nodes_.back();
+}
+
+void VirtualMeasureSession::SaveUnmounted(std::unique_ptr<MountedNode> node, std::size_t index) {
+  if (!node) {
+    return;
+  }
+  VirtualItemState retained_state = CaptureItemState(*node);
+  if (!ContainsStateSlots(retained_state)) {
+    return;
+  }
+
+  auto& state = *owner_->virtual_state;
+  if (!state.item_state_cache) {
+    state.item_state_cache = std::make_unique<VirtualItemStateCache>();
+  }
+  if (node->key.has_value()) {
+    state.item_state_cache->keyed.insert_or_assign(*node->key, std::move(retained_state));
+  } else if (index < state.source.size) {
+    state.item_state_cache->indexed.insert_or_assign(index, std::move(retained_state));
+  }
+}
+
+void VirtualMeasureSession::CommitRealization(const std::vector<VirtualLayoutResult::Placement>& placements) {
+  std::vector<std::unique_ptr<MountedNode>> next;
+  std::vector<std::size_t> next_indices;
+  next.reserve(placements.size());
+  next_indices.reserve(placements.size());
+  std::unordered_set<pingcore::ViewNode*> placed;
+
+  for (const auto& placement : placements) {
+    if (placement.item == nullptr || !placed.insert(placement.item).second) {
+      throw std::logic_error("PingCore virtual layout must place each requested item at most once");
+    }
+    const auto found = std::find_if(requested_nodes_.begin(), requested_nodes_.end(), [&placement](const auto& item) {
+      return item.get() == placement.item;
+    });
+    if (found == requested_nodes_.end()) {
+      throw std::logic_error(
+          "PingCore virtual layout can only place items "
+          "requested from its context"
+      );
+    }
+    const std::size_t position = static_cast<std::size_t>(found - requested_nodes_.begin());
+    next.push_back(std::move(*found));
+    next_indices.push_back(requested_item_indices_[position]);
+  }
+
+  for (std::size_t position = 0; position < requested_nodes_.size(); ++position) {
+    if (requested_nodes_[position]) {
+      owner_->virtual_state->item_declarations.erase(requested_item_indices_[position]);
+      SaveUnmounted(std::move(requested_nodes_[position]), requested_item_indices_[position]);
+    }
+  }
+  for (std::size_t position = 0; position < previous_nodes_.size(); ++position) {
+    if (previous_nodes_[position]) {
+      const std::size_t index = position < previous_realized_indices_.size() ? previous_realized_indices_[position] : 0;
+      owner_->virtual_state->item_declarations.erase(index);
+      SaveUnmounted(std::move(previous_nodes_[position]), index);
+    }
+  }
+
+  bool structure_changed =
+      next_indices != previous_realized_indices_ || next.size() != previous_node_identities_.size();
+  if (!structure_changed) {
+    for (std::size_t index = 0; index < next.size(); ++index) {
+      if (!next[index] || next[index]->identity != previous_node_identities_[index]) {
+        structure_changed = true;
+        break;
+      }
+    }
+  }
+
+  owner_->child_paint_order.clear();
+  owner_->children = std::move(next);
+  owner_->virtual_state->realized_indices = std::move(next_indices);
+  ui_window_->state_->extension_tree_dirty_ = ui_window_->state_->extension_tree_dirty_ || structure_changed;
+  committed_ = true;
+}
+
+void VirtualMeasureSession::RestoreOwner() noexcept {
+  owner_->child_paint_order.clear();
+  owner_->children.clear();
+  owner_->virtual_state->realized_indices.clear();
+  for (std::size_t position = 0; position < requested_nodes_.size(); ++position) {
+    if (requested_nodes_[position]) {
+      owner_->children.push_back(std::move(requested_nodes_[position]));
+      owner_->virtual_state->realized_indices.push_back(requested_item_indices_[position]);
+    }
+  }
+  for (std::size_t position = 0; position < previous_nodes_.size(); ++position) {
+    if (previous_nodes_[position]) {
+      owner_->children.push_back(std::move(previous_nodes_[position]));
+      owner_->virtual_state->realized_indices.push_back(
+          position < previous_realized_indices_.size() ? previous_realized_indices_[position] : 0
+      );
+    }
+  }
+}
+
+void InternalAccess::InitializeWindow(
+    UiWindow& ui_window, Runtime& runtime, std::optional<ResourceConfiguration> configuration,
+    WindowLifecycleState lifecycle
+) {
+  const auto& application = *runtime.state_->declaration;
+  ui_window.InitializeWindow(runtime, application.root_factory, application.options.window,
+                            std::move(configuration), lifecycle);
+}
+
+std::shared_ptr<ExecutionContext> InternalAccess::WindowExecution(const UiWindow& ui_window) {
+  return ui_window.state_ ? ui_window.state_->execution_ : nullptr;
+}
+
+void InternalAccess::RetireWindow(UiWindow& ui_window) noexcept {
+  ui_window.Retire();
+}
+
+} // namespace pingcore::detail

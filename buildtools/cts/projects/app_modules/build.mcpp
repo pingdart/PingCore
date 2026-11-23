@@ -1,0 +1,4 @@
+import mcpp;
+import pingcore.rules;
+
+int main() { return pingcore::rules::configure({ .resources = "resources" }) ? 0 : 1; }

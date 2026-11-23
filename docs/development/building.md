@@ -1,0 +1,240 @@
+# Building PingCore
+
+This guide covers framework development from a source checkout.
+Application developers using a released SDK should follow [Getting Started](../guide/getting-started.md).
+
+## Requirements
+
+- CMake 3.20 or later
+- Ninja, Visual Studio, Xcode, or another supported host generator
+- A C++20 compiler
+- The required platform SDK and dependencies
+
+Apple builds require Xcode 26 or later for the standard library's `std::stop_token` and `std::stop_source` support without experimental-library flags. Release CI selects Xcode 26.2 explicitly through `DEVELOPER_DIR` for iOS artifacts and both macOS architectures, including their host-tool builds. For a local build, select a supported Xcode before configuring a fresh build directory. The build-machine requirement is separate from the deployment targets, which remain iOS 15.0 and macOS 12.0.
+The root CMake project selects the native macOS 12.0 default before the first `project()` call, including when invoked by the SDK packaging script. Explicit deployment settings and `MACOSX_DEPLOYMENT_TARGET` retain precedence; when a toolchain file is supplied, that toolchain owns the deployment setting. Existing build caches retain their configured values.
+
+Linux additionally requires GTK 4.14 or later, libepoxy, Pango (including pangoft2), Fontconfig, Cairo, GIO, and libsoup 3 development packages discoverable through pkg-config.
+Linux release CI uses GCC 14. Select it explicitly with `CC=gcc-14 CXX=g++-14` when configuring a fresh build directory; GCC 13 can encounter an internal compiler error in the coroutine-based local-notification example.
+
+Debian or Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install build-essential cmake ninja-build pkg-config libgtk-4-dev libepoxy-dev libsoup-3.0-dev libpango1.0-dev libfontconfig1-dev
+```
+
+Fedora:
+
+```bash
+sudo dnf install gcc-c++ cmake ninja-build pkgconf-pkg-config gtk4-devel libepoxy-devel libsoup3-devel pango-devel fontconfig-devel
+```
+
+## Configure and build
+
+Use the host platform toolchain.
+
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build build --parallel
+```
+
+On Windows, select an installed Visual Studio generator or use a developer shell configured for MSVC.
+Do not use MinGW for the Windows backend.
+`pingcore_add_app` enables MSVC `/utf-8` so source text and ordinary string literals use UTF-8, including in generated composable sources. Manually created application targets must select UTF-8 themselves when passing non-ASCII literals to PingCore text APIs.
+
+Useful project options:
+
+| Option | Desktop top-level default | Purpose |
+|---|---:|---|
+| `PINGCORE_BUILD_SHARED` | `ON` | Build `PingCore::pingcore` |
+| `PINGCORE_BUILD_STATIC` | `ON` | Build `PingCore::pingcore_static` |
+| `PINGCORE_BUILD_TESTS` | `ON` | Build repository tests |
+| `PINGCORE_BUILD_EXAMPLES` | `ON` | Build examples |
+| `PINGCORE_BUILD_CLI` | `ON` | Build the `pingcore` CLI |
+| `PINGCORE_ENABLE_PROFILING` | `OFF` | Compile private Runtime diagnostics for source builds; excluded from SDKs |
+| `PINGCORE_OPTIMIZATION` | `default` | Release optimization level: `default`, `size`, or `minsize` |
+| `PINGCORE_ENABLE_LTO` | `OFF` | Enable LTO for source targets in release configurations |
+| `PINGCORE_WINDOWS_7_COMPAT` | `OFF` | Build the documented Windows 7 compatibility variant |
+
+Android, iOS, and Web builds default to static framework targets.
+See [Size optimization](../guide/packaging.md#size-optimization) for supported optimization settings and CLI options.
+
+## Test
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+Test ownership follows the production contract: `tests/unit` covers portable values and algorithms, `tests/runtime` covers shared composition and lifecycle behavior, and `tests/platform/<platform>` owns backend logic and native integration. `tests/platform/common` contains filesystem integration contracts executed against the selected backend; POSIX and Windows requirements remain separate source files. CLI tests separate command handling, project generation, SDK selection, process execution, and each platform driver. Codegen, resource compiler, CMake integration, and script tests keep their own registration files.
+
+Each suite has CTest labels for its ownership and execution requirements:
+
+```bash
+ctest --test-dir build -LE platform --output-on-failure
+ctest --test-dir build -L portable --output-on-failure
+ctest --test-dir build -L native --output-on-failure
+```
+
+The first command runs common contracts, tools, and general build integration. `portable` selects platform-specific conversion and CLI contract tests that can run on the development host; it does not claim native device coverage. The Web JavaScript bridge and file-picker contracts also run in this group when Node.js is available, using test doubles for browser services. `native` selects integration with the configured platform's services, renderer, and filesystem. Platform names are additional labels for focused selection. Android Instrumentation and Apple bridge checks remain owned by their device or platform build workflows. Common, portable, and native results are reported separately in SDK CI. Public header compile checks also have separate common and platform targets.
+
+Emscripten C++ test suites build as Node.js `.cjs` executables that run Catch2's `main` and return its exit status to CTest through `CMAKE_CROSSCOMPILING_EMULATOR`. They use the host filesystem for test fixtures and omit browser IDBFS startup. `PingCoreWebTestFailureExitTests` runs a hidden, deliberately failing assertion and requires a nonzero exit status, guarding against modules that load without executing tests. Use `ctest -V` to inspect the actual Catch2 case and assertion counts. These Node.js suites do not establish browser or IndexedDB integration coverage; Web applications still build as modularized ES modules with browser storage initialization.
+
+When Chrome or Chromium is available at configure time, `PingCoreWebFileStorageTests` runs a Web application in a temporary headless browser profile. It verifies persistent write restrictions before and after mounting, MEMFS random-access writes, and asynchronous output across a page reload. Set `PINGCORE_WEB_TEST_BROWSER` to the browser executable if CMake cannot find it.
+
+The Node.js test executables enable Asyncify so bounded asynchronous waits can yield to the event loop without holding queue locks. Their emulator command appends `--stack-size=4096` to allow deep scene regression tests to run with a 4 MiB V8 call stack, separate from the Wasm and Asyncify saved-stack sizes. Resource and filesystem tests exercise their real Web operation queues. Tests whose contract requires a second thread report a Catch2 skip on Web; mixed tests retain their single-threaded assertions, and transport callbacks use the application thread. Native builds retain cross-thread and case-folded filesystem alias coverage; Node's host filesystem does not model Web virtual filesystem casing. The Web runner checks both callback delivery and timeout behavior, and its deliberate assertion failure occurs after yielding so CTest also verifies the resumed exit status.
+
+Group cases around one observable contract, using sections or parameterized inputs for its variations. Keep independent lifecycle and error boundaries distinguishable, share only fixtures with matching ownership, and do not add cases merely to increase the count. Run focused test executables directly when changing a narrow subsystem.
+Host CMake integration and script tests are registered in native builds; cross-compilation builds retain their target executable suites and profiling artifact checks. The desktop runtime-deployment tests build and run relocated dependency fixtures; Linux requires `patchelf` 0.19.0 or newer and binutils, and Windows requires the toolchain's Release VC++ redistributables.
+`PingCoreInstalledConsumerTests` installs and relocates the SDK, checks consumer linkage, and performs a fresh source build through the CLI. It has a 20-minute timeout independent of the ordinary test timeout and reports elapsed time at each stage; use `ctest -V -R PingCoreInstalledConsumerTests` to see progress while it runs. Set `CMAKE_BUILD_PARALLEL_LEVEL` to bound its nested builds; the Linux and macOS SDK jobs reuse their matrix build concurrency for this purpose.
+Code-generation changes also require the codegen tests and updated required host tools.
+CI maintains all checked-in host packages through [Host-tool updates](sdk-packaging.md#host-tool-updates).
+When changing that workflow or its support script, run `python -B tests/scripts/host_tools_test.py`; it uses temporary Git repositories and requires only Python 3.12 or later and Git.
+
+Android Runtime tests run on a device or emulator with `./gradlew :PingCore:connectedDebugAndroidTest -PpingcoreBuildNative=true` from `platform/android` (`gradlew.bat` on Windows).
+The library's `androidTest` source set uses `tests/platform/android/instrumentation/PingCoreRuntimeTest.java` as its platform Instrumentation runner and needs no AndroidX/JUnit dependency.
+The host focus checks construct a real `PingCoreView`, so the test package must include the matching native PingCore library and its runtime dependencies; `pingcoreBuildNative=true` builds and packages them for the configured ABIs.
+It covers host focus highlighting, paragraph geometry, and local-notification Intent identity and activation normalization, and installs only the separate test package rather than replacing an example application.
+
+The separate windowless UI smoke runs with `./gradlew :ui_testing:connectedDebugAndroidTest` from the same directory.
+It builds source libraries by default; `-PpingcoreTestingSdk=/absolute/path/to/sdk` selects installed headers, libraries, tools, and resources instead.
+The test module packages its own native dependencies and assets without changing `:PingCore` or an example application.
+See [Android execution](../guide/testing.md#android-execution) for the resource and runner contract.
+
+The iOS smoke bundle includes native presentation and Objective-C module lifetime regressions alongside the windowless UI and file-reference tests.
+Use its UIApplication host so UIKit presentation and dismissal animations actually advance; invoking the bundle directly with the command-line `xctest` agent cannot validate those transitions.
+With an available Simulator selected, run:
+
+```bash
+cmake -S . -B build/ios-testing -G Xcode \
+  -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphonesimulator \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+  -DPINGCORE_BUILD_SHARED=OFF -DPINGCORE_BUILD_STATIC=ON \
+  -DPINGCORE_BUILD_TESTING_LIBRARY=ON -DPINGCORE_BUILD_TESTING_SMOKE_TESTS=ON \
+  -DPINGCORE_BUILD_CLI=OFF -DPINGCORE_BUILD_EXAMPLES=OFF -DPINGCORE_BUILD_TESTS=OFF
+xcodebuild -project build/ios-testing/pingcore.xcodeproj \
+  -scheme pingcore_ui_testing_host -configuration Debug \
+  -destination 'platform=iOS Simulator,id=<simulator-udid>' -parallel-testing-enabled NO test
+```
+
+## Debug layout guides
+
+Open the `DEBUG` ribbon and turn on **Layout guides**. The debug overlay is enabled by default in Debug builds and can also be enabled with `AppOptions::show_debug_overlay`. Guides start off in each window and stay visible when you collapse the panel.
+
+Cyan outlines show node bounds, amber marks padding and content bounds, pink marks actual Row and Column spacing and `Spacer` extents, and green marks alignment. Blue outlines show scroll viewports, and red outlines show explicit clipping. Guides show axis-aligned bounds in the application content tree, with descendant guides limited to the enclosing clip bounds. Separately presented layers and their controls are outside that tree.
+
+## Runtime profiling
+
+To profile an application, select a PingCore source checkout with `--sdk` and pass `--profile` to `build`, `run`, or `package`.
+
+```bash
+pingcore run windows --config release --sdk ../PingCore --profile
+```
+
+The CLI uses a separate build directory where it owns the build cache. Android forwards the setting through the `pingcoreProfiling` Gradle property and iOS through the `PINGCORE_ENABLE_PROFILING` Xcode build setting. Existing Android and iOS projects need to forward those settings to CMake from `platform/android/app/build.gradle` and `platform/ios/Scripts/build_pingcore_core.sh`, respectively, as the current templates do. Both platform shells default to `OFF`.
+
+Profiling builds require a matching `hcg` for source metadata. The [host tool build scripts](sdk-packaging.md#host-tool-updates) can rebuild the tools from the checkout when the bundled versions are older.
+
+Source builds default to `PINGCORE_ENABLE_PROFILING=OFF`; explicitly enable the option to compile private Runtime diagnostics for source applications and repository examples.
+The option is independent of Debug and Release; use an optimized build for performance measurements.
+Existing build directories retain their cached value; pass `-DPINGCORE_ENABLE_PROFILING=OFF` explicitly to disable diagnostics in a directory previously configured with the option on.
+Defining a macro only on an application cannot add instrumentation to a precompiled SDK.
+With the option off, the recorder source is excluded and instrumentation macros do not evaluate their arguments; there is no added capture buffer, timer, environment lookup, or per-node profiling branch.
+The DEBUG overlay provides live frame and process metrics in ordinary builds.
+
+```bash
+cmake -S . -B build/profile -G Ninja -DCMAKE_BUILD_TYPE=Release -DPINGCORE_ENABLE_PROFILING=ON
+cmake --build build/profile --target example_ui_gallery pingcore_runtime_tests --parallel
+ctest --test-dir build/profile -R PingCoreProfilingBuildTests --output-on-failure
+```
+
+Profiling-enabled builds start idle. Open the DEBUG panel, select **Start recording**, reproduce the interaction, and select **Stop recording**. When the trace is ready, **Export trace** opens the window's file picker.
+The profiling build of UI Gallery shows the DEBUG ribbon in Release. Other Release applications can enable it with `AppOptions::show_debug_overlay = true`.
+Each capture belongs to the current window. If the buffer fills, recording stops automatically and **Prepare trace** makes the completed frames available for export.
+
+For scripted capture, set `PINGCORE_PROFILE=overview` for frame stages and aggregate counters or `PINGCORE_PROFILE=detailed` for nested scope, reconciliation, layout, paint recording, and resource spans. Each window records on startup and exports on normal retirement.
+The optional `PINGCORE_PROFILE_DIRECTORY` selects the automatic output directory, which defaults to `traces/` under the working directory at window creation. An unavailable directory reports a diagnostic.
+
+PowerShell, using the build above:
+
+```powershell
+$env:PINGCORE_PROFILE = "detailed"
+& ./build/profile/bin/example_ui_gallery.exe
+```
+
+Unset `PINGCORE_PROFILE` to start idle and allow manual recording. Set it to `off` to disable recording for the process.
+
+The event and source storage share an 8 MiB budget per capture. Buffer exhaustion or a frame failure discards the incomplete frame. Earlier complete frames and counters remain available until the next recording or window retirement.
+Detailed captures include the composable's function name, project-relative file path, definition line, and the mounted component ID. Files outside the project use their basename. The event's node ID identifies the actual node measured or painted, including a descendant of that component. Scope events report the recomposition reason and measurement events mark cache hits.
+Capture data is limited to timings, counts, IDs, and source metadata.
+
+Open the JSON with [Perfetto](https://perfetto.dev/docs/getting-started/other-formats#chrome-json-format).
+**Runtime frame** measures shared CPU-side frame construction in `UiWindow::BuildFrame()`. Paint spans measure drawing command recording, and nested spans report inclusive durations.
+The `pingcore` JSON field holds complete-frame counters and truncation information.
+Recording and export can affect performance, so use a profiling-disabled optimized build for the application timing baseline.
+
+SDK packaging scripts explicitly set `PINGCORE_ENABLE_PROFILING=OFF` for their target libraries, including both Windows configurations.
+Installing libraries or producing an SDK from a profiling-enabled host build is rejected; reconfigure with the option off and rebuild before packaging.
+
+## Examples
+
+Examples live under `examples/<name>` and produce targets named `example_<name>`.
+
+```bash
+cmake --build build --target example_ui_gallery
+```
+
+[`example_virtual_table`](../../examples/virtual_table/main.cpp) shows a read-only 10,000 × 100 table using the public `VirtualLayout` protocol. Scroll diagonally, keep scrolling vertically at the right edge, and use **Far corner** to jump via both controllers. Toggle **Compact** or **Roomy** to exercise anchor correction and clamping on both axes.
+
+[`example_transition`](../../examples/transition/main.cpp) is an interactive Transition Studio covering page Push, Pop, Replace, and whole-scene changes. Select among ten effects, including a prism sweep, split gate, cascade mosaic, circular reveal and close, and the fragmented Crimson rift, enable slow motion, and compare the reversed return animation. Example-owned path, transform, fragment, and synchronized decoration effects live in [`effects.cpp`](../../examples/transition/effects.cpp). Build with `cmake --build build --target example_transition`; Android selects `-PpingcoreExample=transition` and the iOS runner selects `PINGCORE_APP_TARGET=example_transition`.
+
+[`example_shared_transition`](../../examples/shared_transition/main.cpp) demonstrates titles moving from a reading list to a detail page, covers growing from thumbnails, and descriptions crossfading with SharedBounds. A separate local card demonstrates expansion, an arc, and interrupted retargeting without navigation; its control stays outside the animated scope. Both modes offer slow playback. Keep participating regions fully in view. Build with `cmake --build build --target example_shared_transition`; Android selects `-PpingcoreExample=shared_transition` and the iOS runner selects `PINGCORE_APP_TARGET=example_shared_transition`.
+
+[`example_multi_window`](../../examples/multi_window/main.cpp) demonstrates moving tabs between two open desktop windows. Build with `cmake --build build --target example_multi_window`. Hosts without multiple-window support disable the open-window command.
+
+[`example_desktop_lyrics`](../../examples/desktop_lyrics/main.cpp) demonstrates a borderless floating panel on Windows, macOS, and Linux. Build with `cmake --build build --target example_desktop_lyrics`. Open the panel, click **Next lyric** to replace its text, and drag a non-interactive part of the panel to move it. **Pass clicks through** lets you use the window below the lyrics. Use the main window to restore input or close the panel.
+
+[`example_system_tasks`](../../examples/system_tasks/README.md) demonstrates continued file export, system-scheduled export validation, and an ongoing HTTP receive session. It includes Android cold-start loading and foreground service configuration, plus an iOS Info.plist selected through `PINGCORE_APP_INFO_PLIST`. Its README covers platform support, storage, build commands, and device checks.
+
+Desktop binaries or application bundles are emitted under the configured build output.
+Android examples use `platform/android/example_runner`, and iOS examples use the repository platform runner.
+The Android runner resolves the selected example's final CMake shared-library name into `BuildConfig.PINGCORE_APP_LIBRARY`; MainActivity loads it before creating the hosted Runtime, without a fixed application `.so` name.
+
+[`example_buffer_reference`](../../examples/buffer_reference/main.cpp) pulls successive grayscale frames from one fixed native allocation, analyzes row-strided bytes in C++, and displays the mean, histogram, and backing-reference reuse check without converting frames into images.
+Select `-PpingcoreExample=buffer_reference` on Android or `PINGCORE_APP_TARGET=example_buffer_reference` in the iOS runner; Android uses DirectByteBuffer and Apple uses NSMutableData through PlatformPayload, while Windows and Linux use the C++ reference directly.
+The next button is enabled only after analysis finishes; there is no background producer or implicit read lock. Web displays an unsupported message.
+
+`example_application` demonstrates lifecycle, general activation, activated-file reading, and runtime permissions. The separate [`example_local_notification`](../../examples/local_notification/main.cpp) demonstrates notification authorization, default and template presentation, one-shot scheduling, cancellation, and activation data.
+
+On Windows, `example_application` calls the public URL scheme registration API at entry to register `pingcore-example` for the current executable and user. Open `pingcore-example://documents/42` to exercise cold-start or running-window activation. Registration conflicts are reported at entry; close the old copy and run its `--unregister-url-scheme` cleanup argument before moving to a different build path. See [Windows URL scheme registration](../guide/packaging.md#windows-url-scheme-registration).
+
+On Windows 10 or later, build and run `example_local_notification` directly. Its Windows shell registers a separate development notification identity for the current user before the host starts, without installation or a registration script. Registration persists for notification clicks after exit; close the example and use the [development cleanup command](../guide/packaging.md#windows-notification-registration) before moving or deleting its executable. Registration success and an accepted submission do not prove user-visible delivery.
+
+For Android, select it with `-PpingcoreExample=local_notification` when building `platform/android/example_runner`. The runner loads the selected example's Java sources and resources from `examples/<name>/android/src/main/{java,res}` and merges its optional `AndroidManifest.xml` over the shared manifest for debug and release. Notification channel setup, permission, receiver, and RemoteViews belong to this example; other examples do not package that configuration. For example, from `platform/android`:
+
+```bash
+./gradlew :example_runner:assembleDebug -PpingcoreExample=local_notification
+```
+
+The notification example supplies a Windows ToastGeneric XML provider, an Android template provider, and an iOS Content Extension. Windows progress bars require Windows 10 version 1703 or later; progress submissions replace the notification and may show another popup rather than updating in place. In the iOS runner, select the dedicated `PingCoreNotifications` scheme; changing the generic runner's C++ example target alone does not embed an extension. The [iOS runner instructions](../../platform/ios/example_runner/README.md#download-notification-example) cover signing and device validation. macOS can exercise default notifications, and unsupported hosts display capability results instead of simulating notifications.
+
+The shared download example retrieves the fixed PingCore v0.2.0 Windows SDK ZIP (54,836,850 bytes) only after the user presses Download. It streams into an attempt-specific cache directory, updates the same notification at most about once per second during transfer, and publishes a terminal complete, failed, or canceled snapshot. Only successfully closed downloads are renamed from `.part` to `.zip`; files are not extracted or installed. Failed or canceled partial files and completed downloads remain in app cache, and retries use separate directories. Downloading depends on the running application's Task lifetime, not a platform background download service or restartable download manager; process termination can leave the last progress notification visible.
+
+The Android example's channel uses low importance so progress updates do not request sound or heads-up interruptions, subject to user settings. Compact and optional expanded RemoteViews read `file_name`, `downloaded_bytes`, nullable `total_bytes`, `status`, and `expanded` from `data`. Clicking returns the submitted snapshot through startup or subsequent activation and displays its fields without treating them as file-access authority. Unknown totals use indeterminate progress; the release's advertised size is not substituted for a transport-provided total. Default reminders retain their own identifier and remain available alongside the download.
+
+`example_streaming_text` is a local Agent repair simulation. Edit the message at the bottom and press Enter or Send: the first response follows a compact inspection, failure, patch, and verification sequence. Its 15 blocks retain a scripted analysis summary, numbered steps, nested bullets, four tool calls, attributed text, code, file actions, a result table, three concept images, and a controlled question form. Every later message, including a form submission or revision request, uses a four-block interaction-review continuation instead of replaying the investigation. It carries the user's follow-up into a fixed scripted review, not a model-generated answer; earlier messages and proposals remain unchanged. Analysis summaries are fictional, not private model reasoning; no model is contacted, no command is executed, and no project file is read or changed.
+
+Tool cards show a command and expandable output, with Running, Completed, Failed, or Stopped status. Completed calls include their scripted exit code; stopping an active call preserves its received log prefix without claiming an exit result. Logs arrive in batches of up to two lines every 140 ms. Prose arrives in varying batches of 12–24 Unicode scalars every 36 ms, and analysis summaries in batches of six every 50 ms; prose publication combines two transport chunks. Transport batching keeps updates visible without one-character-per-frame delivery. Code coloring remains source-versioned so late worker results cannot overwrite a newer tail.
+
+Completed blocks and the selection index remain shared while only the active text part changes. A tool's command stays immutable while its output streams through the same independently observed tail used by ordinary paragraphs. Generation, answers, tool outcomes, and expansion choices live outside virtual rows. Incoming updates follow the bottom only when the reader is already there; Latest returns to the end, and Stop preserves received content. Table cells copy in row order with tab separators. List prefixes, including bullet symbols and nested indentation, belong to the copied text; wrapped item bodies align under their own text. Collapsed analysis and collapsed tool output are excluded from selection, while the tool command remains available. Code, terminal output, and tables scroll horizontally on narrow screens. Web retains the documented basic-shaping limits.
+
+File names, addition/deletion counts, source snippets, and previews derive from the same immutable mock diff data. Click a file or Review proposal to open the scrollable Dialog with old/new line numbers and marked additions/deletions; copied diff text excludes the line-number gutters. Previewing changes does not interrupt generation or send a new message. Escape or the close icon dismisses the Dialog. Submitting the controlled question form or choosing Request revision appends another user turn; submitted forms retain an Answered status. The example uses public APIs and structured fixtures without a Markdown parser, an Agent framework, or embedded Views inside text runs.
+
+The three concept images stay in one horizontally scrollable row, with selectable captions in document order. Click a thumbnail to open a larger, aspect-preserving image in a viewport-constrained Dialog; Escape, platform Back, an outside press, or the close icon dismisses it. The preview retains the image and caption independently of virtual-row lifetime and does not interrupt streaming.
+
+The example supplies its own light ThemeSpec to MaterialTheme: neutral surfaces, graphite text, and restrained teal accents. Tool cards use white surfaces, code and questions use a pale neutral fill, and the composer has a distinct bordered surface. Commands and code use neutral foregrounds; completed and failed tool states use green and red labels without relying on color alone. Concept images share the example palette, including the diff preview's addition/deletion colors. Hover, ripple, focus, form controls, and dialogs follow this local theme; framework defaults are unchanged.
+
+## Source and installed consumption
+
+The [CMake SDK contract](../design/sdk-cli.md#cmake-sdk) defines the public helpers and targets shared by source builds and installed packages. Consumer projects use public headers and those targets.
+
+For Windows applications created with `pingcore_add_app`, use debugger output or application-owned logging. The GUI subsystem does not create a console for standard output or standard error in either Debug or Release builds.

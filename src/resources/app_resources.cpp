@@ -1,0 +1,546 @@
+#include "resource_internal.h"
+#include "internal_access.h"
+
+#include <algorithm>
+#include <cmath>
+#include <stdexcept>
+#include <string_view>
+#include <tuple>
+
+#include <pingcore/environment.h>
+#include <pingcore/app.h>
+#include <pingcore/file.h>
+
+#include "runtime/profiling_internal.h"
+#include "application/application_internal.h"
+
+namespace pingcore::detail {
+
+namespace {
+
+auto ResourceKey(const ResourceIndexEntry& entry) {
+  return std::tuple{entry.kind, entry.id.Domain(), entry.id.Key()};
+}
+
+bool IsAsciiAlpha(char value) {
+  return (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z');
+}
+
+bool IsAsciiDigit(char value) {
+  return value >= '0' && value <= '9';
+}
+
+bool IsScriptSubtag(std::string_view value) {
+  return value.size() == 4 && std::ranges::all_of(value, IsAsciiAlpha);
+}
+
+bool IsRegionSubtag(std::string_view value) {
+  return (value.size() == 2 && std::ranges::all_of(value, IsAsciiAlpha)) ||
+         (value.size() == 3 && std::ranges::all_of(value, IsAsciiDigit));
+}
+
+std::string JoinLocalePrefix(const std::vector<std::string_view>& subtags, std::size_t count) {
+  std::string result;
+  for (std::size_t index = 0; index < count; ++index) {
+    if (!result.empty()) {
+      result.push_back('-');
+    }
+    result.append(subtags[index]);
+  }
+  return result;
+}
+
+void AppendLocaleFallback(std::vector<std::string>& fallbacks, std::string value) {
+  if (std::ranges::find(fallbacks, value) == fallbacks.end()) {
+    fallbacks.push_back(std::move(value));
+  }
+}
+
+std::vector<std::string> LocaleFallbacks(const Locale& locale) {
+  const std::string_view language_tag = locale.LanguageTag();
+  std::vector<std::string_view> subtags;
+  std::size_t start = 0;
+  while (start < language_tag.size()) {
+    const std::size_t end = language_tag.find('-', start);
+    subtags.push_back(language_tag.substr(start, end == std::string_view::npos ? end : end - start));
+    if (end == std::string_view::npos) {
+      break;
+    }
+    start = end + 1;
+  }
+
+  constexpr std::size_t no_subtag = std::string_view::npos;
+  std::size_t script_index = no_subtag;
+  std::size_t region_index = no_subtag;
+  std::size_t core_count = 1;
+  if (core_count < subtags.size() && IsScriptSubtag(subtags[core_count])) {
+    script_index = core_count++;
+  }
+  if (core_count < subtags.size() && IsRegionSubtag(subtags[core_count])) {
+    region_index = core_count++;
+  }
+
+  std::vector<std::string> result;
+  for (std::size_t count = subtags.size(); count >= core_count; --count) {
+    AppendLocaleFallback(result, JoinLocalePrefix(subtags, count));
+    if (count == core_count) {
+      break;
+    }
+  }
+  if (region_index != no_subtag) {
+    AppendLocaleFallback(result, std::string(subtags.front()) + '-' + std::string(subtags[region_index]));
+  }
+  if (script_index != no_subtag) {
+    AppendLocaleFallback(result, std::string(subtags.front()) + '-' + std::string(subtags[script_index]));
+  }
+  AppendLocaleFallback(result, std::string(subtags.front()));
+  AppendLocaleFallback(result, {});
+  return result;
+}
+
+std::string MissingResourceMessage(const ResourceId& id) {
+  return "PingCore resource is missing from the installed package: " + id.ToString();
+}
+
+} // namespace
+
+AppResources::AppResources(PlatformResources* platform_resources) : platform_resources_(platform_resources) {
+  if (platform_resources_ == nullptr) {
+    return;
+  }
+  configuration_ = platform_resources_->Configuration();
+  if (!std::isfinite(configuration_.display_scale) || configuration_.display_scale <= 0.0F) {
+    throw std::logic_error("PingCore platform resource display scale must be finite and positive");
+  }
+  if (auto index = platform_resources_->OpenRead(resource_index_path)) {
+    LoadIndex(ReadStreamBytes(std::move(*index)));
+  }
+}
+
+AppResources::AppResources(const File& directory) : directory_(directory) {
+  auto index = OpenPackageFile(directory.Resolve(resource_index_path));
+  if (!index) {
+    throw std::logic_error("PingCore resource package index is missing: " + directory.Path());
+  }
+  auto bytes = ReadStreamBytes(std::move(*index));
+  if (bytes.empty()) {
+    throw std::logic_error("PingCore resource package index is empty: " + directory.Path());
+  }
+  LoadIndex(std::move(bytes));
+}
+
+void AppResources::LoadIndex(Bytes bytes) {
+  entries_ = ParseResourceIndex(RawAsset::FromBytes(std::move(bytes)));
+  // The immutable package keeps each resource's locale and scale variants contiguous after this initial sort.
+  std::ranges::sort(entries_, {}, [](const ResourceIndexEntry& entry) {
+    return std::tuple{ResourceKey(entry), std::string_view(entry.locale), entry.scale};
+  });
+}
+
+void AppResources::Disconnect() {
+  std::scoped_lock lock(mutex_);
+  platform_resources_ = nullptr;
+}
+
+InputStream AppResources::OpenRead(std::string_view package_path) {
+  std::optional<InputStream> stream;
+  if (directory_) {
+    stream = OpenPackageFile(directory_->Resolve(package_path));
+  } else {
+    // Disconnect waits only for opening. Returned streams own their platform handles independently.
+    std::scoped_lock lock(mutex_);
+    if (!platform_resources_) {
+      throw std::logic_error("PingCore packaged resource service is disconnected");
+    }
+    stream = platform_resources_->OpenRead(package_path);
+  }
+  if (!stream) {
+    throw std::logic_error("PingCore packaged resource payload is missing: " + std::string(package_path));
+  }
+  return std::move(*stream);
+}
+
+std::unique_lock<std::mutex> AppResources::LockCache() {
+  return IsIndependentPackage() ? std::unique_lock{mutex_} : std::unique_lock<std::mutex>{};
+}
+
+void AppResources::UpdateConfiguration(ResourceConfiguration configuration) {
+  if (!std::isfinite(configuration.display_scale) || configuration.display_scale <= 0.0F) {
+    throw std::logic_error("PingCore platform resource display scale must be finite and positive");
+  }
+  if (configuration_ == configuration) {
+    return;
+  }
+  BeginDependencyChange(configuration_dependency_);
+  configuration_ = std::move(configuration);
+  CommitDependencyChange(configuration_dependency_);
+}
+
+ResourceConfiguration AppResources::Configuration(bool observe) const {
+  if (observe) ObserveDependency(configuration_dependency_);
+  return configuration_;
+}
+
+ResourceConfiguration AppResources::EffectiveConfiguration(bool observe) const {
+  if (directory_) {
+    return configuration_;
+  }
+  ResourceConfiguration result = configuration_;
+  auto dependency = configuration_dependency_;
+  const auto source = CurrentExecutionContext();
+  if (source && source->requires_ui) {
+    const auto ui = source->ui.lock();
+    if (!ui || !ui->ui_window) {
+      throw std::logic_error("PingCore resource lookup originating UI is disconnected");
+    }
+    if (ui->configuration) {
+      result = *ui->configuration;
+      dependency = ui->configuration_dependency;
+    }
+  }
+  if (observe) {
+    ObserveDependency(dependency);
+  }
+  for (auto environment = CurrentEnvironment(); environment; environment = EnvironmentParent(*environment)) {
+    const std::any* value = observe ? FindLocalEnvironmentValue(*environment, typeid(Locale))
+                                    : PeekLocalEnvironmentValue(*environment, typeid(Locale));
+    if (value) {
+      result.locale = std::any_cast<const Locale&>(*value);
+      break;
+    }
+  }
+  return result;
+}
+
+RawAsset AppResources::Resolve(RawResource resource) {
+  PINGCORE_PROFILE_SCOPE(profile_resource, Resource, 0);
+  PINGCORE_PROFILE_COUNT(Resources);
+  const auto entries = FindEntries(ResourceEntryKind::Raw, resource);
+  if (entries.empty()) {
+    throw std::logic_error(MissingResourceMessage(resource));
+  }
+  const auto& entry = entries.front();
+  auto lock = LockCache();
+  const auto cached = raw_cache_.find(entry.package_path);
+  if (cached != raw_cache_.end()) {
+    return cached->second;
+  }
+  RawAsset asset = InternalAccess::PackagedRaw(weak_from_this(), entry.package_path, entry.mime_type);
+  raw_cache_.emplace(entry.package_path, asset);
+  return asset;
+}
+
+std::span<const ResourceIndexEntry> AppResources::FindEntries(ResourceEntryKind kind, const ResourceId& id) const {
+  const auto entries = std::ranges::equal_range(entries_, std::tuple{kind, id.Domain(), id.Key()}, {}, ResourceKey);
+  return {entries.begin(), entries.end()};
+}
+
+std::span<const ResourceIndexEntry>
+AppResources::ResolveLocalized(const ResourceId& id, ResourceEntryKind kind, const Locale& locale) const {
+  const auto candidates = FindEntries(kind, id);
+  const std::vector<std::string> fallbacks = LocaleFallbacks(locale);
+  for (const std::string& fallback : fallbacks) {
+    const auto entries = std::ranges::equal_range(candidates, fallback, {}, &ResourceIndexEntry::locale);
+    if (!entries.empty()) {
+      return {entries.begin(), entries.end()};
+    }
+  }
+  throw std::logic_error(MissingResourceMessage(id));
+}
+
+ResolvedImageAsset AppResources::ReadImage(const ResourceIndexEntry& entry) {
+  RawAsset raw = RawAsset::FromBytes(ReadStreamBytes(OpenRead(entry.package_path)), entry.mime_type);
+  if (InternalAccess::IsVectorPayload(raw)) {
+    VectorAsset asset = InternalAccess::VectorFromRaw(std::move(raw));
+    if (asset.IntrinsicSize() != entry.intrinsic_size) {
+      throw std::logic_error("PingCore vector metadata does not match the installed payload: " + entry.id.ToString());
+    }
+    return asset;
+  }
+  ImageAsset asset = InternalAccess::ImageFromRaw(std::move(raw), entry.scale);
+  if (asset.PixelWidth() != entry.pixel_width || asset.PixelHeight() != entry.pixel_height) {
+    throw std::logic_error("PingCore image metadata does not match the installed payload: " + entry.id.ToString());
+  }
+  return asset;
+}
+
+ResolvedImageAsset AppResources::ResolveImage(ImageResource resource, const Locale& locale,
+                                              std::optional<float> display_scale) {
+  PINGCORE_PROFILE_SCOPE(profile_resource, Resource, 0);
+  PINGCORE_PROFILE_COUNT(Resources);
+  const float scale = display_scale ? *display_scale : EffectiveConfiguration(true).display_scale;
+  if (!std::isfinite(scale) || scale <= 0) {
+    throw std::invalid_argument("PingCore resource display scale must be finite and positive");
+  }
+  const auto candidates = ResolveLocalized(resource, ResourceEntryKind::Image, locale);
+  const auto selected =
+      std::ranges::lower_bound(candidates, scale, {}, &ResourceIndexEntry::scale);
+  const ResourceIndexEntry& entry = selected == candidates.end() ? candidates.back() : *selected;
+  std::string cache_key = entry.package_path + '@' + std::to_string(entry.content_hash);
+  {
+    auto lock = LockCache();
+    if (const auto cached = image_cache_.find(cache_key); cached != image_cache_.end()) {
+      return cached->second;
+    }
+  }
+  auto asset = ReadImage(entry);
+  auto lock = LockCache();
+  return image_cache_.try_emplace(std::move(cache_key), std::move(asset)).first->second;
+}
+
+ImageAsset AppResources::Resolve(ImageResource resource, const Locale& locale, std::optional<float> display_scale) {
+  ResolvedImageAsset asset = ResolveImage(std::move(resource), locale, display_scale);
+  if (const auto* image = std::get_if<ImageAsset>(&asset)) {
+    return *image;
+  }
+  throw std::invalid_argument("PingCore UseImage requires a raster image resource");
+}
+
+VectorAsset AppResources::ResolveVector(ImageResource resource, const Locale& locale, std::optional<float> display_scale) {
+  ResolvedImageAsset asset = ResolveImage(std::move(resource), locale, display_scale);
+  if (const auto* image = std::get_if<VectorAsset>(&asset)) {
+    return *image;
+  }
+  throw std::invalid_argument("PingCore UseVectorImage requires a vector image resource");
+}
+
+ResolvedStringResource AppResources::Resolve(const StringResource& resource, const Locale& locale) const {
+  PINGCORE_PROFILE_SCOPE(profile_resource, Resource, 0);
+  PINGCORE_PROFILE_COUNT(Resources);
+  const ResourceIndexEntry& entry = ResolveLocalized(resource, ResourceEntryKind::String, locale).front();
+  return {entry.value, entry.argument_count};
+}
+
+Locale ResolveResourceLocale(std::shared_ptr<const Environment> environment, const AppResources& resources) {
+  if (const std::any* value = FindEnvironmentValue(std::move(environment), typeid(Locale))) {
+    if (const auto* locale = std::any_cast<Locale>(value)) {
+      return *locale;
+    }
+    throw std::logic_error("PingCore Locale environment value has an invalid type");
+  }
+  return resources.Configuration().locale;
+}
+
+} // namespace pingcore::detail
+
+namespace pingcore {
+
+namespace {
+
+std::shared_ptr<detail::AppResources> CurrentResources() {
+  try {
+    return UseService<detail::AppResources>();
+  } catch (const std::logic_error&) {
+    throw std::logic_error("PingCore resource lookup requires an active Runtime resource service");
+  }
+}
+
+} // namespace
+
+RawAsset UseRawResource(RawResource resource) {
+  return CurrentResources()->Resolve(std::move(resource));
+}
+
+ImageAsset UseImage(ImageResource resource) {
+  return CurrentResources()->Resolve(std::move(resource), UseEnvironment<Locale>());
+}
+
+VectorAsset UseVectorImage(ImageResource resource) {
+  return CurrentResources()->ResolveVector(std::move(resource), UseEnvironment<Locale>());
+}
+
+namespace detail {
+
+namespace {
+
+std::string FormatResolvedString(
+    const StringResource& resource, const ResolvedStringResource& resolved, std::span<const std::string> arguments
+) {
+  if (arguments.size() != resolved.argument_count) {
+    throw std::invalid_argument(
+        "PingCore localized string requires exactly " + std::to_string(resolved.argument_count) + " arguments for " +
+        resource.ToString()
+    );
+  }
+  const std::string& format = resolved.value;
+  std::string result;
+  result.reserve(format.size());
+  for (std::size_t index = 0; index < format.size();) {
+    if (format[index] == '{' && index + 1 < format.size() && format[index + 1] == '{') {
+      result.push_back('{');
+      index += 2;
+      continue;
+    }
+    if (format[index] == '}' && index + 1 < format.size() && format[index + 1] == '}') {
+      result.push_back('}');
+      index += 2;
+      continue;
+    }
+    if (format[index] != '{') {
+      result.push_back(format[index++]);
+      continue;
+    }
+    const std::size_t end = format.find('}', index + 1);
+    if (end == std::string::npos || end == index + 1) {
+      throw std::logic_error("PingCore localized string template is invalid: " + resource.ToString());
+    }
+    std::size_t argument_index = 0;
+    for (std::size_t digit = index + 1; digit < end; ++digit) {
+      if (format[digit] < '0' || format[digit] > '9') {
+        throw std::logic_error("PingCore localized string template is invalid: " + resource.ToString());
+      }
+      argument_index = argument_index * 10 + static_cast<std::size_t>(format[digit] - '0');
+    }
+    if (argument_index >= arguments.size()) {
+      throw std::invalid_argument(
+          "PingCore localized string argument is missing for " + resource.ToString() + " at index " +
+          std::to_string(argument_index)
+      );
+    }
+    result += arguments[argument_index];
+    index = end + 1;
+  }
+  return result;
+}
+
+} // namespace
+
+std::string ResolveString(const StringVariant& value, AppResources& resources, const Locale& locale) {
+  const auto& source = InternalAccess::StringValue(value);
+  if (const auto* literal = std::get_if<std::string>(&source)) {
+    return *literal;
+  }
+  const StringResource& resource = std::get<StringResource>(source);
+  return FormatResolvedString(resource, resources.Resolve(resource, locale), InternalAccess::StringArguments(value));
+}
+
+std::string ResolveString(StringVariant&& value, AppResources& resources, const Locale& locale) {
+  auto& source = InternalAccess::StringValue(value);
+  if (auto* literal = std::get_if<std::string>(&source)) {
+    return std::move(*literal);
+  }
+  return ResolveString(value, resources, locale);
+}
+
+const std::string& StringLiteral(const StringVariant& value) {
+  if (const auto* literal = std::get_if<std::string>(&InternalAccess::StringValue(value))) {
+    return *literal;
+  }
+  throw std::logic_error("PingCore unresolved StringVariant reached mounted state");
+}
+
+std::string StringLiteral(StringVariant&& value) {
+  if (auto* literal = std::get_if<std::string>(&InternalAccess::StringValue(value))) {
+    return std::move(*literal);
+  }
+  throw std::logic_error("PingCore unresolved StringVariant reached mounted state");
+}
+
+ResolvedImageAsset ResolveImage(const ImageVariant& image, AppResources& resources, const Locale& locale,
+                                 std::optional<float> display_scale) {
+  ValidateImageVariant(image);
+  return std::visit(
+      [&resources, &locale, display_scale](const auto& value) -> ResolvedImageAsset {
+        using Image = std::decay_t<decltype(value)>;
+        if constexpr (std::same_as<Image, ImageResource>) {
+          return resources.ResolveImage(value, locale, display_scale);
+        } else {
+          return value;
+        }
+      },
+      image
+  );
+}
+
+ResolvedImageAsset UseImageVariant(const ImageVariant& image) {
+  if (!NeedsResourceResolution(image)) {
+    ValidateImageVariant(image);
+    if (const auto* raster = std::get_if<ImageAsset>(&image)) {
+      return *raster;
+    }
+    if (const auto* bitmap = std::get_if<Bitmap>(&image)) return *bitmap;
+    return std::get<VectorAsset>(image);
+  }
+  std::shared_ptr<AppResources> resources = CurrentResources();
+  return ResolveImage(image, *resources, UseEnvironment<Locale>());
+}
+
+} // namespace detail
+
+std::string UseString(const StringVariant& value) {
+  if (!detail::NeedsResourceResolution(value)) {
+    return detail::StringLiteral(value);
+  }
+  std::shared_ptr<detail::AppResources> resources = CurrentResources();
+  return detail::ResolveString(value, *resources, UseEnvironment<Locale>());
+}
+
+std::string UseString(StringVariant&& value) {
+  if (!detail::NeedsResourceResolution(value)) {
+    return detail::StringLiteral(std::move(value));
+  }
+  std::shared_ptr<detail::AppResources> resources = CurrentResources();
+  return detail::ResolveString(std::move(value), *resources, UseEnvironment<Locale>());
+}
+
+Resources Resources::OpenPackage(const File& directory) {
+  return Resources(std::make_shared<detail::AppResources>(directory), {});
+}
+
+void Resources::RequireLifetime() const {
+  if (!resources_) {
+    throw std::logic_error("PingCore resource resolver was moved from");
+  }
+  if (resources_->IsIndependentPackage()) {
+    return;
+  }
+  const auto application = application_.lock();
+  if (!application) {
+    throw std::logic_error("PingCore resource service application lifetime has ended");
+  }
+  application->RequireThread();
+  if (application->phase == detail::ApplicationRuntimeState::Phase::Stopped) {
+    throw std::logic_error("PingCore resource service is disconnected");
+  }
+  if (const auto source = detail::CurrentExecutionContext(); source && source->application.lock() != application) {
+    throw std::logic_error("PingCore resource service belongs to another application lifetime");
+  }
+}
+
+ResourceConfiguration Resources::Configuration() const {
+  RequireLifetime();
+  return resources_->EffectiveConfiguration(false);
+}
+
+RawAsset Resources::GetRawResource(RawResource resource) const {
+  RequireLifetime();
+  return resources_->Resolve(std::move(resource));
+}
+
+ImageAsset Resources::GetImage(ImageResource resource) const {
+  return GetImage(std::move(resource), Configuration());
+}
+
+ImageAsset Resources::GetImage(ImageResource resource, const ResourceConfiguration& configuration) const {
+  RequireLifetime();
+  return resources_->Resolve(std::move(resource), configuration.locale, configuration.display_scale);
+}
+
+VectorAsset Resources::GetVectorImage(ImageResource resource) const {
+  return GetVectorImage(std::move(resource), Configuration());
+}
+
+VectorAsset Resources::GetVectorImage(ImageResource resource, const ResourceConfiguration& configuration) const {
+  RequireLifetime();
+  return resources_->ResolveVector(std::move(resource), configuration.locale, configuration.display_scale);
+}
+
+std::string Resources::GetString(const StringVariant& value) const {
+  return GetString(value, Configuration());
+}
+
+std::string Resources::GetString(const StringVariant& value, const ResourceConfiguration& configuration) const {
+  RequireLifetime();
+  return detail::ResolveString(value, *resources_, configuration.locale);
+}
+} // namespace pingcore

@@ -1,0 +1,142 @@
+#include "support.h"
+
+using namespace pingcore::cli::test;
+
+TEST_CASE("PingCoreCliLinuxEnvironmentDiagnosisOwnsToolChecks") {
+  if (pingcore::cli::CurrentHostId() != "linux") {
+    SKIP("Linux prerequisite diagnosis requires a Linux host");
+  }
+  const pingcore::cli::PlatformDriver* linux = pingcore::cli::FindPlatformDriver("linux");
+  REQUIRE(linux != nullptr);
+  pingcore::cli::EnvironmentRequest request;
+  request.generator = "Unix Makefiles";
+  const std::vector<pingcore::cli::EnvironmentDiagnostic> linux_diagnostics = linux->DiagnoseEnvironment(request);
+  const auto has_linux_diagnostic = [&linux_diagnostics](std::string_view id) {
+    return std::any_of(
+        linux_diagnostics.begin(),
+        linux_diagnostics.end(),
+        [id](const pingcore::cli::EnvironmentDiagnostic& diagnostic) { return diagnostic.id == id; }
+    );
+  };
+  REQUIRE(has_linux_diagnostic("pkg-config"));
+  REQUIRE(has_linux_diagnostic("make"));
+  REQUIRE(has_linux_diagnostic("pkg:epoxy"));
+  REQUIRE(has_linux_diagnostic("pkg:gio-2.0"));
+  REQUIRE(has_linux_diagnostic("pkg:libsoup-3.0"));
+  REQUIRE(has_linux_diagnostic("pkg:pangoft2"));
+  REQUIRE(has_linux_diagnostic("pkg:fontconfig"));
+  const auto gtk_diagnostic = std::find_if(
+      linux_diagnostics.begin(),
+      linux_diagnostics.end(),
+      [](const pingcore::cli::EnvironmentDiagnostic& diagnostic) { return diagnostic.id == "pkg:gtk4"; }
+  );
+  REQUIRE(gtk_diagnostic != linux_diagnostics.end());
+  REQUIRE(gtk_diagnostic->required_version == "4.14");
+  REQUIRE_FALSE(has_linux_diagnostic("pkg:x11"));
+  REQUIRE_FALSE(has_linux_diagnostic("pkg:egl"));
+  REQUIRE_FALSE(has_linux_diagnostic("pkg:glesv2"));
+  REQUIRE_FALSE(has_linux_diagnostic("meson"));
+  REQUIRE_FALSE(has_linux_diagnostic("ninja"));
+  REQUIRE_FALSE(has_linux_diagnostic("gperf"));
+  // Each is taken from the host by a build system that does not provision its own toolchain.
+  REQUIRE(std::ranges::all_of(linux_diagnostics, &pingcore::cli::EnvironmentDiagnostic::host_toolchain));
+  REQUIRE_FALSE(has_linux_diagnostic("git"));
+}
+
+TEST_CASE("PingCoreCliCreatesAndRunsLinuxApplicationsThroughTheRootCMakeProject") {
+  TemporaryDirectory temporary;
+  const pingcore::cli::PlatformDriver* linux = pingcore::cli::FindPlatformDriver("linux");
+  REQUIRE(linux != nullptr);
+  const std::filesystem::path project = temporary.Path() / "sample";
+  const std::filesystem::path build = project / ".pingcore/build/linux/debug";
+  const pingcore::cli::PlatformCommandContext context{
+      project,
+      temporary.Path() / "sdk",
+      build,
+      "Ninja",
+      "debug",
+      {},
+  };
+
+  const std::vector<pingcore::cli::GeneratedFile> shell =
+      linux->CreateShell(pingcore::cli::MakeProjectTemplateContext("sample"));
+  const auto main = std::find_if(shell.begin(), shell.end(), [](const pingcore::cli::GeneratedFile& file) {
+    return file.path == "main.cpp";
+  });
+  REQUIRE(main != shell.end());
+  REQUIRE(main->content.find("RunApplication()") != std::string::npos);
+  REQUIRE(std::find_if(shell.begin(), shell.end(), [](const pingcore::cli::GeneratedFile& file) {
+            return file.path == "pingcore.cmake";
+          }) != shell.end());
+  REQUIRE(std::find_if(shell.begin(), shell.end(), [](const pingcore::cli::GeneratedFile& file) {
+            return file.path == "package/AppRun";
+          }) != shell.end());
+  REQUIRE(linux->LibraryGraphCommands(context).empty());
+
+  const std::vector<pingcore::cli::ProcessCommand> build_commands = linux->BuildCommands(context);
+  REQUIRE(build_commands.size() == 2);
+  REQUIRE(
+      build_commands[0].arguments ==
+      std::vector<std::string>{
+          "-G",
+          "Ninja",
+          "-S",
+          project.string(),
+          "-B",
+          build.string(),
+          "-DCMAKE_BUILD_TYPE=Debug",
+          "-DPINGCORE_HOME=" + context.pingcore_home.string(),
+          "-DPINGCORE_PACKAGE=OFF",
+      }
+  );
+  REQUIRE(
+      build_commands[1].arguments ==
+      std::vector<std::string>{"--build", build.string(), "--config", "Debug"}
+  );
+
+  const std::filesystem::path artifact = build / "bin/sample";
+  const std::filesystem::path plan = build / "pingcore-integration/sample/Debug/app.json";
+  std::filesystem::create_directories(artifact.parent_path());
+  std::filesystem::create_directories(plan.parent_path());
+  std::ofstream(artifact) << "test\n";
+  std::ofstream(plan) << "{\n"
+                         "  \"target\": \"sample\",\n"
+                         "  \"bundleIdentifier\": \"com.example.sample\",\n"
+                         "  \"version\": \"1.2.3\",\n"
+                         "  \"installComponent\": \"PingCoreApplication\",\n"
+                         "  \"artifact\": \""
+                      << artifact.generic_string() << "\"\n}\n";
+
+  const std::vector<pingcore::cli::ProcessCommand> run_commands = linux->RunCommands(context);
+  REQUIRE(run_commands.size() == 1);
+  REQUIRE(std::filesystem::equivalent(run_commands[0].executable, artifact));
+  REQUIRE(run_commands[0].arguments.empty());
+  REQUIRE(std::filesystem::equivalent(run_commands[0].working_directory, artifact.parent_path()));
+
+  const std::vector<pingcore::cli::PackageArtifact> package_artifacts = linux->PackageArtifacts(context);
+  const std::filesystem::path app_image = project / ".pingcore/package/linux/debug/sample-1.2.3.AppImage";
+  const std::vector<pingcore::cli::PackageArtifact> expected_package_artifacts{{app_image, app_image.filename()}};
+  REQUIRE(package_artifacts == expected_package_artifacts);
+
+  auto system_package = context;
+  system_package.package = true;
+  for (const std::string format : {"deb", "rpm"}) {
+    system_package.package_format = format;
+    const auto system_artifact = app_image.parent_path() / ("com.example.sample-1.2.3." + format);
+    REQUIRE(linux->PackageArtifacts(system_package) ==
+            std::vector<pingcore::cli::PackageArtifact>{{system_artifact, system_artifact.filename()}});
+    REQUIRE_THROWS_AS(linux->VerifyBuildAbis(system_package), std::runtime_error);
+  }
+
+  auto explicit_context = context;
+  explicit_context.abis = {"aarch64"};
+  const std::array<unsigned char, 20> elf_header{0x7f, 'E', 'L', 'F', 2, 1, 0, 0, 0, 0,
+                                                0,    0,   0,   0,   0, 0, 0, 0, 0xb7, 0};
+  std::ofstream(artifact, std::ios::binary)
+      .write(reinterpret_cast<const char*>(elf_header.data()), static_cast<std::streamsize>(elf_header.size()));
+  REQUIRE_NOTHROW(linux->VerifyBuildAbis(explicit_context));
+  const auto explicit_package = linux->PackageArtifacts(explicit_context);
+  REQUIRE(explicit_package.front().source == app_image.parent_path() / "aarch64" / app_image.filename());
+  explicit_context.abis = {"x86_64"};
+  REQUIRE_THROWS_AS(linux->VerifyBuildAbis(explicit_context), std::runtime_error);
+}

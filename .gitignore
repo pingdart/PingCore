@@ -1,19 +1,30 @@
-# PingDartCore .gitignore
-build/
-build-*/
-dist/
-dist-*/
-.cache/*
-!.cache/googletest-v1.15.2.tar.gz
-compile_commands.json
+/build/
+.idea
+.vscode
+.vs
+.cache
 .DS_Store
-*.swp
-*.o
-*.a
-*.so
-*.dylib
-*.dll
-*.exe
-rust/**/target/
-.gradle/
-**/.gradle/
+*.xcuserstate
+.codex
+.claude
+cmake-build**
+/bin/
+/obj/
+.omo/
+build-egl/
+
+# mcpp build outputs (the mcpp leg of the dual build system).
+target/
+.mcpp/
+# The framework is a library package, so its lock file is a build record rather than a pin; the tool
+# packages below buildtools/mcpp keep theirs.
+/mcpp.lock
+compile_commands.json
+# GCC writes module BMIs beside the compiler's working directory; a stray
+# `gcm.cache/` at the repo root is a 28 MB build artifact, not a source file.
+gcm.cache/
+# PingCore's profiling writes a runtime trace per process into the working
+# directory, so `mcpp test` leaves one behind in the test package.
+traces/
+__pycache__/
+*.pyc

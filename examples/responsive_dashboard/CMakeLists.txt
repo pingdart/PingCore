@@ -1,4 +1,0 @@
-# examples/responsive_dashboard/CMakeLists.txt
-add_executable(example_responsive_dashboard main.cpp)
-target_include_directories(example_responsive_dashboard PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_compile_features(example_responsive_dashboard PRIVATE cxx_std_20)

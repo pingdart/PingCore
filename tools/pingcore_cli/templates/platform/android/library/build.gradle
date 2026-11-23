@@ -1,0 +1,18 @@
+plugins {
+    id "com.android.library"
+}
+
+android {
+    namespace = "@PROJECT_ID@"
+    compileSdk = @ANDROID_COMPILE_SDK@
+
+    defaultConfig {
+        minSdk = @ANDROID_MIN_SDK@
+        consumerProguardFiles "consumer-rules.pro"
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_1_8
+        targetCompatibility = JavaVersion.VERSION_1_8
+    }
+}

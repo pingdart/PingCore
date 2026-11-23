@@ -1,0 +1,322 @@
+#pragma once
+
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <typeindex>
+#include <variant>
+
+#include <pingcore/layer.h>
+#include <pingcore/app.h>
+#include <pingcore/layout.h>
+#include <pingcore/modifier.h>
+#include <pingcore/paint.h>
+#include <pingcore/resource.h>
+#include <pingcore/render_scene.h>
+#include <pingcore/scroll.h>
+#include <pingcore/text.h>
+#include <pingcore/vector.h>
+#include <pingcore/virtual_layout.h>
+
+namespace pingcore {
+class NavigationItem;
+class UiWindow;
+class Runtime;
+class Application;
+class SharedBounds;
+class SharedElement;
+class SharedTransitionScope;
+class TransitionSpec;
+class View;
+}
+
+namespace pingcore::detail {
+
+struct MountedNode;
+struct PathElement;
+struct SharedMarkerData;
+class SharedTransitionCoordinator;
+struct VirtualCollectionSemantics;
+
+// Public headers only declare this friend. Implementations stay with the subsystem owning each operation.
+// Existing ownership, internal cooperation, and direct field sharing do not need a forwarding function here.
+struct InternalAccess {
+  /// Initializes shared application state after the backend's native services are ready.
+  /// @param runtime Original platform or testing Runtime, called on its application thread.
+  /// @param application Declaration providing startup options and the root factory.
+  /// @param startup_activation Initial activation, or nullopt for a background-only start.
+  /// @param hosted Whether to publish the service table for context-free acquisition; false isolates test hosts.
+  /// @param lifecycle Native process state visible to application hooks.
+  static void InitializeRuntime(Runtime& runtime, const Application& application,
+      std::optional<ApplicationActivation> startup_activation = LaunchActivation{}, bool hosted = false, ApplicationLifecycleState lifecycle = ApplicationLifecycleState::Active);
+  /// Disconnects application services and callbacks before native Runtime members are destroyed.
+  /// @param runtime Original owner; repeated retirement is harmless and must run on its application thread.
+  static void RetireRuntime(Runtime& runtime) noexcept;
+  /// Attaches shared window state after native text, rendering, and scheduling facilities are usable.
+  /// @param ui_window Native attachment to initialize on the application's thread.
+  /// @param runtime Live application owner that outlives this attachment.
+  /// @param configuration Initial window resources, or nullopt to use the application's configuration.
+  /// @param lifecycle Initial visibility/activation state exposed to WindowHooks.
+  static void InitializeWindow(UiWindow& ui_window, Runtime& runtime,
+      std::optional<ResourceConfiguration> configuration = std::nullopt,
+      WindowLifecycleState lifecycle = WindowLifecycleState::Background);
+  /// Borrows the frozen application catalog while preparing native facilities before UI installation.
+  static PlatformRegistry& ApplicationRegistry(Runtime& runtime);
+  /// Captures a native callback's window provenance; an uninitialized attachment returns no context.
+  static std::shared_ptr<ExecutionContext> WindowExecution(const UiWindow& ui_window);
+  /// Retires shared UI state while native window facilities are still alive.
+  /// @param ui_window Original attachment; retirement is idempotent and stays on the application thread.
+  static void RetireWindow(UiWindow& ui_window) noexcept;
+#pragma region View
+
+  static const std::optional<std::variant<std::int64_t, std::uint64_t, std::string>>&
+  ViewDeclarationKey(const View& view) noexcept;
+
+#pragma endregion
+
+#pragma region UiWindow
+
+  static void InvalidateRoot(UiWindow& ui_window);
+  // Returns the application content root inside the runtime-owned containers.
+  static const MountedNode* RootNode(const UiWindow& ui_window) noexcept;
+  // Returns the complete mounted tree, including runtime-owned containers.
+  static const MountedNode* MountedRoot(const UiWindow& ui_window) noexcept;
+#if defined(__EMSCRIPTEN__) || (defined(__linux__) && !defined(__ANDROID__))
+  static std::uint64_t TextMetricsRevision(const UiWindow& ui_window) noexcept;
+  // Platform backends clear renderer caches before invalidating shared text geometry on the application thread.
+  static void InvalidateTextMetrics(UiWindow& ui_window);
+#endif
+  static const ScrollPhysics& DefaultScrollPhysics(const UiWindow& ui_window) noexcept;
+  static void NotifyScrollActivity(UiWindow& ui_window, MountedNode& node, const ScrollActivity& activity);
+  static void RequestFrame(UiWindow& ui_window);
+  static void FocusNode(UiWindow& ui_window, std::uint64_t identity);
+  static std::optional<std::uint64_t> FocusedNodeIdentity(const UiWindow& ui_window) noexcept;
+  static void InvalidateLayout(UiWindow& ui_window, MountedNode& node);
+  static std::optional<std::uint64_t> HitTestPlatformView(const UiWindow& ui_window, Point position);
+  static std::optional<std::uint64_t> FocusedPlatformView(const UiWindow& ui_window);
+  static void SynchronizePlatformViewFocus(UiWindow& ui_window, std::optional<std::uint64_t> identity, bool focus_visible);
+  static bool MoveFocusFromPlatformView(UiWindow& ui_window, std::uint64_t identity, bool reverse);
+  static std::optional<PlatformPayload> DispatchPlatformViewEvent(
+      UiWindow& ui_window, std::uint64_t identity, std::string_view name, const PlatformPayload& payload
+  );
+  static std::optional<PlatformValue>
+  DispatchPlatformViewEvent(UiWindow& ui_window, std::uint64_t identity, std::type_index key, const PlatformValue& value);
+
+#pragma endregion
+
+#pragma region TransitionSpec
+
+  static bool HasTransitionPaint(const TransitionSpec& transition) noexcept;
+
+#pragma endregion
+
+#pragma region SharedTransition
+
+  static const SharedMarkerData& SharedMarker(const SharedElement& marker) noexcept;
+  static const SharedMarkerData& SharedMarker(const SharedBounds& marker) noexcept;
+  static const std::shared_ptr<SharedTransitionCoordinator>& SharedScope(const SharedTransitionScope& scope) noexcept;
+
+#pragma endregion
+
+#pragma region LayerController
+
+  static LayerId AttachCaptured(
+      const LayerController& layers,
+      LayerOptions options,
+      ViewFactory content,
+      std::shared_ptr<const Environment> environment,
+      LayerPlacement placement,
+      std::shared_ptr<LayerTransitionState> transition = {},
+      std::shared_ptr<const SemanticModalGroupToken> semantic_modal_group = {},
+      std::optional<ViewHandle> retained_focus_target = std::nullopt,
+      std::optional<ViewHandle> initial_focus = std::nullopt
+  );
+  static LayerId AttachCapturedReplacing(
+      const LayerController& layers,
+      std::optional<LayerId> replaced,
+      LayerOptions options,
+      ViewFactory content,
+      std::shared_ptr<const Environment> environment,
+      LayerPlacement placement,
+      std::shared_ptr<LayerTransitionState> transition,
+      std::shared_ptr<const SemanticModalGroupToken> semantic_modal_group = {},
+      std::optional<ViewHandle> retained_focus_target = std::nullopt,
+      std::optional<ViewHandle> initial_focus = std::nullopt
+  );
+  static bool UpdateCaptured(
+      const LayerController& layers,
+      LayerId id,
+      LayerOptions options,
+      ViewFactory content,
+      std::shared_ptr<const Environment> environment,
+      LayerPlacement placement,
+      std::shared_ptr<LayerTransitionState> transition
+  );
+  static bool UpdateEntry(
+      const LayerController& layers,
+      LayerId id,
+      std::optional<LayerOptions> options,
+      ViewFactory content,
+      std::optional<std::shared_ptr<const Environment>> environment
+  );
+  static bool UpdatePlacement(const LayerController& layers, LayerId id, LayerPlacement placement);
+  static std::optional<LayerOptions> EntryOptions(const LayerController& layers, LayerId id);
+  static std::shared_ptr<LayerTransitionState> Transition(const LayerController& layers, LayerId id);
+  static LayerController::DismissRequestResult RequestDismiss(const LayerController& layers, LayerId id);
+
+#pragma endregion
+
+#pragma region NodeExtension
+
+  static std::shared_ptr<GestureRecognizer> CreateGestureRecognizer(
+      NodeExtension& extension,
+      pingcore::ViewNode& node,
+      const PointerEvent& event,
+      double timestamp,
+      const GestureSettings& settings,
+      Transform2D frozen_node_to_window
+  );
+  static const DragSourceCapability* GetDragSourceCapability(const NodeExtension& extension) noexcept;
+  static const DropTargetCapability* GetDropTargetCapability(const NodeExtension& extension) noexcept;
+  static const FileDropTargetCapability* GetFileDropTargetCapability(const NodeExtension& extension) noexcept;
+
+#pragma endregion
+
+#pragma region LayoutContext
+
+  static LayoutContext CreateLayoutContext(
+      void* state,
+      LayoutContext::MeasureFunction measure,
+      EdgeInsets safe_area,
+      const WindowTitleBarMetrics* title_bar_metrics
+  );
+
+#pragma endregion
+
+#pragma region VirtualLayoutContext
+
+  static VirtualLayoutContext CreateVirtualLayoutContext(
+      void* state,
+      VirtualLayoutContext::ItemCountFunction item_count,
+      VirtualLayoutContext::ViewportFunction viewport,
+      VirtualLayoutContext::ItemFunction item,
+      VirtualLayoutContext::MeasureFunction measure
+  );
+
+#pragma endregion
+
+#pragma region VirtualLayoutResult
+
+  static std::optional<VirtualCollectionSemantics> CollectionSemantics(const VirtualLayoutResult& result);
+
+#pragma endregion
+
+#pragma region Paint
+
+  static PaintContext CreatePaintContext(PaintSequence& sequence, Rect bounds, std::string default_shaping_locale);
+  // command belongs to sequence.Commands().
+  static const TextLayoutBackend* TextLayoutForPaint(
+      const PaintSequence& sequence, const PaintCommand& command) noexcept;
+
+#pragma endregion
+
+#pragma region PlatformView
+
+  static void PaintPlatformView(const MountedNode& node, PaintContext& context);
+
+#pragma endregion
+
+#pragma region SegmentedButtonItem
+
+  static std::optional<std::variant<ImageAsset, VectorAsset, Bitmap>> ResolveIcon(SegmentedButtonItem& item);
+  static std::string ResolveLabel(SegmentedButtonItem& item);
+  static bool ShowsLabel(const SegmentedButtonItem& item) noexcept;
+  static bool HasIcon(const SegmentedButtonItem& item) noexcept;
+  static bool HasBlankLiteralLabel(const SegmentedButtonItem& item) noexcept;
+  static void ValidateIcon(const SegmentedButtonItem& item);
+
+#pragma endregion
+
+#pragma region TabItem
+
+  static std::optional<std::variant<ImageAsset, VectorAsset, Bitmap>> ResolveIcon(TabItem& item);
+  static std::string ResolveLabel(TabItem& item);
+  static bool ShowsLabel(const TabItem& item) noexcept;
+  static bool IsEnabled(const TabItem& item) noexcept;
+  static bool HasIcon(const TabItem& item) noexcept;
+  static bool HasBlankLiteralLabel(const TabItem& item) noexcept;
+  static void ValidateIcon(const TabItem& item);
+
+#pragma endregion
+
+#pragma region NavigationItem
+
+  static std::string ResolveLabel(NavigationItem& item);
+  static std::optional<std::variant<ImageAsset, VectorAsset, Bitmap>> ResolveIcon(NavigationItem& item);
+  static std::optional<std::variant<ImageAsset, VectorAsset, Bitmap>> ResolveSelectedIcon(NavigationItem& item);
+  static bool IsEnabled(const NavigationItem& item) noexcept;
+  static bool HasIcon(const NavigationItem& item) noexcept;
+  static bool HasSelectedIcon(const NavigationItem& item) noexcept;
+  static bool HasBlankLiteralLabel(const NavigationItem& item) noexcept;
+  static void ValidateImages(const NavigationItem& item);
+
+#pragma endregion
+
+#pragma region AttributedText
+
+  static bool SameBody(const AttributedText& left, const AttributedText& right) noexcept;
+  static std::size_t BodyHash(const AttributedText& text) noexcept;
+  static const std::shared_ptr<const FontFamilyData>& FontData(const FontFamily& family) noexcept;
+
+#pragma endregion
+
+#pragma region StringVariant
+
+  static const std::variant<std::string, StringResource>& StringValue(const StringVariant& value) noexcept;
+  static std::variant<std::string, StringResource>& StringValue(StringVariant& value) noexcept;
+  static std::span<const std::string> StringArguments(const StringVariant& value) noexcept;
+
+#pragma endregion
+
+#pragma region RawAsset
+
+  static RawAsset PackagedRaw(std::weak_ptr<AppResources> resources, std::string path, std::string mime_type);
+  static std::span<const std::byte> RawBytes(const RawAsset& asset) noexcept;
+
+#pragma endregion
+
+#pragma region ImageAsset
+
+  static ImageAsset ImageFromRaw(RawAsset asset, float scale);
+  static std::uint64_t ImageIdentity(const ImageAsset& image) noexcept;
+  static std::uint64_t ImageIdentity(const Bitmap& bitmap) noexcept;
+
+#pragma endregion
+
+#pragma region VectorAsset
+
+  static VectorAsset VectorFromRaw(RawAsset asset);
+  static bool IsVectorPayload(const RawAsset& asset) noexcept;
+  [[nodiscard]] static const PaintSequence& Sequence(const VectorAsset& asset) noexcept;
+
+#pragma endregion
+
+#pragma region Path
+
+  [[nodiscard]] static std::span<const PathElement> Elements(const Path& path) noexcept;
+
+#pragma endregion
+
+#pragma region ClipShape
+
+  static bool ClipContains(const ClipShape& shape, Point point);
+  static Rect ClipBounds(const ClipShape& shape) noexcept;
+  static RenderClip RenderClipShape(const ClipShape& shape);
+
+#pragma endregion
+};
+
+} // namespace pingcore::detail

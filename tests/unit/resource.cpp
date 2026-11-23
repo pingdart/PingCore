@@ -1,0 +1,306 @@
+#include <catch2/catch_amalgamated.hpp>
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <tuple>
+#include <type_traits>
+#include <vector>
+
+#include <pingcore/resource.h>
+
+#include "image_test_support.h"
+#include "resources/resource_internal.h"
+
+namespace {
+
+using namespace pingcore;
+
+static_assert(std::is_convertible_v<ImageResource, ResourceId>);
+static_assert(std::is_convertible_v<StringResource, ResourceId>);
+static_assert(std::is_convertible_v<RawResource, ResourceId>);
+static_assert(!std::is_convertible_v<ImageResource, StringResource>);
+static_assert(!std::is_convertible_v<ImageResource, RawResource>);
+static_assert(!std::is_convertible_v<StringResource, ImageResource>);
+static_assert(!std::is_convertible_v<StringResource, RawResource>);
+static_assert(!std::is_convertible_v<RawResource, ImageResource>);
+static_assert(!std::is_convertible_v<RawResource, StringResource>);
+static_assert(std::is_constructible_v<StringVariant, std::string>);
+static_assert(std::is_constructible_v<StringVariant, std::string_view>);
+static_assert(std::is_constructible_v<StringVariant, const char*>);
+static_assert(std::is_constructible_v<StringVariant, StringResource>);
+static_assert(std::is_constructible_v<ImageVariant, ImageResource>);
+static_assert(std::is_constructible_v<ImageVariant, ImageAsset>);
+static_assert(std::is_constructible_v<ImageVariant, VectorAsset>);
+static_assert(std::is_constructible_v<ImageVariant, Bitmap>);
+
+TEST_CASE("BitmapGeometryUsesPixelsAndPreservesLogicalDensity") {
+  const Bitmap source = Bitmap::FromRgba8(2, 1, {
+      std::byte{255}, std::byte{0}, std::byte{0}, std::byte{255},
+      std::byte{0}, std::byte{0}, std::byte{255}, std::byte{0},
+  }, 2.0F);
+
+  REQUIRE(source.IntrinsicSize() == Size{1.0F, 0.5F});
+  REQUIRE(source.Crop(0, 0, 2, 1) == source);
+  REQUIRE(source.Resize(2, 1) == source);
+  REQUIRE_THROWS_AS(source.Crop(1, 0, 2, 1), std::invalid_argument);
+  REQUIRE_THROWS_AS(Bitmap::FromRgba8(2, 1, Bytes(7)), std::invalid_argument);
+
+  const auto crop = source.Crop(1, 0, 1, 1);
+  REQUIRE(crop.Scale() == source.Scale());
+  REQUIRE(std::ranges::equal(crop.Pixels(), source.Pixels().last(4)));
+
+  const auto resized = source.Resize(3, 1);
+  const auto middle = resized.Pixels().subspan(4, 4);
+  REQUIRE(std::ranges::equal(middle, std::array{
+      std::byte{255}, std::byte{0}, std::byte{0}, std::byte{128},
+  }));
+
+  const auto shifted = source.Transform({.translate_x = 1.0F}, 3, 1, ImageSampling::Nearest);
+  REQUIRE(std::ranges::equal(shifted.Pixels().first(4), std::array<std::byte, 4>{}));
+  REQUIRE(std::ranges::equal(shifted.Pixels().subspan(4), source.Pixels()));
+}
+
+TEST_CASE("BitmapCopiesStridedPixelsInExplicitByteOrder") {
+  using Format = Bitmap::PixelFormat;
+  const std::array rgba{
+      std::byte{1}, std::byte{2}, std::byte{3}, std::byte{0},
+      std::byte{5}, std::byte{6}, std::byte{7}, std::byte{255},
+  };
+  const std::array bgra{
+      std::byte{3}, std::byte{2}, std::byte{1}, std::byte{0}, std::byte{99},
+      std::byte{7}, std::byte{6}, std::byte{5}, std::byte{255},
+  };
+  const std::array argb{
+      std::byte{0}, std::byte{1}, std::byte{2}, std::byte{3},
+      std::byte{255}, std::byte{5}, std::byte{6}, std::byte{7},
+  };
+  for (const auto& [bytes, stride, format] : {
+      std::tuple{std::span<const std::byte>(rgba), std::size_t{4}, Format::Rgba8888},
+      std::tuple{std::span<const std::byte>(bgra), std::size_t{5}, Format::Bgra8888},
+      std::tuple{std::span<const std::byte>(argb), std::size_t{4}, Format::Argb8888},
+  }) {
+    const auto bitmap = Bitmap::CopyPixels(1, 2, bytes, stride, format, 2.0F);
+    REQUIRE(std::ranges::equal(bitmap.Pixels(), rgba));
+    REQUIRE(bitmap.IntrinsicSize() == Size{0.5F, 1.0F});
+  }
+  REQUIRE_THROWS_AS(Bitmap::CopyPixels(1, 2, bgra, 6, Format::Bgra8888), std::invalid_argument);
+  REQUIRE_THROWS_AS(Bitmap::CopyPixels(1, 2, rgba, 3, Format::Rgba8888), std::invalid_argument);
+  REQUIRE_THROWS_AS(Bitmap::CopyPixels(1, 2, rgba, 4, static_cast<Format>(-1)), std::invalid_argument);
+}
+
+void AppendU32(std::vector<std::byte>& bytes, std::uint32_t value) {
+  for (unsigned shift = 0; shift < 32; shift += 8) {
+    bytes.push_back(static_cast<std::byte>((value >> shift) & 0xFFU));
+  }
+}
+
+void AppendU64(std::vector<std::byte>& bytes, std::uint64_t value) {
+  AppendU32(bytes, static_cast<std::uint32_t>(value));
+  AppendU32(bytes, static_cast<std::uint32_t>(value >> 32U));
+}
+
+void AppendString(std::vector<std::byte>& bytes, std::string_view value) {
+  AppendU32(bytes, static_cast<std::uint32_t>(value.size()));
+  for (char character : value) {
+    bytes.push_back(static_cast<std::byte>(character));
+  }
+}
+
+std::vector<std::byte> MakeIndex() {
+  std::vector<std::byte> bytes{
+      std::byte{'H'},
+      std::byte{'U'},
+      std::byte{'X'},
+      std::byte{'R'},
+      std::byte{'E'},
+      std::byte{'S'},
+      std::byte{0},
+      std::byte{0},
+  };
+  AppendU32(bytes, 1);
+  AppendU32(bytes, 1);
+  bytes.push_back(std::byte{1});
+  AppendString(bytes, "app");
+  AppendString(bytes, "raw/config");
+  AppendString(bytes, "pingcore/app/raw/config.bin");
+  AppendString(bytes, "application/octet-stream");
+  AppendString(bytes, "");
+  AppendString(bytes, "");
+  AppendU32(bytes, std::bit_cast<std::uint32_t>(1.0F));
+  AppendU32(bytes, 0);
+  AppendU32(bytes, 0);
+  AppendU64(bytes, 42);
+  AppendU32(bytes, 0);
+  AppendU32(bytes, 0);
+  AppendU32(bytes, 0);
+  return bytes;
+}
+
+TEST_CASE("ResourceIdsValidateAndCompareByValue") {
+  REQUIRE(ResourceId("app", "images/logo") == ResourceId("app", "images/logo"));
+  REQUIRE(ResourceId("app", "images/logo").ToString() == "app:images/logo");
+  REQUIRE_THROWS_AS(ResourceId("", "images/logo"), std::invalid_argument);
+  REQUIRE_THROWS_AS(ResourceId("app", "../logo"), std::invalid_argument);
+  REQUIRE_THROWS_AS(ResourceId("app", "images/./logo"), std::invalid_argument);
+  REQUIRE_THROWS_AS(ResourceId("app", "images/logo:dark"), std::invalid_argument);
+  REQUIRE_THROWS_AS(ResourceId("app", "images/logo\"dark"), std::invalid_argument);
+  REQUIRE_THROWS_AS(ResourceId("app", "images/logo\ndark"), std::invalid_argument);
+}
+
+TEST_CASE("StringVariantComparesLiteralAndDeferredResourceValues") {
+  REQUIRE(StringVariant("Save") == StringVariant(std::string("Save")));
+  REQUIRE(StringVariant(StringResource("app", "strings/save")) == StringVariant(StringResource("app", "strings/save")));
+  REQUIRE(
+      StringVariant::Format(StringResource("app", "strings/files"), 3) ==
+      StringVariant::Format(StringResource("app", "strings/files"), 3)
+  );
+  REQUIRE_FALSE(
+      StringVariant::Format(StringResource("app", "strings/files"), 3) ==
+      StringVariant::Format(StringResource("app", "strings/files"), 4)
+  );
+}
+
+TEST_CASE("ImageVariantPreservesResourceAndResolvedImageValues") {
+  const ImageResource resource("app", "images/logo");
+  REQUIRE(std::get<ImageResource>(ImageVariant(resource)) == resource);
+
+  const ImageAsset raster = ImageAsset::FromEncoded(pingcore::test::MakeTestPng(2, 1));
+  REQUIRE(std::get<ImageAsset>(ImageVariant(raster)) == raster);
+
+  const VectorAsset vector = VectorAsset::Create({1.0F, 1.0F}, [](VectorBuilder&) {});
+  REQUIRE(std::get<VectorAsset>(ImageVariant(vector)) == vector);
+}
+
+TEST_CASE("LocaleNormalizesCommonLanguageTags") {
+  REQUIRE(Locale::FromLanguageTag("ZH_hans_cn").LanguageTag() == "zh-Hans-CN");
+  REQUIRE(Locale::Default().LanguageTag() == "en");
+  REQUIRE_THROWS_AS(Locale::FromLanguageTag("zh--CN"), std::invalid_argument);
+}
+
+TEST_CASE("RawAssetSharesOwnedBytes") {
+  RawAsset asset = RawAsset::FromBytes({std::byte{1}, std::byte{2}}, "application/test");
+  RawAsset copy = asset;
+  REQUIRE(copy == asset);
+  REQUIRE(copy.ReadBytes().size() == 2);
+  REQUIRE(copy.MimeType() == "application/test");
+}
+
+TEST_CASE("RawAssetDistinguishesMissingStorageFromZeroLengthBytes") {
+  REQUIRE_FALSE(RawAsset{}.HasValue());
+
+  const RawAsset empty = RawAsset::FromBytes({});
+  REQUIRE(empty.HasValue());
+  REQUIRE(empty.ReadBytes().empty());
+}
+
+TEST_CASE("RawAssetReadsOwnedStringsPreservingBinaryContent") {
+  RawAsset asset = RawAsset::FromBytes({std::byte{'a'}, std::byte{0}, std::byte{'b'}}, "text/plain");
+  const std::string view = asset.ReadString();
+  REQUIRE(view.size() == 3);
+  REQUIRE(view[0] == 'a');
+  REQUIRE(view[1] == '\0');
+  REQUIRE(view[2] == 'b');
+
+  const std::string copy = asset.ReadString();
+  asset = {};
+  REQUIRE(copy.size() == 3);
+  REQUIRE(copy[1] == '\0');
+
+  REQUIRE(RawAsset{}.ReadString().empty());
+  REQUIRE(RawAsset{}.ReadString(true).empty());
+}
+
+TEST_CASE("RawAssetCopiesBytesAndOpensAnIndependentSynchronousStream") {
+  RawAsset asset = RawAsset::FromBytes({std::byte{1}, std::byte{2}, std::byte{3}}, "application/test");
+  REQUIRE((asset.ReadBytes() == Bytes{std::byte{1}, std::byte{2}, std::byte{3}}));
+
+  InputStream stream = asset.OpenRead();
+  asset = {};
+  Bytes buffer(2);
+  REQUIRE(stream.Read(buffer).Value() == 2);
+  REQUIRE((buffer == Bytes{std::byte{1}, std::byte{2}}));
+  REQUIRE(stream.Read(buffer).Value() == 1);
+  REQUIRE(buffer[0] == std::byte{3});
+  REQUIRE(stream.Read(buffer).Value() == 0);
+  REQUIRE_THROWS_AS(RawAsset{}.OpenRead(), std::logic_error);
+}
+
+TEST_CASE("RawAssetStreamsRetainSharedByteSlicesWithoutRetainingTheAsset") {
+  auto storage = std::make_shared<const Bytes>(Bytes{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}});
+  std::weak_ptr<const Bytes> retained = storage;
+  RawAsset asset = RawAsset::FromSharedBytes(storage, storage->data() + 1, 2);
+  {
+    InputStream input = asset.OpenRead();
+    asset = {};
+    storage.reset();
+    REQUIRE_FALSE(retained.expired());
+    Bytes buffer(4);
+    REQUIRE(input.Read(buffer).Value() == 2);
+    REQUIRE(buffer[0] == std::byte{2});
+    REQUIRE(buffer[1] == std::byte{3});
+  }
+  REQUIRE(retained.expired());
+}
+
+TEST_CASE("ImageAssetReadsEncodedMetadataWithoutDecoding") {
+  ImageAsset image = ImageAsset::FromEncoded(pingcore::test::MakeTestPng(48, 24), 2.0F);
+  REQUIRE(image.HasValue());
+  REQUIRE_FALSE(ImageAsset{}.HasValue());
+  REQUIRE(image.Format() == ImageFormat::Png);
+  REQUIRE(image.PixelWidth() == 48);
+  REQUIRE(image.PixelHeight() == 24);
+  REQUIRE(image.IntrinsicSize() == Size{24.0F, 12.0F});
+  REQUIRE(image.MimeType() == "image/png");
+}
+
+TEST_CASE("ImageAssetRejectsTruncatedEncodedImages") {
+  std::vector<std::byte> truncated = pingcore::test::MakeTestPng(2, 2);
+  truncated.resize(24);
+  REQUIRE_THROWS_AS(ImageAsset::FromEncoded(std::move(truncated)), std::invalid_argument);
+}
+
+TEST_CASE("ResourceIndexRejectsUnsupportedVersions") {
+  std::vector<std::byte> bytes = MakeIndex();
+  bytes[8] = std::byte{2};
+  REQUIRE_THROWS_WITH(
+      pingcore::detail::ParseResourceIndex(RawAsset::FromBytes(std::move(bytes))),
+      "PingCore resource index version is unsupported: 2"
+  );
+}
+
+TEST_CASE("ResourceIndexRequiresCompleteVersionOneEntries") {
+  std::vector<std::byte> bytes = MakeIndex();
+  bytes.resize(bytes.size() - sizeof(float) * 2);
+  REQUIRE_THROWS_WITH(
+      pingcore::detail::ParseResourceIndex(RawAsset::FromBytes(std::move(bytes))),
+      "PingCore resource index is truncated"
+  );
+}
+
+TEST_CASE("ResourceIndexReadsTypedEntries") {
+  const auto entries = pingcore::detail::ParseResourceIndex(RawAsset::FromBytes(MakeIndex()));
+  REQUIRE(entries.size() == 1);
+  REQUIRE(entries.front().kind == pingcore::detail::ResourceEntryKind::Raw);
+  REQUIRE(entries.front().id == ResourceId("app", "raw/config"));
+  REQUIRE(entries.front().package_path == "pingcore/app/raw/config.bin");
+  REQUIRE(entries.front().content_hash == 42);
+}
+
+TEST_CASE("ResourcePackagePathsRejectTraversalByComponent") {
+  REQUIRE(pingcore::detail::IsValidResourcePackagePath("pingcore/app/raw/config..json"));
+  REQUIRE_FALSE(pingcore::detail::IsValidResourcePackagePath("../config.json"));
+  REQUIRE_FALSE(pingcore::detail::IsValidResourcePackagePath("pingcore/../config.json"));
+  REQUIRE_FALSE(pingcore::detail::IsValidResourcePackagePath("pingcore//config.json"));
+  REQUIRE_FALSE(pingcore::detail::IsValidResourcePackagePath("pingcore/app:C/raw/config.json"));
+  REQUIRE_FALSE(pingcore::detail::IsValidResourcePackagePath("pingcore/app/raw/config\"dark.json"));
+  REQUIRE_FALSE(pingcore::detail::IsValidResourcePackagePath("pingcore/app/raw/config\ndark.json"));
+}
+
+} // namespace

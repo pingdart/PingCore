@@ -1,0 +1,45 @@
+#pragma once
+
+#include <windows.h>
+
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <optional>
+
+#include <pingcore/platform_registry.h>
+#include <pingcore/render_scene.h>
+
+namespace pingcore {
+class UiWindow;
+}
+
+namespace pingcore::detail {
+
+class Win32PlatformViews final {
+public:
+  using OverlayMessageHandler = std::function<LRESULT(HWND, UINT, WPARAM, LPARAM)>;
+
+  Win32PlatformViews(HINSTANCE instance, HWND platform_window, PlatformRegistry& registry,
+                     UiWindow& ui_window, OverlayMessageHandler overlay_message_handler);
+  ~Win32PlatformViews();
+
+  Win32PlatformViews(const Win32PlatformViews&) = delete;
+  Win32PlatformViews& operator=(const Win32PlatformViews&) = delete;
+
+  [[nodiscard]] bool Commit(const RenderFrame& frame, float dpi_scale,
+                            std::optional<RECT> custom_input_bounds = std::nullopt);
+  void DidPresent();
+  void Resize();
+  [[nodiscard]] bool HandleFocusTraversal(const MSG& message);
+  void SynchronizeFocus(HWND focused);
+  // Accessibility captures this UI-thread-owned handle into the same snapshot as its SemanticFrame.
+  [[nodiscard]] HWND AccessibilityView(std::uint64_t identity) const noexcept;
+  void Shutdown() noexcept;
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+} // namespace pingcore::detail

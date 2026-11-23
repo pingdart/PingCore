@@ -1,0 +1,299 @@
+#include "linux_internal.h"
+
+#include "linux_ui_dispatcher.h"
+#include "runtime_test_support.h"
+#include "timer.h"
+
+#include <glib.h>
+
+#include <algorithm>
+#include <chrono>
+#include <functional>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <utility>
+#include <variant>
+#include <vector>
+
+namespace pingcore::test {
+namespace {
+
+using namespace std::chrono_literals;
+
+std::weak_ptr<example::TimerService> linux_timer_service;
+
+View LinuxPlatformModuleApp() {
+  linux_timer_service = example::UseTimer();
+  return Text("platform module");
+}
+
+AppOptions LinuxPlatformModuleOptions() {
+  AppOptions options{.show_debug_overlay = false};
+  options.application_hooks = {example::InstallTimer};
+  options.window_hooks.push_back([](WindowContext& root) {
+    root.Provide(OpenPlatformModule<std::shared_ptr<example::TimerService>>(example::timer::type));
+  });
+  return options;
+}
+
+struct MainContextSourceDeleter {
+  void operator()(GSource* source) const {
+    g_source_destroy(source);
+    g_source_unref(source);
+  }
+};
+
+using MainContextSource = std::unique_ptr<GSource, MainContextSourceDeleter>;
+
+template <class Predicate>
+bool RunDispatcherUntil(
+    detail::LinuxUiThreadDispatcher&, Predicate&& predicate, std::chrono::milliseconds timeout
+) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (!std::invoke(predicate) && std::chrono::steady_clock::now() < deadline) {
+    if (g_main_context_iteration(nullptr, FALSE) == FALSE) {
+      std::this_thread::sleep_for(1ms);
+    }
+  }
+  return std::invoke(predicate);
+}
+
+void RunDispatcherFor(detail::LinuxUiThreadDispatcher& dispatcher, std::chrono::milliseconds duration) {
+  RunDispatcherUntil(dispatcher, [] { return false; }, duration);
+}
+
+TEST_CASE("LinuxUIThreadDispatcherWakesMainContextAndPreservesOrder") {
+  detail::LinuxUiThreadDispatcher dispatcher;
+  UiThreadDispatcher post = dispatcher.Bind();
+  const std::thread::id ui_thread = std::this_thread::get_id();
+  std::vector<int> order;
+  bool ran_inline = false;
+  bool inside_post = true;
+
+  std::thread worker([&] {
+    post([&] {
+      ran_inline = inside_post;
+      REQUIRE(std::this_thread::get_id() == ui_thread);
+      order.push_back(1);
+    });
+    post([&] { order.push_back(2); });
+  });
+  worker.join();
+  inside_post = false;
+
+  REQUIRE(order.empty());
+  REQUIRE(RunDispatcherUntil(dispatcher, [&] { return order.size() == 2; }, 1s));
+  REQUIRE_FALSE(ran_inline);
+  REQUIRE(order == std::vector<int>{1, 2});
+}
+
+TEST_CASE("LinuxUIThreadDispatcherProgressesUnderInputAndFrameCompetition") {
+  int frame_calls = 0;
+  int input_calls = 0;
+  std::vector<int> order;
+  detail::LinuxUiThreadDispatcher dispatcher;
+  UiThreadDispatcher post = dispatcher.Bind();
+  const std::thread::id ui_thread = std::this_thread::get_id();
+
+  MainContextSource frame_source(g_idle_source_new());
+  g_source_set_priority(frame_source.get(), G_PRIORITY_HIGH_IDLE);
+  g_source_set_callback(
+      frame_source.get(),
+      [](gpointer data) -> gboolean {
+        ++*static_cast<int*>(data);
+        return G_SOURCE_CONTINUE;
+      },
+      &frame_calls, nullptr
+  );
+  g_source_attach(frame_source.get(), nullptr);
+  REQUIRE(RunDispatcherUntil(dispatcher, [&] { return frame_calls > 0; }, 1s));
+  const int initial_frame_calls = frame_calls;
+
+  MainContextSource input_source(g_idle_source_new());
+  g_source_set_priority(input_source.get(), G_PRIORITY_DEFAULT);
+  g_source_set_callback(
+      input_source.get(),
+      [](gpointer data) -> gboolean {
+        return ++*static_cast<int*>(data) < 8 ? G_SOURCE_CONTINUE : G_SOURCE_REMOVE;
+      },
+      &input_calls, nullptr
+  );
+  g_source_attach(input_source.get(), nullptr);
+
+  for (int index = 0; index < 32; ++index) {
+    post([&, index] {
+      REQUIRE(std::this_thread::get_id() == ui_thread);
+      order.push_back(index);
+    });
+  }
+  REQUIRE(order.empty());
+  const bool completed = RunDispatcherUntil(
+      dispatcher,
+      [&] { return order.size() == 32 && input_calls == 8 && frame_calls > initial_frame_calls; },
+      1s
+  );
+  CAPTURE(input_calls, frame_calls, order.size());
+  REQUIRE(completed);
+  for (int index = 0; index < 32; ++index) {
+    REQUIRE(order[static_cast<std::size_t>(index)] == index);
+  }
+}
+
+TEST_CASE("LinuxUIThreadDispatcherDiscardsPendingAndFutureWorkAfterShutdown") {
+  int calls = 0;
+  int control_calls = 0;
+  detail::LinuxUiThreadDispatcher dispatcher;
+  UiThreadDispatcher post = dispatcher.Bind();
+  post([&] { ++calls; });
+  dispatcher.Shutdown();
+  post([&] { ++calls; });
+
+  MainContextSource control_source(g_idle_source_new());
+  g_source_set_callback(
+      control_source.get(),
+      [](gpointer data) -> gboolean {
+        ++*static_cast<int*>(data);
+        return G_SOURCE_REMOVE;
+      },
+      &control_calls, nullptr
+  );
+  g_source_attach(control_source.get(), nullptr);
+  REQUIRE(RunDispatcherUntil(dispatcher, [&] { return control_calls != 0; }, 1s));
+  REQUIRE(calls == 0);
+}
+
+TEST_CASE("LinuxPlatformModuleUsesUIThreadWithoutInlineReentry") {
+  linux_timer_service.reset();
+  detail::LinuxUiThreadDispatcher dispatcher;
+  TestPlatform platform(dispatcher.Bind());
+  UiWindow runtime(LinuxPlatformModuleApp, platform, LinuxPlatformModuleOptions());
+  runtime.SetWindowMetrics({{320.0F, 200.0F}});
+  runtime.BuildRenderFrame();
+  const std::shared_ptr<example::TimerService> timer = linux_timer_service.lock();
+  REQUIRE(timer != nullptr);
+
+  const std::thread::id ui_thread = std::this_thread::get_id();
+  bool inside_call = true;
+  bool completed = false;
+  bool ticked = false;
+  bool completion_was_inline = false;
+  bool completion_has_value = false;
+  bool completion_on_ui = false;
+  bool event_on_ui = false;
+  std::uint64_t completed_tick = 0;
+  std::vector<std::string> delivery_order;
+  timer->Start(
+      10ms,
+      [&](std::uint64_t tick) {
+        ticked = tick == 1;
+        event_on_ui = std::this_thread::get_id() == ui_thread;
+        delivery_order.push_back("event");
+      },
+      [&](PlatformResult<std::uint64_t> result) {
+        completion_was_inline = inside_call;
+        if (const auto* value = std::get_if<std::uint64_t>(&result)) {
+          completion_has_value = true;
+          completed_tick = *value;
+        }
+        completed = true;
+        completion_on_ui = std::this_thread::get_id() == ui_thread;
+        delivery_order.push_back("result");
+      }
+  );
+  inside_call = false;
+
+  REQUIRE_FALSE(completed);
+  REQUIRE_FALSE(ticked);
+  REQUIRE(RunDispatcherUntil(dispatcher, [&] { return completed && ticked; }, 1s));
+  REQUIRE_FALSE(completion_was_inline);
+  REQUIRE(completion_has_value);
+  REQUIRE(completed_tick == 1);
+  REQUIRE(completion_on_ui);
+  REQUIRE(event_on_ui);
+  REQUIRE(delivery_order == std::vector<std::string>{"result", "event"});
+
+  const std::size_t delivered_events = delivery_order.size();
+  bool stopped = false;
+  timer->Stop([&](PlatformResult<std::monostate> result) {
+    stopped = std::holds_alternative<std::monostate>(result);
+  });
+  REQUIRE_FALSE(stopped);
+  REQUIRE(RunDispatcherUntil(dispatcher, [&] { return stopped; }, 1s));
+  RunDispatcherFor(dispatcher, 30ms);
+  REQUIRE(delivery_order.size() == delivered_events);
+}
+
+TEST_CASE("LinuxPlatformModuleReplacesCancelsAndDisposesTimer") {
+  linux_timer_service.reset();
+  detail::LinuxUiThreadDispatcher dispatcher;
+  TestPlatform platform(dispatcher.Bind());
+  bool first_replaced = false;
+  bool second_completed = false;
+  bool ticked = false;
+  bool cancelled_completed = false;
+  bool cancelled_ticked = false;
+  std::weak_ptr<example::TimerService> service_lifetime;
+  {
+    UiWindow runtime(LinuxPlatformModuleApp, platform, LinuxPlatformModuleOptions());
+    runtime.SetWindowMetrics({{320.0F, 200.0F}});
+    runtime.BuildRenderFrame();
+    std::shared_ptr<example::TimerService> timer = linux_timer_service.lock();
+    REQUIRE(timer != nullptr);
+    service_lifetime = timer;
+
+    REQUIRE_THROWS_AS(
+        timer->Start(
+            0ms,
+            [](std::uint64_t) {},
+            [](PlatformResult<std::uint64_t>) {}
+        ),
+        std::invalid_argument
+    );
+
+    timer->Start(
+        200ms,
+        [&](std::uint64_t) {},
+        [&](PlatformResult<std::uint64_t> result) {
+          const auto* error = std::get_if<PlatformError>(&result);
+          first_replaced = error != nullptr && error->code == "example/timer-replaced";
+        }
+    );
+    timer->Start(
+        10ms,
+        [&](std::uint64_t) { ticked = true; },
+        [&](PlatformResult<std::uint64_t> result) { second_completed = std::holds_alternative<std::uint64_t>(result); }
+    );
+    REQUIRE(RunDispatcherUntil(dispatcher, [&] { return first_replaced && second_completed && ticked; }, 1s));
+
+    timer->Stop([](PlatformResult<std::monostate>) {});
+    while (g_main_context_iteration(nullptr, FALSE) != FALSE) {
+    }
+    const PlatformRequestId cancelled = timer->Start(
+        100ms,
+        [&](std::uint64_t) { cancelled_ticked = true; },
+        [&](PlatformResult<std::uint64_t>) { cancelled_completed = true; }
+    );
+    REQUIRE(timer->Cancel(cancelled));
+    REQUIRE_FALSE(timer->Cancel(cancelled));
+    RunDispatcherFor(dispatcher, 150ms);
+    REQUIRE_FALSE(cancelled_completed);
+    REQUIRE_FALSE(cancelled_ticked);
+
+    timer->Start(
+        100ms,
+        [&](std::uint64_t) { cancelled_ticked = true; },
+        [&](PlatformResult<std::uint64_t>) { cancelled_completed = true; }
+    );
+    timer.reset();
+  }
+
+  REQUIRE(service_lifetime.expired());
+  RunDispatcherFor(dispatcher, 150ms);
+  REQUIRE_FALSE(cancelled_completed);
+  REQUIRE_FALSE(cancelled_ticked);
+}
+
+} // namespace
+} // namespace pingcore::test

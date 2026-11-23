@@ -1,0 +1,188 @@
+#pragma once
+
+#include <memory>
+#include <optional>
+#include <utility>
+#include <vector>
+
+#include <pingcore/app.h>
+#include <pingcore/paint.h>
+#include <pingcore/render_scene.h>
+
+namespace pingcore::detail {
+
+class IndicationController;
+struct MountedNode;
+class GestureRecognizer;
+
+std::shared_ptr<TextInputClient> FindTextInputClient(MountedNode& node);
+
+struct ActiveTextInputSession {
+  struct GeometrySnapshot {
+    std::uint64_t client_revision = 0;
+    std::uint64_t layout_revision = 0;
+    Transform2D node_to_host;
+    TextInputGeometry geometry;
+  };
+
+  std::uint64_t node_identity = 0;
+  TextInputSessionId session_id = 0;
+  std::shared_ptr<TextInputClient> client;
+  TextInputConfiguration configuration;
+  TextInputState state;
+  std::optional<GeometrySnapshot> published_geometry;
+  std::optional<GeometrySnapshot> prepared_geometry;
+};
+
+struct TextSelectionGestureState {
+  std::optional<double> previous_tap_time;
+  Point previous_tap_position;
+  std::optional<std::uint64_t> previous_tap_node;
+  PointerDeviceKind previous_tap_device = PointerDeviceKind::Mouse;
+};
+
+struct TextSelectionOverlayState {
+  // Presentation intent survives scrolling and missing geometry; RenderNode::visible describes actual output.
+  bool visible = false;
+  bool paint_dirty = true;
+  bool indication_frame_active = false;
+  bool has_painted_geometry = false;
+  bool dragging = false;
+  bool dragging_start_handle = false;
+  Point drag_position;
+  bool show_handles = false;
+  bool dismissing = false;
+  std::vector<std::pair<std::uint64_t, ScrollSource>> scroll_activities;
+  std::optional<std::int64_t> pointer_id;
+  std::optional<std::uint64_t> press_id;
+  std::optional<std::size_t> pressed_action;
+  std::optional<std::size_t> hovered_action;
+  Rect start_handle_hit_rect;
+  Rect end_handle_hit_rect;
+  TextSelectionGeometry painted_geometry;
+  Rect toolbar_rect;
+  VisualFill toolbar_background = Color::Transparent();
+  Color toolbar_separator;
+  Shadow toolbar_shadow;
+  EdgeInsets toolbar_separator_padding;
+  CornerRadii toolbar_corner_radii;
+  float toolbar_separator_thickness = 0.0F;
+  bool toolbar_separators = false;
+  TextStyle toolbar_text_style;
+  TextShapingOptions toolbar_text_shaping;
+  std::vector<TextEditingAction> actions;
+  std::vector<Rect> action_rects;
+  std::vector<std::string> action_labels;
+  std::vector<InteractionState> action_interactions;
+  std::vector<std::shared_ptr<IndicationController>> action_indications;
+};
+
+struct TextSelectionOverlay {
+  // The framework-owned selection overlay is rendered above application layers without becoming part of their tree.
+  RenderNode render_node;
+  TextSelectionOverlayState state;
+};
+
+class TextInteraction final {
+public:
+  enum class EditingActionSource { Menu, Shortcut, ShortcutRepeat };
+
+  explicit TextInteraction(UiWindow::State& runtime_state) : runtime_state_(runtime_state) {}
+
+  class KeyboardDispatch {
+  public:
+    explicit KeyboardDispatch(TextInteraction& text);
+    ~KeyboardDispatch();
+    KeyboardDispatch(const KeyboardDispatch&) = delete;
+    KeyboardDispatch& operator=(const KeyboardDispatch&) = delete;
+    void Finish();
+
+  private:
+    TextInteraction& text_;
+    std::size_t first_request_;
+    bool finished_ = false;
+  };
+
+  template <class Dispatch>
+  decltype(auto) DispatchWithKeyboardRequests(Dispatch dispatch) {
+    KeyboardDispatch keyboard_dispatch(*this);
+    decltype(auto) result = dispatch();
+    keyboard_dispatch.Finish();
+    return result;
+  }
+
+  bool BringTextInputIntoView();
+  void StopTextInputSession(TextInputEndReason reason);
+  void RefreshTextInputSession();
+  TextInputApplyResult HandleTextInputCommands(const TextInputCommandBatch& batch);
+  bool PerformSemanticTextAction(std::uint64_t node, NodeExtension& extension, std::uint64_t local_id,
+                                 const SemanticAction& action);
+  bool HandleFocusedTextInputKey(const KeyEvent& event);
+  bool PerformTextInputAction(TextInputSessionId session, TextInputAction action);
+  TextInputContext QueryTextInputContext(TextInputSessionId session, TextOffset start, TextOffset length) const;
+  TextInputGeometry QueryTextInputGeometry(TextInputSessionId session, TextRange range) const;
+  TextInputPositionResult QueryTextInputPosition(TextInputSessionId session, Point point) const;
+  bool CanPerformTextEditingAction(TextEditingAction action) const;
+  bool PerformTextEditingAction(TextEditingAction action, EditingActionSource source = EditingActionSource::Menu);
+  bool SelectTextWord(std::uint64_t node, Point position, bool show_overlay);
+  void HandleTextSelectionTap(std::optional<std::uint64_t> target);
+  void HideTextSelectionOverlay();
+  void AdvanceTextSelectionDrag(const FrameInfo& frame);
+  void AdvanceTextSelectionOverlay(const FrameInfo& frame);
+  bool HandleTextSelectionOverlayPointer(const PointerEvent& event);
+  void PaintTextSelectionOverlay();
+
+  bool HasSession() const noexcept;
+  void RequestKeyboardForNode(std::uint64_t node, bool show);
+  void RequestAutomaticKeyboard(std::uint64_t node);
+  bool SessionBelongsTo(const MountedNode& root) const;
+  void NotifyScrollActivity(MountedNode& node, const ScrollActivity& activity);
+  bool OverlayVisible() const noexcept;
+  void InvalidateOverlay() noexcept;
+  const RenderNode& Overlay() const noexcept;
+  void ResetSelectionGesture() noexcept;
+  std::shared_ptr<GestureRecognizer> CreateSelectionRecognizer(std::uint64_t node, const PointerEvent& event,
+                                                              double timestamp, const GestureSettings& settings);
+  void RememberSelectionTap(const PointerEvent& event, std::uint64_t node, double timestamp);
+
+private:
+  struct KeyboardRequest {
+    std::uint64_t node;
+    std::weak_ptr<TextInputClient> client;
+    // Zero allows this dispatch to start the session for the captured editor.
+    TextInputSessionId session;
+    bool show;
+    bool automatic;
+  };
+
+  struct EditingActionTarget {
+    std::uint64_t node_identity = 0;
+    std::shared_ptr<TextInputClient> input;
+    TextSelectionClient* selection = nullptr;
+    const ActiveTextInputSession* session = nullptr;
+  };
+
+  void QueueKeyboardRequest(KeyboardRequest request);
+  void FlushKeyboardRequests();
+  EditingActionTarget FindEditingActionTarget() const;
+  TextEditingActionStatus ResolveEditingActionStatus(const EditingActionTarget& target, TextEditingAction action,
+                                                    const Clipboard& clipboard) const;
+  bool PerformDefaultTextEditingAction(const ActiveTextInputSession& session, TextEditingAction action,
+                                       const Clipboard& clipboard);
+  void InvalidateTextInputStateChange(std::uint64_t node, const TextInputState& previous, const TextInputState& current);
+  bool ExtendFocusedTextSelection(Point position, bool start_handle);
+  std::optional<TextSelectionGeometry> QueryFocusedTextSelectionGeometry() const;
+  void ShowTextSelectionOverlay(bool show_handles);
+
+  UiWindow::State& runtime_state_;
+  std::optional<ActiveTextInputSession> text_input_session_;
+  std::vector<KeyboardRequest> keyboard_requests_;
+  std::size_t keyboard_dispatch_depth_ = 0;
+  TextSelectionGestureState text_selection_gesture_;
+  // Re-hit the retained pointer position after the next layout has consumed an auto-scroll offset change.
+  bool selection_scroll_pending_ = false;
+  TextSelectionOverlay text_selection_overlay_;
+  TextInputSessionId next_text_input_session_id_ = 1;
+};
+
+} // namespace pingcore::detail

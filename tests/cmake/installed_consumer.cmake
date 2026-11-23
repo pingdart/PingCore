@@ -1,0 +1,374 @@
+foreach (required_variable IN ITEMS
+        BUILD_DIRECTORY BUILD_CONFIG WORK_DIRECTORY INSTALL_BINDIR CLI_SUFFIX PLATFORM_ID HOST_GENERATOR SOURCE_DIRECTORY
+)
+    if (NOT DEFINED ${required_variable})
+        message(FATAL_ERROR "${required_variable} is required")
+    endif ()
+endforeach ()
+
+string(TIMESTAMP TEST_STARTED_AT "%s" UTC)
+function(report_stage description)
+    string(TIMESTAMP now "%s" UTC)
+    math(EXPR elapsed "${now} - ${TEST_STARTED_AT}")
+    message(STATUS "PingCore installed consumer [${elapsed}s]: ${description}")
+endfunction()
+
+get_filename_component(CMAKE_BIN_DIRECTORY "${CMAKE_COMMAND}" DIRECTORY)
+if (WIN32)
+    set(ENV{PATH} "${CMAKE_BIN_DIRECTORY};$ENV{PATH}")
+else ()
+    set(ENV{PATH} "${CMAKE_BIN_DIRECTORY}:$ENV{PATH}")
+endif ()
+
+string(RANDOM LENGTH 12 ALPHABET 0123456789abcdef TEST_NONCE)
+set(TEST_ROOT "${WORK_DIRECTORY}/hux-${TEST_NONCE}")
+set(SDK_INSTALL_ROOT "${TEST_ROOT}/sdk-install")
+set(SDK_ROOT "${TEST_ROOT}/sdk-relocated")
+set(PROJECT_PARENT "${TEST_ROOT}")
+set(PROJECT_ROOT "${PROJECT_PARENT}/app")
+file(MAKE_DIRECTORY "${PROJECT_PARENT}")
+
+set(INSTALL_COMMAND
+        "${CMAKE_COMMAND}" --install "${BUILD_DIRECTORY}"
+        --prefix "${SDK_INSTALL_ROOT}"
+)
+if (BUILD_CONFIG)
+    list(APPEND INSTALL_COMMAND --config "${BUILD_CONFIG}")
+endif ()
+report_stage("Install SDK")
+execute_process(
+        COMMAND ${INSTALL_COMMAND}
+        RESULT_VARIABLE INSTALL_RESULT
+        OUTPUT_VARIABLE INSTALL_OUTPUT
+        ERROR_VARIABLE INSTALL_ERROR
+)
+if (NOT INSTALL_RESULT EQUAL 0)
+    message(FATAL_ERROR "SDK installation failed:\n${INSTALL_OUTPUT}${INSTALL_ERROR}")
+endif ()
+report_stage("Relocate SDK and validate installed paths")
+file(GLOB_RECURSE INSTALLED_BUILTIN_RESOURCE_INDEXES
+        "${SDK_INSTALL_ROOT}/*/pingcore/resources/pingcore/resources.bin"
+)
+if (NOT INSTALLED_BUILTIN_RESOURCE_INDEXES)
+    message(FATAL_ERROR "Installed SDK is missing the PingCore built-in resource package")
+endif ()
+file(RENAME "${SDK_INSTALL_ROOT}" "${SDK_ROOT}")
+file(REAL_PATH "${SDK_ROOT}" SDK_ROOT)
+file(TO_NATIVE_PATH "${SDK_ROOT}" SDK_ROOT_NATIVE)
+
+file(GLOB_RECURSE INSTALLED_CMAKE_FILES "${SDK_ROOT}/*/cmake/PingCore/*.cmake")
+foreach (INSTALLED_CMAKE_FILE IN LISTS INSTALLED_CMAKE_FILES)
+    file(READ "${INSTALLED_CMAKE_FILE}" INSTALLED_CMAKE_CONTENT)
+    string(FIND "${INSTALLED_CMAKE_CONTENT}" "${BUILD_DIRECTORY}" BUILD_PATH_POSITION)
+    if (NOT BUILD_PATH_POSITION EQUAL -1)
+        message(FATAL_ERROR "Installed CMake package contains the build path: ${INSTALLED_CMAKE_FILE}")
+    endif ()
+endforeach ()
+
+foreach (CONSUMER_LINKAGE IN ITEMS shared static default both)
+    report_stage("Configure ${CONSUMER_LINKAGE} consumer")
+    set(CONSUMER_SOURCE "${TEST_ROOT}/consumer-${CONSUMER_LINKAGE}")
+    set(CONSUMER_BUILD "${TEST_ROOT}/consumer-${CONSUMER_LINKAGE}-build")
+    file(MAKE_DIRECTORY "${CONSUMER_SOURCE}")
+    file(WRITE "${CONSUMER_SOURCE}/main.cpp"
+            "#include <pingcore/pingcore.h>\nint main() { pingcore::Bytes bytes{std::byte{1}}; pingcore::View view; return view ? static_cast<int>(bytes.size()) : 0; }\n")
+    set(CONSUMER_COMPONENT)
+    set(CONSUMER_CONFIGURE_ARGUMENTS)
+    if (CONSUMER_LINKAGE STREQUAL "shared")
+        set(CONSUMER_COMPONENT " COMPONENTS shared")
+        set(CONSUMER_TARGET pingcore)
+        set(CONSUMER_TARGET_EXPECTATIONS [=[
+if (TARGET PingCore::pingcore_static)
+  message(FATAL_ERROR "Shared component imported the static target")
+endif ()
+]=])
+        if (PLATFORM_ID STREQUAL "linux")
+            list(APPEND CONSUMER_CONFIGURE_ARGUMENTS -DCMAKE_DISABLE_FIND_PACKAGE_PkgConfig=TRUE)
+        endif ()
+    elseif (CONSUMER_LINKAGE STREQUAL "static")
+        set(CONSUMER_COMPONENT " COMPONENTS static")
+        set(CONSUMER_TARGET pingcore_static)
+        set(CONSUMER_TARGET_EXPECTATIONS [=[
+if (TARGET PingCore::pingcore)
+  message(FATAL_ERROR "Static component imported the shared target")
+endif ()
+]=])
+    elseif (CONSUMER_LINKAGE STREQUAL "both")
+        set(CONSUMER_COMPONENT " COMPONENTS shared static")
+        set(CONSUMER_TARGET pingcore_static)
+        set(CONSUMER_TARGET_EXPECTATIONS [=[
+if (NOT TARGET PingCore::pingcore OR NOT TARGET PingCore::pingcore_static)
+  message(FATAL_ERROR "Combined components did not import both targets")
+endif ()
+]=])
+    else ()
+        set(CONSUMER_TARGET pingcore_static)
+        set(CONSUMER_TARGET_EXPECTATIONS [=[
+if (NOT TARGET PingCore::pingcore OR NOT TARGET PingCore::pingcore_static)
+  message(FATAL_ERROR "Default package loading did not import both targets")
+endif ()
+]=])
+    endif ()
+    file(WRITE "${CONSUMER_SOURCE}/CMakeLists.txt"
+            "cmake_minimum_required(VERSION 3.20)\n"
+            "project(pingcore_installed_consumer LANGUAGES CXX)\n"
+            "find_package(PingCore CONFIG REQUIRED${CONSUMER_COMPONENT})\n"
+            "if(NOT COMMAND pingcore_add_runtime_dependencies)\n  message(FATAL_ERROR \"SDK runtime deployment helper is missing\")\nendif()\n"
+            "${CONSUMER_TARGET_EXPECTATIONS}"
+            "add_executable(consumer main.cpp)\n"
+            "target_compile_features(consumer PRIVATE cxx_std_20)\n"
+            "target_link_libraries(consumer PRIVATE PingCore::${CONSUMER_TARGET})\n")
+    execute_process(
+            COMMAND "${CMAKE_COMMAND}" -S "${CONSUMER_SOURCE}" -B "${CONSUMER_BUILD}"
+                    -G "${HOST_GENERATOR}" "-DCMAKE_PREFIX_PATH=${SDK_ROOT}"
+                    ${CONSUMER_CONFIGURE_ARGUMENTS}
+            RESULT_VARIABLE CONSUMER_CONFIGURE_RESULT
+            OUTPUT_VARIABLE CONSUMER_CONFIGURE_OUTPUT
+            ERROR_VARIABLE CONSUMER_CONFIGURE_ERROR
+    )
+    report_stage("Build ${CONSUMER_LINKAGE} consumer")
+    execute_process(
+            COMMAND "${CMAKE_COMMAND}" --build "${CONSUMER_BUILD}" --config "${BUILD_CONFIG}"
+            RESULT_VARIABLE CONSUMER_BUILD_RESULT
+            OUTPUT_VARIABLE CONSUMER_BUILD_OUTPUT
+            ERROR_VARIABLE CONSUMER_BUILD_ERROR
+    )
+    if (NOT CONSUMER_CONFIGURE_RESULT EQUAL 0 OR NOT CONSUMER_BUILD_RESULT EQUAL 0)
+        message(FATAL_ERROR
+                "Relocated installed ${CONSUMER_LINKAGE} consumer failed:\n"
+                "${CONSUMER_CONFIGURE_OUTPUT}${CONSUMER_CONFIGURE_ERROR}"
+                "${CONSUMER_BUILD_OUTPUT}${CONSUMER_BUILD_ERROR}")
+    endif ()
+endforeach ()
+
+file(GLOB_RECURSE TESTING_TARGET_EXPORTS "${SDK_ROOT}/*/cmake/PingCore/PingCoreTestingTargets.cmake")
+if (TESTING_TARGET_EXPORTS)
+    foreach (TESTING_LINKAGE IN ITEMS default shared static)
+        report_stage("Configure ${TESTING_LINKAGE} testing consumer")
+        set(TESTING_BUILD "${TEST_ROOT}/testing-${TESTING_LINKAGE}")
+        set(TESTING_CONFIGURE_ARGUMENTS)
+        if (NOT TESTING_LINKAGE STREQUAL "default")
+            list(APPEND TESTING_CONFIGURE_ARGUMENTS
+                    "-DPINGCORE_TEST_LINK_FORM=${TESTING_LINKAGE}" -DPINGCORE_TEST_PRELOAD_CORE=ON)
+        endif ()
+        execute_process(
+                COMMAND "${CMAKE_COMMAND}" -S "${SOURCE_DIRECTORY}/tests/cmake/testing_consumer"
+                        -B "${TESTING_BUILD}" -G "${HOST_GENERATOR}"
+                        "-DCMAKE_PREFIX_PATH=${SDK_ROOT}" "-DCMAKE_BUILD_TYPE=${BUILD_CONFIG}"
+                        ${TESTING_CONFIGURE_ARGUMENTS}
+                RESULT_VARIABLE TESTING_RESULT OUTPUT_VARIABLE TESTING_OUTPUT ERROR_VARIABLE TESTING_ERROR
+        )
+        if (NOT TESTING_RESULT EQUAL 0)
+            message(FATAL_ERROR "Testing consumer configure failed:\n${TESTING_OUTPUT}${TESTING_ERROR}")
+        endif ()
+        report_stage("Build ${TESTING_LINKAGE} testing consumer")
+        execute_process(
+                COMMAND "${CMAKE_COMMAND}" --build "${TESTING_BUILD}" --config "${BUILD_CONFIG}"
+                RESULT_VARIABLE TESTING_RESULT OUTPUT_VARIABLE TESTING_OUTPUT ERROR_VARIABLE TESTING_ERROR
+        )
+        if (NOT TESTING_RESULT EQUAL 0)
+            message(FATAL_ERROR "Testing consumer build failed:\n${TESTING_OUTPUT}${TESTING_ERROR}")
+        endif ()
+        report_stage("Run ${TESTING_LINKAGE} testing consumer")
+        execute_process(
+                COMMAND "${CMAKE_CTEST_COMMAND}" --test-dir "${TESTING_BUILD}" -C "${BUILD_CONFIG}"
+                        --output-on-failure --no-tests=error
+                RESULT_VARIABLE TESTING_RESULT OUTPUT_VARIABLE TESTING_OUTPUT ERROR_VARIABLE TESTING_ERROR
+        )
+        if (NOT TESTING_RESULT EQUAL 0)
+            message(FATAL_ERROR "Testing consumer execution failed:\n${TESTING_OUTPUT}${TESTING_ERROR}")
+        endif ()
+    endforeach ()
+    report_stage("Reject conflicting testing linkage")
+    execute_process(
+            COMMAND "${CMAKE_COMMAND}" -S "${SOURCE_DIRECTORY}/tests/cmake/testing_consumer"
+                    -B "${TEST_ROOT}/testing-conflict" -G "${HOST_GENERATOR}"
+                    "-DCMAKE_PREFIX_PATH=${SDK_ROOT}" -DPINGCORE_TEST_LINK_FORM=shared
+                    -DPINGCORE_TEST_CONFLICT_LINK_FORM=static
+            RESULT_VARIABLE TESTING_RESULT OUTPUT_VARIABLE TESTING_OUTPUT ERROR_VARIABLE TESTING_ERROR
+    )
+    if (TESTING_RESULT EQUAL 0 OR NOT TESTING_ERROR MATCHES "PingCore testing is already bound")
+        message(FATAL_ERROR "Testing consumer did not reject conflicting core forms:\n${TESTING_OUTPUT}${TESTING_ERROR}")
+    endif ()
+endif ()
+
+report_stage("Validate installed CLI SDK discovery")
+set(PINGCORE_CLI "${SDK_ROOT}/${INSTALL_BINDIR}/pingcore${CLI_SUFFIX}")
+string(TOLOWER "${BUILD_CONFIG}" BUILD_PROFILE)
+if (NOT BUILD_PROFILE)
+    set(BUILD_PROFILE debug)
+endif ()
+execute_process(
+        COMMAND "${CMAKE_COMMAND}" -E env
+                "PINGCORE_HOME=${SDK_ROOT}"
+                "${PINGCORE_CLI}" doctor
+        WORKING_DIRECTORY "${PROJECT_PARENT}"
+        RESULT_VARIABLE DOCTOR_RESULT
+        OUTPUT_VARIABLE DOCTOR_OUTPUT
+        ERROR_VARIABLE DOCTOR_ERROR
+)
+string(FIND "${DOCTOR_OUTPUT}" "[ok] PINGCORE_HOME (environment): ${SDK_ROOT_NATIVE}" SDK_OUTPUT_POSITION)
+if (NOT DOCTOR_RESULT EQUAL 0 OR SDK_OUTPUT_POSITION LESS 0 OR DOCTOR_ERROR)
+    message(FATAL_ERROR "Relocated SDK environment discovery failed:\n${DOCTOR_OUTPUT}${DOCTOR_ERROR}")
+endif ()
+execute_process(
+        COMMAND "${CMAKE_COMMAND}" -E env
+                "PINGCORE_HOME=${TEST_ROOT}/missing"
+                "${PINGCORE_CLI}" doctor
+        RESULT_VARIABLE INVALID_HOME_RESULT
+        OUTPUT_VARIABLE INVALID_HOME_OUTPUT
+        ERROR_VARIABLE INVALID_HOME_ERROR
+)
+if (INVALID_HOME_RESULT EQUAL 0
+        OR NOT INVALID_HOME_OUTPUT MATCHES "requires an installed SDK")
+    message(FATAL_ERROR "Invalid PINGCORE_HOME was not rejected:\n${INVALID_HOME_OUTPUT}${INVALID_HOME_ERROR}")
+endif ()
+report_stage("Create application with installed CLI")
+execute_process(
+        COMMAND "${CMAKE_COMMAND}" -E env --unset=PINGCORE_HOME
+                "PINGCORE_SDK_ROOT=${TEST_ROOT}/missing"
+                "${PINGCORE_CLI}" create app app --platform "${PLATFORM_ID}"
+        WORKING_DIRECTORY "${PROJECT_PARENT}"
+        RESULT_VARIABLE CREATE_RESULT
+        OUTPUT_VARIABLE CREATE_OUTPUT
+        ERROR_VARIABLE CREATE_ERROR
+)
+if (NOT CREATE_RESULT EQUAL 0)
+    message(FATAL_ERROR "Installed CLI project creation failed:\n${CREATE_OUTPUT}${CREATE_ERROR}")
+endif ()
+if (NOT EXISTS "${PROJECT_ROOT}/.agents/skills/pingcore-app-development/SKILL.md")
+    message(FATAL_ERROR "Installed CLI did not create the default PingCore application development skill")
+endif ()
+if (NOT EXISTS "${PROJECT_ROOT}/.agents/skills/pingcore-app-development/references/project-workflow.md" OR
+    NOT EXISTS "${PROJECT_ROOT}/.agents/skills/pingcore-app-development/references/resources-files-network.md")
+    message(FATAL_ERROR "Installed CLI created an incomplete PingCore application development skill")
+endif ()
+
+set(APP_SOURCE "${PROJECT_ROOT}/src/app.cpp")
+file(READ "${APP_SOURCE}" APP_SOURCE_CONTENT)
+string(REPLACE
+        "using namespace pingcore;\n"
+        "using namespace pingcore;\n\nint AdditionalSource();\n"
+        APP_SOURCE_CONTENT
+        "${APP_SOURCE_CONTENT}"
+)
+string(REPLACE
+        "View App() {\n"
+        "View App() {\n  AdditionalSource();\n"
+        APP_SOURCE_CONTENT
+        "${APP_SOURCE_CONTENT}"
+)
+file(WRITE "${APP_SOURCE}" "${APP_SOURCE_CONTENT}")
+file(WRITE "${PROJECT_ROOT}/src/extra.cpp" "int AdditionalSource() {\n  return 42;\n}\n")
+
+set(BUILD_COMMAND
+        "${CMAKE_COMMAND}" -E env --unset=PINGCORE_HOME
+        "PINGCORE_SDK_ROOT=${TEST_ROOT}/missing"
+        "${PINGCORE_CLI}" build "${PLATFORM_ID}"
+        --config "${BUILD_PROFILE}"
+)
+if (NOT PLATFORM_ID STREQUAL "windows")
+    list(APPEND BUILD_COMMAND --generator "${HOST_GENERATOR}")
+endif ()
+report_stage("Build application with relocated SDK")
+execute_process(
+        COMMAND ${BUILD_COMMAND}
+        WORKING_DIRECTORY "${PROJECT_ROOT}"
+        RESULT_VARIABLE BUILD_RESULT
+        OUTPUT_VARIABLE BUILD_OUTPUT
+        ERROR_VARIABLE BUILD_ERROR
+)
+if (NOT BUILD_RESULT EQUAL 0)
+    message(FATAL_ERROR "Installed SDK consumer build failed:\n${BUILD_OUTPUT}${BUILD_ERROR}")
+endif ()
+file(GLOB_RECURSE APP_INTEGRATION_PLANS
+        "${PROJECT_ROOT}/.pingcore/build/*/*/*/pingcore-integration/*/app.json"
+)
+list(LENGTH APP_INTEGRATION_PLANS APP_INTEGRATION_PLAN_COUNT)
+if (NOT APP_INTEGRATION_PLAN_COUNT EQUAL 1)
+    message(FATAL_ERROR "Installed SDK consumer generated an unexpected number of application integration plans")
+endif ()
+file(GLOB_RECURSE BUILTIN_RESOURCE_HEADERS
+        "${PROJECT_ROOT}/.pingcore/build/*/pingcore_resources.h"
+)
+if (NOT BUILTIN_RESOURCE_HEADERS)
+    message(FATAL_ERROR "Installed SDK consumer did not generate the PingCore resource header")
+endif ()
+list(GET BUILTIN_RESOURCE_HEADERS 0 BUILTIN_RESOURCE_HEADER)
+file(READ "${BUILTIN_RESOURCE_HEADER}" BUILTIN_RESOURCE_HEADER_CONTENT)
+foreach (EXPECTED_CONTENT IN ITEMS
+        "namespace pingcore \\{"
+        dialog_ok
+        progress_in_progress
+        text_selection_copy
+        validation_required
+        window_restore
+)
+    if (NOT BUILTIN_RESOURCE_HEADER_CONTENT MATCHES "${EXPECTED_CONTENT}")
+        message(FATAL_ERROR "Installed SDK consumer generated an invalid PingCore resource header")
+    endif ()
+endforeach ()
+
+report_stage("Reject implicit source selection")
+execute_process(
+        COMMAND "${CMAKE_COMMAND}" -E env "PINGCORE_HOME=${SOURCE_DIRECTORY}"
+                "${PINGCORE_CLI}" build "${PLATFORM_ID}"
+        WORKING_DIRECTORY "${PROJECT_ROOT}"
+        RESULT_VARIABLE IMPLICIT_SOURCE_RESULT OUTPUT_VARIABLE IMPLICIT_SOURCE_OUTPUT ERROR_VARIABLE IMPLICIT_SOURCE_ERROR
+)
+if (IMPLICIT_SOURCE_RESULT EQUAL 0 OR NOT IMPLICIT_SOURCE_ERROR MATCHES "--sdk")
+    message(FATAL_ERROR "Implicit source selection was not rejected:\n${IMPLICIT_SOURCE_OUTPUT}${IMPLICIT_SOURCE_ERROR}")
+endif ()
+
+set(SOURCE_BUILD_COMMAND
+        "${CMAKE_COMMAND}" -E env "PINGCORE_HOME=${TEST_ROOT}/missing-sdk"
+        "${PINGCORE_CLI}" b "${PLATFORM_ID}" --config "${BUILD_PROFILE}" --sdk "${SOURCE_DIRECTORY}"
+)
+if (NOT PLATFORM_ID STREQUAL "windows")
+    list(APPEND SOURCE_BUILD_COMMAND --generator "${HOST_GENERATOR}")
+endif ()
+report_stage("Build application from source")
+execute_process(COMMAND ${SOURCE_BUILD_COMMAND}
+        WORKING_DIRECTORY "${PROJECT_ROOT}"
+        RESULT_VARIABLE SOURCE_RESULT OUTPUT_VARIABLE SOURCE_OUTPUT ERROR_VARIABLE SOURCE_ERROR
+)
+if (NOT SOURCE_RESULT EQUAL 0)
+    message(FATAL_ERROR "Explicit source build without an installed SDK failed:\n${SOURCE_OUTPUT}${SOURCE_ERROR}")
+endif ()
+report_stage("Return to SDK build")
+set(EXPLICIT_SDK_BUILD_COMMAND
+        "${CMAKE_COMMAND}" -E env "PINGCORE_HOME=${TEST_ROOT}/missing-sdk"
+        "${PINGCORE_CLI}" b "${PLATFORM_ID}" --config "${BUILD_PROFILE}" --sdk "${SDK_ROOT}"
+)
+if (NOT PLATFORM_ID STREQUAL "windows")
+    list(APPEND EXPLICIT_SDK_BUILD_COMMAND --generator "${HOST_GENERATOR}")
+endif ()
+execute_process(COMMAND ${EXPLICIT_SDK_BUILD_COMMAND}
+        WORKING_DIRECTORY "${PROJECT_ROOT}"
+        RESULT_VARIABLE RETURN_RESULT OUTPUT_VARIABLE RETURN_OUTPUT ERROR_VARIABLE RETURN_ERROR
+)
+if (NOT RETURN_RESULT EQUAL 0)
+    message(FATAL_ERROR "Returning to the SDK build failed:\n${RETURN_OUTPUT}${RETURN_ERROR}")
+endif ()
+report_stage("Validate incremental caches and clean up")
+file(GLOB HOME_CACHES "${PROJECT_ROOT}/.pingcore/build/home-*/*/*/CMakeCache.txt")
+list(LENGTH HOME_CACHES HOME_CACHE_COUNT)
+if (NOT HOME_CACHE_COUNT EQUAL 2)
+    message(FATAL_ERROR "SDK and source locations did not retain independent incremental caches")
+endif ()
+set(CACHED_HOMES)
+foreach (HOME_CACHE IN LISTS HOME_CACHES)
+    file(STRINGS "${HOME_CACHE}" CACHED_HOME REGEX "^PINGCORE_HOME:PATH=")
+    string(REPLACE "PINGCORE_HOME:PATH=" "" CACHED_HOME "${CACHED_HOME}")
+    file(REAL_PATH "${CACHED_HOME}" CACHED_HOME)
+    list(APPEND CACHED_HOMES "${CACHED_HOME}")
+endforeach ()
+file(REAL_PATH "${SOURCE_DIRECTORY}" SOURCE_HOME)
+list(FIND CACHED_HOMES "${SDK_ROOT}" SDK_HOME_INDEX)
+list(FIND CACHED_HOMES "${SOURCE_HOME}" SOURCE_HOME_INDEX)
+if (SDK_HOME_INDEX LESS 0 OR SOURCE_HOME_INDEX LESS 0)
+    message(FATAL_ERROR "Build caches did not preserve the selected SDK and source locations")
+endif ()
+
+file(REMOVE_RECURSE "${TEST_ROOT}")
+report_stage("Complete")

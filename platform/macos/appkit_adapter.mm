@@ -1,0 +1,2199 @@
+#import <AppKit/AppKit.h>
+#import <CoreGraphics/CoreGraphics.h>
+#import <CoreServices/CoreServices.h>
+#import <ImageIO/ImageIO.h>
+#import <QuartzCore/CADisplayLink.h>
+#import <UserNotifications/UserNotifications.h>
+#import <dispatch/dispatch.h>
+#import <mach/mach.h>
+#import <sys/resource.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <exception>
+#include <functional>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <pingcore/app.h>
+#include <pingcore/gesture.h>
+#include <pingcore/macos/platform_registry.h>
+
+#include "appkit_accessibility.h"
+#include "appkit_platform_view.h"
+#include "appkit_renderer.h"
+#include "appkit_system_tray.h"
+#include "appkit_text_input.h"
+#include "appkit_window_chrome.h"
+#include "macos_application_internal.h"
+#include "macos_file_internal.h"
+#include "macos_http_internal.h"
+#include "application/application_internal.h"
+#include "application/platform_frame_internal.h"
+#include "resources/resource_internal.h"
+#include "runtime/gesture_internal.h"
+#include "text/text_internal.h"
+#include "application/window_internal.h"
+#include "internal_access.h"
+#include "macros_internal.h"
+
+namespace pingcore::detail {
+class MacUiWindow;
+class MacRuntime;
+}
+
+namespace {
+
+double TimevalSeconds(const timeval& value) noexcept {
+  return static_cast<double>(value.tv_sec) + static_cast<double>(value.tv_usec) / 1'000'000.0;
+}
+
+pingcore::PointerButton MacPointerButton(NSInteger button_number) noexcept {
+  switch (button_number) {
+  case 0:
+    return pingcore::PointerButton::Primary;
+  case 1:
+    return pingcore::PointerButton::Secondary;
+  case 2:
+    return pingcore::PointerButton::Middle;
+  case 3:
+    return pingcore::PointerButton::Back;
+  case 4:
+    return pingcore::PointerButton::Forward;
+  default:
+    return pingcore::PointerButton::None;
+  }
+}
+
+pingcore::PointerButton MacPressedButtons(NSUInteger mask) noexcept {
+  pingcore::PointerButton buttons = pingcore::PointerButton::None;
+  for (NSInteger index = 0; index < 5; ++index) {
+    if ((mask & (static_cast<NSUInteger>(1) << index)) != 0) {
+      buttons |= MacPointerButton(index);
+    }
+  }
+  return buttons;
+}
+
+NSCursor* MacPointerCursor(pingcore::PointerCursorKind kind) {
+  switch (kind) {
+  case pingcore::PointerCursorKind::Default:
+    return NSCursor.arrowCursor;
+  case pingcore::PointerCursorKind::Text:
+    return NSCursor.IBeamCursor;
+  case pingcore::PointerCursorKind::Hand:
+    return NSCursor.pointingHandCursor;
+  case pingcore::PointerCursorKind::Crosshair:
+    return NSCursor.crosshairCursor;
+  case pingcore::PointerCursorKind::Move:
+  case pingcore::PointerCursorKind::Grab:
+    return NSCursor.openHandCursor;
+  case pingcore::PointerCursorKind::Grabbing:
+    return NSCursor.closedHandCursor;
+  case pingcore::PointerCursorKind::ResizeHorizontal:
+    return NSCursor.resizeLeftRightCursor;
+  case pingcore::PointerCursorKind::ResizeVertical:
+    return NSCursor.resizeUpDownCursor;
+  case pingcore::PointerCursorKind::ResizeNorthEastSouthWest:
+  case pingcore::PointerCursorKind::ResizeNorthWestSouthEast:
+    return NSCursor.crosshairCursor;
+  case pingcore::PointerCursorKind::NotAllowed:
+    return NSCursor.operationNotAllowedCursor;
+  case pingcore::PointerCursorKind::Wait:
+    return NSCursor.arrowCursor;
+  }
+  return NSCursor.arrowCursor;
+}
+
+} // namespace
+
+@interface PingCoreWindow : NSWindow
+@end
+
+@interface PingCoreNonActivatingPanel : NSPanel
+@end
+
+@interface PingCoreView : NSView <NSDraggingSource> {
+@public
+  pingcore::detail::MacUiWindow* pingcoreWindow;
+  NSPoint pingcorePointerPosition;
+  NSTrackingArea* pingcoreTrackingArea;
+  std::uint8_t pingcoreModifierKeys;
+  __strong NSCursor* pingcorePointerCursor;
+  std::uint64_t pingcoreFileDropSession;
+  BOOL pingcoreFileDropHover;
+  __strong NSEvent* pingcoreDragPress;
+  std::shared_ptr<pingcore::detail::WindowDrag> pingcoreOutgoingDrag;
+  std::shared_ptr<pingcore::detail::WindowDrag> pingcoreIncomingDrag;
+}
+- (void)sendPointerEvent:(NSEvent*)event type:(pingcore::PointerEventType)type;
+- (BOOL)sendKeyEvent:(NSEvent*)event type:(pingcore::KeyEventType)type;
+- (void)resourceConfigurationDidChange:(NSNotification*)notification;
+- (void)cancelPointer;
+- (void)setPingCorePointerCursor:(NSCursor*)cursor;
+- (void)commitPingCoreFrame;
+@end
+
+@interface PingCoreWindowDelegate : NSObject <NSWindowDelegate> {
+@public
+  pingcore::detail::MacUiWindow* pingcoreWindow;
+}
+@end
+
+@interface PingCoreApplicationDelegate : NSObject <NSApplicationDelegate, UNUserNotificationCenterDelegate> {
+@public
+  pingcore::detail::MacRuntime* pingcoreApplicationRuntime;
+}
+- (void)resourceConfigurationDidChange:(NSNotification*)notification;
+@end
+
+@interface PingCoreFrameScheduler : NSObject
+- (instancetype)initWithView:(PingCoreView*)view;
+- (void)requestFrameAfter:(double)delaySeconds;
+- (void)shutdown;
+@end
+
+@interface PingCoreFrameScheduler ()
+- (void)armForGeneration:(NSUInteger)generation;
+- (void)display;
+@end
+
+@implementation PingCoreFrameScheduler {
+  __weak PingCoreView* _view;
+  __strong CADisplayLink* _displayLink;
+  NSUInteger _generation;
+}
+
+- (instancetype)initWithView:(PingCoreView*)view {
+  self = [super init];
+  if (self == nil) {
+    return nil;
+  }
+
+  _view = view;
+  if (@available(macOS 14.0, *)) {
+    _displayLink = [view displayLinkWithTarget:self selector:@selector(displayLinkDidFire:)];
+    _displayLink.paused = YES;
+    [_displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+  }
+  return self;
+}
+
+- (void)requestFrameAfter:(double)delaySeconds {
+  const NSUInteger generation = ++_generation;
+  if (delaySeconds > 0.0) {
+    const auto nanoseconds = static_cast<std::int64_t>(delaySeconds * static_cast<double>(NSEC_PER_SEC));
+    __weak PingCoreFrameScheduler* scheduler = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, nanoseconds), dispatch_get_main_queue(), ^{
+      PingCoreFrameScheduler* strongScheduler = scheduler;
+      if (strongScheduler != nil && strongScheduler->_generation == generation) {
+        [strongScheduler armForGeneration:generation];
+      }
+    });
+    return;
+  }
+  [self armForGeneration:generation];
+}
+
+- (void)armForGeneration:(NSUInteger)generation {
+  if (_generation != generation) {
+    return;
+  }
+  if (_displayLink != nil) {
+    _displayLink.paused = NO;
+    return;
+  }
+
+  __weak PingCoreFrameScheduler* scheduler = self;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    PingCoreFrameScheduler* strongScheduler = scheduler;
+    if (strongScheduler != nil && strongScheduler->_generation == generation) {
+      [strongScheduler display];
+    }
+  });
+}
+
+- (void)displayLinkDidFire:(CADisplayLink*)displayLink {
+  displayLink.paused = YES;
+  [self display];
+}
+
+- (void)display {
+  PingCoreView* view = _view;
+  if (view != nil && view.window != nil) {
+    [view commitPingCoreFrame];
+  }
+}
+
+- (void)shutdown {
+  ++_generation;
+  [_displayLink invalidate];
+  _displayLink = nil;
+  _view = nil;
+}
+
+@end
+
+namespace pingcore::detail {
+
+namespace {
+
+NSString* MacClipboardString(std::string_view text) {
+  return [[NSString alloc] initWithBytes:text.data() length:text.size() encoding:NSUTF8StringEncoding];
+}
+
+bool WriteMacClipboardItem(NSPasteboard* pasteboard, const ClipboardItem& content) {
+  if (!pasteboard) return false;
+  NSPasteboardItem* item = [[NSPasteboardItem alloc] init];
+  if (content.text) {
+    NSString* text = MacClipboardString(*content.text);
+    if (!text || ![item setString:text forType:NSPasteboardTypeString]) return false;
+  }
+  if (content.html) {
+    NSString* html = MacClipboardString(*content.html);
+    if (!html || ![item setString:html forType:NSPasteboardTypeHTML]) return false;
+  }
+  if (content.image) {
+    const auto bytes = content.image->EncodedBytes();
+    NSData* data = [NSData dataWithBytes:bytes.data() length:bytes.size()];
+    NSPasteboardType type = content.image->Format() == ImageFormat::Png ? NSPasteboardTypePNG : @"public.jpeg";
+    if (!data || ![item setData:data forType:type]) return false;
+  }
+  for (const auto& [mime, bytes] : content.custom_formats) {
+    NSString* type = MacClipboardString(ClipboardTypeIdentifier(mime));
+    NSData* data = [NSData dataWithBytes:bytes.data() length:bytes.size()];
+    if (!type || !data || ![item setData:data forType:type]) return false;
+  }
+  [pasteboard clearContents];
+  return [pasteboard writeObjects:@[item]] == YES;
+}
+
+bool WriteMacClipboardFiles(NSPasteboard* pasteboard, const ClipboardFiles& content) {
+  if (!pasteboard) return false;
+  const auto files = ClipboardFilePaths(content);
+  if (!files) return false;
+  NSMutableArray<NSURL*>* urls = [NSMutableArray arrayWithCapacity:files->size()];
+  for (const auto& file : *files) {
+    NSString* path = MacClipboardString(file.Path());
+    if (!path) return false;
+    [urls addObject:[NSURL fileURLWithPath:path]];
+  }
+  [pasteboard clearContents];
+  return [pasteboard writeObjects:urls] == YES;
+}
+
+using MacClipboardFiles = std::vector<FileReference>;
+
+IoResult<MacClipboardFiles> ReadMacClipboardFiles(NSPasteboard* pasteboard) {
+  if (!pasteboard) return ClipboardFailure<MacClipboardFiles>(IoErrorCode::Unsupported);
+  const NSInteger revision = pasteboard.changeCount;
+  std::size_t expected = 0;
+  for (NSPasteboardItem* item in pasteboard.pasteboardItems) {
+    if ([item.types containsObject:NSPasteboardTypeFileURL]) ++expected;
+  }
+  if (expected == 0) return ClipboardFailure<MacClipboardFiles>(IoErrorCode::NotFound);
+  if (expected > clipboard_max_files) return ClipboardFailure<MacClipboardFiles>(IoErrorCode::TooLarge);
+  NSArray<NSURL*>* urls = [pasteboard readObjectsForClasses:@[NSURL.class]
+                                                  options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
+  if (pasteboard.changeCount != revision) return IoResult<MacClipboardFiles>::Failure(ClipboardChangedError());
+  if (urls.count != expected) return ClipboardFailure<MacClipboardFiles>(IoErrorCode::Io);
+  MacClipboardFiles files;
+  files.reserve(urls.count);
+  try {
+    for (NSURL* url in urls) {
+      auto file = MakeMacFileReference(url, false);
+      if (file.Type() != FileType::File && file.Type() != FileType::Directory) {
+        return ClipboardFailure<MacClipboardFiles>(IoErrorCode::Unsupported);
+      }
+      files.push_back(std::move(file));
+    }
+  } catch (const std::exception&) {
+    return ClipboardFailure<MacClipboardFiles>(IoErrorCode::Io);
+  }
+  return IoResult<MacClipboardFiles>::Success(std::move(files));
+}
+
+Bytes MacClipboardBytes(NSData* data) {
+  Bytes bytes(data.length);
+  if (!bytes.empty()) std::memcpy(bytes.data(), data.bytes, bytes.size());
+  return bytes;
+}
+
+Task<IoResult<ImageAsset>> DecodeMacClipboardImageAsync(Bytes bytes) {
+  co_return co_await RunWorker([bytes = std::move(bytes)] {
+    @autoreleasepool {
+      NSData* data = [NSData dataWithBytes:bytes.data() length:bytes.size()];
+      CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)data, nullptr);
+      if (!source) return ClipboardFailure<ImageAsset>(IoErrorCode::InvalidEncoding);
+      NSDictionary* properties = CFBridgingRelease(CGImageSourceCopyPropertiesAtIndex(source, 0, nullptr));
+      const auto width = [properties[(__bridge NSString*)kCGImagePropertyPixelWidth] unsignedLongLongValue];
+      const auto height = [properties[(__bridge NSString*)kCGImagePropertyPixelHeight] unsignedLongLongValue];
+      CGImageRef image = ClipboardImageSizeAllowed(width, height)
+          ? CGImageSourceCreateImageAtIndex(source, 0, nullptr) : nullptr;
+      CFRelease(source);
+      if (!image) {
+        return ClipboardFailure<ImageAsset>(width && height ? IoErrorCode::TooLarge : IoErrorCode::InvalidEncoding);
+      }
+      NSMutableData* png = [NSMutableData data];
+      CGImageDestinationRef destination =
+          CGImageDestinationCreateWithData((__bridge CFMutableDataRef)png, CFSTR("public.png"), 1, nullptr);
+      if (!destination) {
+        CGImageRelease(image);
+        return ClipboardFailure<ImageAsset>(IoErrorCode::Io);
+      }
+      CGImageDestinationAddImage(destination, image, nullptr);
+      const bool written = CGImageDestinationFinalize(destination);
+      CFRelease(destination);
+      CGImageRelease(image);
+      if (!written) return ClipboardFailure<ImageAsset>(IoErrorCode::Io);
+      if (png.length > clipboard_max_image_bytes) return ClipboardFailure<ImageAsset>(IoErrorCode::TooLarge);
+      return ClipboardImage(MacClipboardBytes(png));
+    }
+  });
+}
+
+IoResult<std::string> ReadMacClipboardString(NSPasteboardItem* item, NSPasteboardType type) {
+  NSString* value = [item stringForType:type];
+  if (!value) return ClipboardFailure<std::string>(IoErrorCode::Io);
+  const auto length = [value lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+  if (length > clipboard_max_text_bytes) return ClipboardFailure<std::string>(IoErrorCode::TooLarge);
+  const char* utf8 = value.UTF8String;
+  if (!utf8) return ClipboardFailure<std::string>(IoErrorCode::InvalidEncoding);
+  return IoResult<std::string>::Success(std::string(utf8, length));
+}
+
+Task<IoResult<ClipboardItem>> ReadMacClipboardItem(NSPasteboard* pasteboard, const ClipboardReadOptions& options) {
+  if (!pasteboard) return ClipboardResult(ClipboardFailure(IoErrorCode::Unsupported));
+  const auto revision = pasteboard.changeCount;
+  NSArray<NSPasteboardType>* image_types = @[NSPasteboardTypePNG, @"public.jpeg", NSPasteboardTypeTIFF];
+  NSMutableArray<NSPasteboardType>* custom_types = [NSMutableArray arrayWithCapacity:options.custom_mime_types.size()];
+  for (const auto& mime : options.custom_mime_types) {
+    [custom_types addObject:MacClipboardString(ClipboardTypeIdentifier(mime))];
+  }
+  for (NSPasteboardItem* source in pasteboard.pasteboardItems) {
+    const bool text = options.text && [source.types containsObject:NSPasteboardTypeString];
+    const bool html = options.html && [source.types containsObject:NSPasteboardTypeHTML];
+    NSPasteboardType image_type = options.image ? [source availableTypeFromArray:image_types] : nil;
+    if (!text && !html && !image_type && ![source availableTypeFromArray:custom_types]) continue;
+    ClipboardItemRead item;
+    if (text) item.SetText(&ClipboardItem::text, ReadMacClipboardString(source, NSPasteboardTypeString));
+    if (html) item.SetText(&ClipboardItem::html, ReadMacClipboardString(source, NSPasteboardTypeHTML));
+    for (std::size_t index = 0; index < options.custom_mime_types.size(); ++index) {
+      NSPasteboardType type = custom_types[index];
+      if (![source.types containsObject:type]) continue;
+      NSData* data = [source dataForType:type];
+      if (!data) item.RecordError(ClipboardError(IoErrorCode::Io));
+      else if (data.length > item.RemainingCustomBytes()) item.RecordError(ClipboardError(IoErrorCode::TooLarge));
+      else item.SetCustom(options.custom_mime_types[index], IoResult<Bytes>::Success(MacClipboardBytes(data)));
+    }
+    std::optional<Task<IoResult<ImageAsset>>> image;
+    if (image_type) {
+      NSData* data = [source dataForType:image_type];
+      if (!data) {
+        item.RecordError(ClipboardError(IoErrorCode::Io));
+      } else if (data.length > clipboard_max_image_bytes) {
+        item.RecordError(ClipboardError(IoErrorCode::TooLarge));
+      } else if ([image_type isEqualToString:NSPasteboardTypeTIFF]) {
+        image = DecodeMacClipboardImageAsync(MacClipboardBytes(data));
+      } else {
+        item.SetImage(ClipboardImage(MacClipboardBytes(data)));
+      }
+    }
+    if (pasteboard.changeCount != revision) {
+      return ClipboardResult(IoResult<ClipboardItem>::Failure(ClipboardChangedError()));
+    }
+    return FinishClipboardItemRead(std::move(item), std::move(image));
+  }
+  if (pasteboard.changeCount != revision) {
+    return ClipboardResult(IoResult<ClipboardItem>::Failure(ClipboardChangedError()));
+  }
+  return ClipboardResult(ClipboardFailure(IoErrorCode::NotFound));
+}
+
+NSString* const application_drag_type = @"org.pingcore.application-drag";
+
+std::shared_ptr<WindowDrag> LocalApplicationDrag(id<NSDraggingInfo> sender) {
+  id source = sender.draggingSource;
+  if (![source isKindOfClass:PingCoreView.class]) return {};
+  return ((PingCoreView*)source)->pingcoreOutgoingDrag;
+}
+
+} // namespace
+
+GestureSettings MacGestureDefaults() noexcept {
+  GestureSettings settings;
+  const double double_click_interval = [NSEvent doubleClickInterval];
+  if (std::isfinite(double_click_interval) && double_click_interval > 0.0) {
+    settings.multi_tap_interval = std::chrono::duration<double>{double_click_interval};
+  }
+  return settings;
+}
+
+/// Owns AppKit application services and delegate callbacks independently of individual NSWindows.
+/// Native facilities are prepared before shared startup and remain alive until Runtime::Retire completes.
+class MacRuntime final : public Runtime, public PlatformClipboard, public PlatformResources {
+public:
+  MacRuntime()
+      : Runtime([](std::function<void()> task) {
+          dispatch_async(dispatch_get_main_queue(), ^{
+            try {
+              task();
+            } catch (...) {
+            }
+          });
+        }) {
+    NSApplication* application = NSApplication.sharedApplication;
+    [application setActivationPolicy:NSApplicationActivationPolicyRegular];
+    delegate_ = [[PingCoreApplicationDelegate alloc] init];
+    delegate_->pingcoreApplicationRuntime = this;
+    application.delegate = delegate_;
+    UNUserNotificationCenter.currentNotificationCenter.delegate = delegate_;
+    [application finishLaunching];
+  }
+
+  ~MacRuntime() override {
+    Retire();
+    if (UNUserNotificationCenter.currentNotificationCenter.delegate == delegate_) {
+      UNUserNotificationCenter.currentNotificationCenter.delegate = nil;
+    }
+    if (NSApplication.sharedApplication.delegate == delegate_)
+      NSApplication.sharedApplication.delegate = nil;
+    delegate_->pingcoreApplicationRuntime = nullptr;
+    [NSNotificationCenter.defaultCenter removeObserver:delegate_];
+  }
+
+  bool SupportsMultipleWindows() const noexcept override { return true; }
+  WindowCapabilities QueryWindowSupport() const noexcept override {
+    return {
+        .transparent_background = true,
+        .always_on_top = true,
+        .non_activating = true,
+        .pointer_pass_through = true,
+    };
+  }
+  std::unique_ptr<UiWindow> CreateUiWindow(ViewFactory content, const WindowOptions& options) override;
+
+  void UpdateWindows();
+
+  void ReportFailure(std::exception_ptr failure) {
+    if (!failure_) failure_ = std::move(failure);
+    RequestShutdown();
+  }
+
+  void RethrowFailure() const {
+    if (failure_) std::rethrow_exception(failure_);
+  }
+
+  /// Removes the first pending non-notification activation for startup.
+  /// @return That activation, or LaunchActivation when absent; notifications remain queued for later delivery.
+  ApplicationActivation TakeStartupActivation() {
+    const auto startup = std::find_if(pending_activations_.begin(), pending_activations_.end(), [](const auto& item) {
+      return !std::holds_alternative<NotificationActivation>(item);
+    });
+    if (startup == pending_activations_.end())
+      return LaunchActivation{};
+    auto activation = std::move(*startup);
+    pending_activations_.erase(startup);
+    return activation;
+  }
+
+  /// Initializes application services, delivers queued native activations, and starts locale observation.
+  /// @param application Declaration that outlives this Runtime; called on the AppKit main thread.
+  void Start(const Application& application) {
+    InitializeApplication(application, TakeStartupActivation(), LifecycleState());
+    started_ = true;
+    for (auto& activation : pending_activations_)
+      HandleApplicationActivation(std::move(activation));
+    pending_activations_.clear();
+    [NSNotificationCenter.defaultCenter addObserver:delegate_
+                                           selector:@selector(resourceConfigurationDidChange:)
+                                               name:NSCurrentLocaleDidChangeNotification
+                                             object:nil];
+  }
+
+  /// Reads AppKit process activity independently of PingCore window attachments.
+  /// @return Background when hidden, otherwise Active or Inactive according to NSApplication activity.
+  static ApplicationLifecycleState LifecycleState() {
+    NSApplication* application = NSApplication.sharedApplication;
+    if (application.hidden) return ApplicationLifecycleState::Background;
+    return application.active ? ApplicationLifecycleState::Active : ApplicationLifecycleState::Inactive;
+  }
+
+  /// Publishes current AppKit activity while shared services are live, on the main thread.
+  void UpdateLifecycleState() {
+    if (IsInitialized() && !stopped_) Runtime::UpdateApplicationLifecycleState(LifecycleState());
+  }
+
+  /// Refreshes application resource configuration after native locale/display changes, on the main thread.
+  void UpdateResourceConfiguration() {
+    if (IsInitialized() && !stopped_) Runtime::UpdateResourceConfiguration(Configuration());
+  }
+
+  NSApplicationTerminateReply ShouldTerminate() {
+    if (stopped_) return NSTerminateNow;
+    if (!started_) return NSTerminateCancel;
+
+    NSAppleEventDescriptor* event = NSAppleEventManager.sharedAppleEventManager.currentAppleEvent;
+    const bool quit_event = event.eventClass == kCoreEventClass && event.eventID == kAEQuitApplication;
+    if (quit_event) termination_pending_ = true;
+    Runtime::RequestShutdown();
+    // A direct terminate: call may be on the main queue. Let that callback return before completing
+    // termination. A Quit Apple Event needs AppKit's eventual reply so system logout can proceed.
+    return quit_event ? NSTerminateLater : NSTerminateCancel;
+  }
+
+  void OpenURLs(NSArray* urls) noexcept {
+    try {
+      std::optional<std::vector<ApplicationActivation>> activations = DecodeMacApplicationActivations(urls);
+      if (!activations.has_value()) {
+        return;
+      }
+      for (ApplicationActivation& activation : *activations) {
+        if (!IsInitialized()) {
+          pending_activations_.push_back(std::move(activation));
+        } else {
+          Runtime::HandleApplicationActivation(std::move(activation));
+        }
+      }
+    } catch (...) {
+    }
+  }
+
+  void HandleNotificationActivation(NotificationActivation activation) noexcept {
+    try {
+      if (!IsInitialized()) {
+        pending_activations_.push_back(std::move(activation));
+      } else {
+        Runtime::HandleApplicationActivation(std::move(activation));
+      }
+    } catch (...) {
+    }
+  }
+
+  PlatformClipboard* Clipboard() noexcept override {
+    return this;
+  }
+
+  PlatformResources* Resources() noexcept override {
+    return this;
+  }
+
+  std::optional<AppDirectories> CreateAppDirectories() override {
+    return CreateMacAppDirectories();
+  }
+
+  std::shared_ptr<FileAccessStore> CreateFileAccessStore(const AppDirectories& directories) override {
+    return CreateMacFileAccessStore(directories);
+  }
+
+  std::shared_ptr<HttpTransport> CreateHttpTransport() override {
+    return CreateMacHttpTransport();
+  }
+
+  std::shared_ptr<LocalNotificationTransport> CreateLocalNotificationTransport() override {
+    return CreateMacLocalNotificationTransport();
+  }
+
+  std::shared_ptr<SystemTaskTransport> CreateSystemTaskTransport() override {
+    return CreateMacSystemTaskTransport();
+  }
+
+  std::shared_ptr<PermissionTransport> CreatePermissionTransport() override {
+    return CreateMacPermissionTransport();
+  }
+
+  std::shared_ptr<SystemTrayTransport> CreateSystemTrayTransport() override {
+    return std::make_shared<AppKitSystemTrayTransport>();
+  }
+
+  std::optional<ProcessMetrics> QueryProcessMetrics() noexcept override {
+    rusage usage{};
+    if (getrusage(RUSAGE_SELF, &usage) != 0) {
+      return std::nullopt;
+    }
+    mach_task_basic_info_data_t task_metrics{};
+    mach_msg_type_number_t task_metrics_count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(
+            mach_task_self(),
+            MACH_TASK_BASIC_INFO,
+            reinterpret_cast<task_info_t>(&task_metrics),
+            &task_metrics_count
+        ) != KERN_SUCCESS) {
+      return std::nullopt;
+    }
+    return ProcessMetrics{
+        .cpu_time_seconds = TimevalSeconds(usage.ru_utime) + TimevalSeconds(usage.ru_stime),
+        .memory_usage_bytes = static_cast<std::uint64_t>(task_metrics.resident_size),
+        .processor_count = static_cast<std::uint32_t>(
+            std::max<NSInteger>(1, [[NSProcessInfo processInfo] processorCount])
+        ),
+    };
+  }
+
+  ResourceConfiguration Configuration() const override {
+    @autoreleasepool {
+      NSString* language = NSLocale.preferredLanguages.firstObject;
+      const char* language_tag = language == nil ? nullptr : language.UTF8String;
+      Locale locale = language_tag == nullptr ? Locale::Default() : Locale::FromLanguageTag(language_tag);
+      NSScreen* screen = NSScreen.mainScreen;
+      const float scale = screen == nil ? 1.0F : static_cast<float>(screen.backingScaleFactor);
+      return {std::move(locale), scale};
+    }
+  }
+
+  std::optional<InputStream> OpenRead(std::string_view package_path) override {
+    if (!IsValidResourcePackagePath(package_path)) {
+      throw std::logic_error("PingCore macOS resource path is invalid");
+    }
+    @autoreleasepool {
+      NSString* relative = [[NSString alloc] initWithBytes:package_path.data()
+                                                    length:package_path.size()
+                                                  encoding:NSUTF8StringEncoding];
+      if (relative == nil) {
+        throw std::logic_error("PingCore macOS resource path is not valid UTF-8");
+      }
+      NSURL* root = [NSBundle.mainBundle.resourceURL URLByAppendingPathComponent:@"PingCore" isDirectory:YES];
+      NSURL* url = [root URLByAppendingPathComponent:relative];
+      const char* path = url.fileSystemRepresentation;
+      if (path == nullptr) {
+        throw std::runtime_error("PingCore package resource path could not be resolved");
+      }
+      return OpenPackageFile(std::filesystem::path(path));
+    }
+  }
+
+  std::optional<std::string> ReadText() override {
+    NSString* text = [[NSPasteboard generalPasteboard] stringForType:NSPasteboardTypeString];
+    if (text == nil) {
+      return std::nullopt;
+    }
+    const char* utf8 = text.UTF8String;
+    return utf8 == nullptr ? std::optional<std::string>{std::string{}} : std::optional<std::string>{utf8};
+  }
+
+  bool WriteText(std::string_view text) override {
+    NSString* value = [[NSString alloc] initWithBytes:text.data() length:text.size() encoding:NSUTF8StringEncoding];
+    if (value == nil) {
+      return false;
+    }
+    NSPasteboard* pasteboard = [NSPasteboard generalPasteboard];
+    [pasteboard clearContents];
+    clipboard_references_.clear();
+    return [pasteboard setString:value forType:NSPasteboardTypeString] == YES;
+  }
+
+  bool WriteItem(ClipboardItem item) override {
+    if (!WriteMacClipboardItem([NSPasteboard generalPasteboard], item)) return false;
+    clipboard_references_.clear();
+    return true;
+  }
+
+  Task<IoResult<ClipboardItem>> ReadItemAsync(ClipboardReadOptions options) override {
+    return ReadMacClipboardItem([NSPasteboard generalPasteboard], options);
+  }
+
+  bool WriteFiles(ClipboardFiles files) override {
+    if (!WriteMacClipboardFiles([NSPasteboard generalPasteboard], files)) return false;
+    clipboard_references_.clear();
+    if (auto* references = std::get_if<std::vector<FileReference>>(&files)) {
+      clipboard_references_ = std::move(*references);
+    }
+    return true;
+  }
+
+  Task<IoResult<MacClipboardFiles>> ReadFilesAsync() override {
+    return ClipboardResult(ReadMacClipboardFiles([NSPasteboard generalPasteboard]));
+  }
+
+  bool MayHaveText() const noexcept override {
+    return [[NSPasteboard generalPasteboard] availableTypeFromArray:@[NSPasteboardTypeString]] != nil;
+  }
+
+private:
+  void OnRuntimeStopped() override {
+    stopped_ = true;
+    if (termination_pending_) {
+      [NSApplication.sharedApplication replyToApplicationShouldTerminate:YES];
+    } else {
+      [NSApplication.sharedApplication terminate:nil];
+    }
+  }
+
+  __strong PingCoreApplicationDelegate* delegate_ = nil;
+  std::vector<FileReference> clipboard_references_;
+  std::vector<ApplicationActivation> pending_activations_;
+  bool started_ = false;
+  bool stopped_ = false;
+  bool termination_pending_ = false;
+  std::exception_ptr failure_;
+};
+
+/// Owns one AppKit window and its text/rendering state; shared UI state retires before native facilities.
+class MacUiWindow final : public UiWindow {
+public:
+  ~MacUiWindow() override { Shutdown(); }
+
+  using UiWindow::IsInitialized;
+
+  ThemeBrightness QuerySystemThemeBrightness() const override {
+    NSAppearance* appearance = view_ != nil ? view_.effectiveAppearance : NSApp.effectiveAppearance;
+    NSString* match = [appearance bestMatchFromAppearancesWithNames:@[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]];
+    return [match isEqualToString:NSAppearanceNameDarkAqua] ? ThemeBrightness::Dark : ThemeBrightness::Light;
+  }
+
+  void RefreshSystemTheme() {
+    if (IsInitialized()) UpdateSystemThemeBrightness(QuerySystemThemeBrightness());
+  }
+
+  void Initialize(MacRuntime& application_runtime, ViewFactory content, const WindowOptions& options) {
+    @autoreleasepool {
+      delegate_ = [[PingCoreWindowDelegate alloc] init];
+      const Size initial_size = ResolveInitialWindowSize(options);
+      const NSRect frame = NSMakeRect(0.0, 0.0, initial_size.width, initial_size.height);
+      custom_chrome_ = options.chrome_mode == WindowChromeMode::Custom;
+      borderless_ = options.chrome_mode == WindowChromeMode::None;
+      activatable_ = options.activatable;
+      custom_title_bar_height_ = options.title_bar_height;
+      NSWindowStyleMask style = borderless_ ? NSWindowStyleMaskBorderless
+          : NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable;
+      if (options.resizable) style |= NSWindowStyleMaskResizable;
+      if (custom_chrome_) {
+        style |= NSWindowStyleMaskFullSizeContentView;
+      }
+      if (activatable_) {
+        window_ = [[PingCoreWindow alloc] initWithContentRect:frame styleMask:style
+                                                   backing:NSBackingStoreBuffered defer:NO];
+      } else {
+        auto* panel = [[PingCoreNonActivatingPanel alloc] initWithContentRect:frame
+                                                                 styleMask:style | NSWindowStyleMaskNonactivatingPanel
+                                                                   backing:NSBackingStoreBuffered defer:NO];
+        panel.hidesOnDeactivate = NO;
+        window_ = panel;
+      }
+      window_.releasedWhenClosed = NO;
+      if (options.transparent_background) {
+        window_.opaque = NO;
+        window_.backgroundColor = NSColor.clearColor;
+      }
+      if (options.always_on_top) window_.level = NSFloatingWindowLevel;
+      window_.ignoresMouseEvents = options.pointer_pass_through;
+      if (options.minimum_size.has_value()) {
+        window_.contentMinSize = NSMakeSize(options.minimum_size->width, options.minimum_size->height);
+      }
+      window_.title = [NSString stringWithUTF8String:options.title.c_str()];
+      window_.acceptsMouseMovedEvents = YES;
+      window_.delegate = delegate_;
+      if (custom_chrome_) {
+        window_.titleVisibility = NSWindowTitleHidden;
+        window_.titlebarAppearsTransparent = YES;
+        window_.movableByWindowBackground = NO;
+        if (@available(macOS 11.0, *)) {
+          window_.titlebarSeparatorStyle = NSTitlebarSeparatorStyleNone;
+        }
+      }
+
+      view_ = [[PingCoreView alloc] initWithFrame:frame];
+      window_.contentView = view_;
+      auto configuration = application_runtime.Configuration();
+      if (window_.screen != nil) configuration.display_scale = static_cast<float>(window_.screen.backingScaleFactor);
+      text_input_ = std::make_unique<MacTextInput>(*this, view_);
+      platform_views_ = std::make_unique<AppKitPlatformViews>(
+          renderer_, frame_coordinator_, InternalAccess::ApplicationRegistry(application_runtime), *this, window_);
+      accessibility_ = std::make_unique<MacAccessibility>(*this, view_, *platform_views_);
+      frame_scheduler_ = [[PingCoreFrameScheduler alloc] initWithView:view_];
+      InitializeWindow(application_runtime, std::move(content), options, configuration);
+      delegate_->pingcoreWindow = this;
+      view_->pingcoreWindow = this;
+      [view_ registerForDraggedTypes:@[NSPasteboardTypeFileURL, application_drag_type]];
+      [NSNotificationCenter.defaultCenter addObserver:view_
+                                             selector:@selector(resourceConfigurationDidChange:)
+                                                 name:NSCurrentLocaleDidChangeNotification
+                                               object:nil];
+      [window_ center];
+      if (activatable_) [window_ makeFirstResponder:view_];
+      UiWindow::UpdateResourceConfiguration(Configuration());
+      RefreshSystemTheme();
+      UpdateWindowLifecycleState();
+      UpdateWindowMetrics({
+          static_cast<float>(view_.bounds.size.width),
+          static_cast<float>(view_.bounds.size.height),
+      });
+      RequestFrameAt(Now());
+    }
+  }
+
+  void Shutdown() noexcept {
+    Retire();
+    [NSNotificationCenter.defaultCenter removeObserver:view_ name:NSCurrentLocaleDidChangeNotification object:nil];
+    [view_ unregisterDraggedTypes];
+    [view_ draggingExited:nil];
+    if (view_ != nil) {
+      view_->pingcoreWindow = nullptr;
+      view_->pingcoreOutgoingDrag.reset();
+      view_->pingcoreDragPress = nil;
+    }
+    if (delegate_ != nil) delegate_->pingcoreWindow = nullptr;
+    [frame_scheduler_ shutdown];
+    frame_scheduler_ = nil;
+    scheduled_frame_deadline_.reset();
+    committed_frame_ = nullptr;
+    accessibility_.reset();
+    if (platform_views_) platform_views_->Shutdown();
+    platform_views_.reset();
+    text_input_.reset();
+    window_.delegate = nil;
+    [window_ close];
+    window_ = nil;
+    view_ = nil;
+    delegate_ = nil;
+  }
+
+  NSWindow* Window() const noexcept {
+    return window_;
+  }
+
+  bool BeginApplicationDrag(std::shared_ptr<WindowDrag> drag) override {
+    if (view_ == nil || view_->pingcoreOutgoingDrag || !view_->pingcoreDragPress ||
+        !(NSEvent.pressedMouseButtons & 1U)) return false;
+    NSPasteboardItem* marker = [[NSPasteboardItem alloc] init];
+    if (![marker setData:NSData.data forType:application_drag_type]) return false;
+    NSDraggingItem* item = [[NSDraggingItem alloc] initWithPasteboardWriter:marker];
+    const NSPoint point = [view_ convertPoint:view_->pingcoreDragPress.locationInWindow fromView:nil];
+    NSImage* image = [[NSImage alloc] initWithSize:NSMakeSize(1, 1)];
+    [item setDraggingFrame:NSMakeRect(point.x, point.y, 1, 1) contents:image];
+    view_->pingcoreOutgoingDrag = std::move(drag);
+    NSDraggingSession* session = [view_ beginDraggingSessionWithItems:@[item] event:view_->pingcoreDragPress source:view_];
+    if (session == nil) {
+      view_->pingcoreOutgoingDrag.reset();
+      return false;
+    }
+    session.animatesToStartingPositionsOnCancelOrFail = NO;
+    view_->pingcoreDragPress = nil;
+    return true;
+  }
+
+  void RequestFrameAt(double deadline) override {
+    if (const std::optional<double> scheduled =
+            frame_coordinator_.Request(deadline, Now(), frame_scheduler_ != nil && view_ != nil)) {
+      ScheduleFrame(*scheduled);
+    }
+  }
+
+  double Now() const noexcept override {
+    using Clock = std::chrono::steady_clock;
+    return std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
+  }
+
+  void SetPointerCursor(PointerCursorKind kind) override {
+    if (view_ != nil) {
+      [view_ setPingCorePointerCursor:MacPointerCursor(kind)];
+    }
+  }
+
+  GestureSettings GestureDefaults() const noexcept override {
+    return MacGestureDefaults();
+  }
+
+  void RequestWindowCommand(WindowCommand command) override {
+    if (window_ == nil || !IsInitialized()) {
+      return;
+    }
+    switch (command) {
+    case WindowCommand::Minimize:
+      performing_minimize_ = true;
+      [window_ miniaturize:nil];
+      break;
+    case WindowCommand::Maximize:
+      if (![window_ isZoomed]) {
+        [window_ zoom:nil];
+      }
+      break;
+    case WindowCommand::Restore:
+      if ([window_ isZoomed]) {
+        [window_ zoom:nil];
+      }
+      break;
+    case WindowCommand::ToggleMaximize:
+      [window_ zoom:nil];
+      break;
+    case WindowCommand::Close:
+      if (borderless_) {
+        [window_ close];
+      } else {
+        performing_close_ = true;
+        [window_ performClose:nil];
+      }
+      break;
+    case WindowCommand::Show:
+      if (activatable_) [window_ orderFront:nil];
+      else [window_ orderFrontRegardless];
+      break;
+    case WindowCommand::Hide:
+      [window_ orderOut:nil];
+      break;
+    case WindowCommand::Activate:
+      [window_ deminiaturize:nil];
+      [window_ makeKeyAndOrderFront:nil];
+      [[NSApplication sharedApplication] activateIgnoringOtherApps:YES];
+      break;
+    }
+    UpdateWindowLifecycleState();
+  }
+
+  bool SetWindowAlwaysOnTop(bool enabled) override {
+    if (window_ == nil) return false;
+    window_.level = enabled ? NSFloatingWindowLevel : NSNormalWindowLevel;
+    return true;
+  }
+
+  bool SetWindowPointerPassThrough(bool enabled) override {
+    if (window_ == nil || (enabled && view_ != nil && view_->pingcoreOutgoingDrag)) return false;
+    if (window_.ignoresMouseEvents == enabled) return true;
+    window_.ignoresMouseEvents = enabled;
+    if (enabled) [view_ cancelPointer];
+    return true;
+  }
+
+  void RequestFullscreen(bool fullscreen) override {
+    if (!IsInitialized()) return;
+    if (fullscreen_transition_) {
+      pending_fullscreen_ = fullscreen;
+      return;
+    }
+    pending_fullscreen_.reset();
+    if (fullscreen == ((window_.styleMask & NSWindowStyleMaskFullScreen) != 0)) return;
+    fullscreen_transition_ = true;
+    [window_ toggleFullScreen:nil];
+  }
+
+  void FullscreenTransitionStarted() {
+    if (!fullscreen_transition_) pending_fullscreen_.reset();
+    fullscreen_transition_ = true;
+  }
+
+  void FullscreenTransitionFinished(std::optional<bool> fullscreen) {
+    fullscreen_transition_ = false;
+    if (!fullscreen.has_value()) pending_fullscreen_.reset();
+    if (!IsInitialized()) return;
+    ExecutionGuard guard(InternalAccess::WindowExecution(*this));
+    if (fullscreen.has_value()) UpdateFullscreen(*fullscreen);
+    WindowGeometryChanged();
+    if (pending_fullscreen_.has_value()) {
+      // AppKit must finish delivering the current transition before another toggle can start.
+      PingCoreWindowDelegate* delegate = delegate_;
+      dispatch_async(dispatch_get_main_queue(), ^{
+        if (auto* window = delegate->pingcoreWindow;
+            window != nullptr && !window->fullscreen_transition_ && window->pending_fullscreen_.has_value()) {
+          window->RequestFullscreen(*window->pending_fullscreen_);
+        }
+      });
+    }
+  }
+
+  bool AllowWindowRequest(WindowCommand command) {
+    if (!IsInitialized()) return false;
+    if (command == WindowCommand::Minimize && performing_minimize_) {
+      performing_minimize_ = false;
+      return true;
+    }
+    try {
+      const bool handled = !(command == WindowCommand::Close && performing_close_) &&
+                           IsInitialized() && UiWindow::HandleWindowRequest(command);
+      performing_close_ = false;
+      if (handled) return false;
+      if (command == WindowCommand::Close) {
+        CloseWindow();
+        return false;
+      }
+      return true;
+    } catch (...) {
+      static_cast<MacRuntime&>(ApplicationRuntime()).ReportFailure(std::current_exception());
+      return false;
+    }
+  }
+
+  void NativeWindowClosed() {
+    if (IsInitialized()) CloseWindow();
+  }
+
+  bool BeginWindowDrag(NSEvent* event) {
+    if ((!custom_chrome_ && !borderless_) || !IsInitialized() || view_ == nil || window_ == nil || event == nil ||
+        (window_.styleMask & NSWindowStyleMaskFullScreen) != 0) {
+      return false;
+    }
+    const NSPoint point = [view_ convertPoint:event.locationInWindow fromView:nil];
+    if (!IsWindowDragRegion({static_cast<float>(point.x), static_cast<float>(point.y)})) {
+      return false;
+    }
+    [window_ performWindowDragWithEvent:event];
+    return true;
+  }
+
+  void UpdateWindowMetrics(Size viewport) {
+    if (IsInitialized()) {
+      const Size constrained_viewport{
+          std::max(0.0F, viewport.width),
+          std::max(0.0F, viewport.height),
+      };
+      UiWindow::SetWindowMetrics({
+          .viewport = constrained_viewport,
+          .title_bar = UpdateTitleBarLayout(constrained_viewport),
+      });
+    }
+  }
+
+  void WindowGeometryChanged() {
+    if (view_ != nil) {
+      UpdateWindowMetrics({static_cast<float>(view_.bounds.size.width), static_cast<float>(view_.bounds.size.height)});
+    }
+    InvalidateTextInputGeometry();
+  }
+
+  void CommitFrameAndInvalidate() {
+    scheduled_frame_deadline_.reset();
+    if (!IsInitialized()) {
+      return;
+    }
+    frame_coordinator_.Commit([&] {
+      const FrameCommit& commit = BuildFrameOrErrorPage();
+      const bool composition_changed = platform_views_->Commit(view_, commit.render_frame);
+      committed_frame_ = &commit.render_frame;
+      accessibility_->Commit(commit.semantic_frame);
+      const bool repaint = frame_coordinator_.PaintInterrupted();
+      if (repaint) {
+        platform_views_->InvalidateSlices();
+      }
+      if (repaint || composition_changed) {
+        [view_ setNeedsDisplay:YES];
+        frame_coordinator_.MarkPaintPending();
+      } else {
+        PINGCORE_DISCARD(InvalidateDamage(commit.render_frame.damage));
+      }
+      if (commit.next_frame_deadline.has_value()) {
+        RequestFrameAt(*commit.next_frame_deadline);
+      }
+    });
+    FlushDeferredFrame();
+  }
+
+  void DrawCommittedFrame(CGContextRef context, NSRect dirty_rect) {
+    if (const auto deadline = platform_views_->DrawBase(context, NSRectToCGRect(dirty_rect), window_.opaque,
+                                                       frame_scheduler_ != nil && view_ != nil)) {
+      ScheduleFrame(*deadline);
+    }
+  }
+
+  NSView* HitTestPlatformView(Point point) const {
+    if (!IsInitialized() || platform_views_ == nullptr) {
+      return nil;
+    }
+    return platform_views_->HitTest(point);
+  }
+
+  void SynchronizePlatformViewFocus() {
+    if (platform_views_ != nullptr && window_ != nil) {
+      platform_views_->SynchronizeFocus(window_.firstResponder);
+    }
+  }
+
+  void SynchronizePlatformViewFocus(NSResponder* responder) {
+    if (platform_views_ != nullptr) {
+      platform_views_->SynchronizeFocus(responder);
+    }
+  }
+
+  bool BeginPlatformViewFocusTraversal(NSEvent* event) {
+    if (platform_views_ == nullptr || window_ == nil || event == nil || event.type != NSEventTypeKeyDown ||
+        event.isARepeat) {
+      return false;
+    }
+    const KeyEvent key_event = MakeMacKeyEvent(event, KeyEventType::Down);
+    if (key_event.key != Key::Tab) {
+      return false;
+    }
+    return platform_views_->BeginFocusTraversal(window_.firstResponder, key_event.modifiers.shift);
+  }
+
+  void EndPlatformViewFocusTraversal() {
+    if (platform_views_ != nullptr) {
+      platform_views_->EndFocusTraversal();
+    }
+  }
+
+  void InvalidateAppKitSurface() {
+    if (view_ != nil) {
+      [view_ setNeedsDisplay:YES];
+    }
+  }
+
+  void UpdateResourceConfiguration() {
+    if (IsInitialized()) {
+      UiWindow::UpdateResourceConfiguration(Configuration());
+    }
+  }
+
+  FontMetrics Metrics(const Font& font) override {
+    return renderer_.Metrics(font);
+  }
+
+  TextRunMetrics
+  MeasureRun(std::string_view text, const TextStyle& style, const TextShapingOptions& options = {}) override {
+    return renderer_.MeasureRun(text, style, options);
+  }
+
+  TextLayoutMetrics MeasureText(const pingcore::AttributedText& text, const TextStyle& style, float max_width,
+      const TextLayoutOptions& options = {}) override {
+    return renderer_.MeasureText(text, style, max_width, options);
+  }
+
+  std::unique_ptr<TextLayoutBackend> CreatePlatformTextLayout(
+      const pingcore::AttributedText& text, const TextStyle& style,
+      float max_width, const TextLayoutOptions& options = {}) override {
+    return renderer_.CreatePlatformTextLayout(text, style, max_width, options);
+  }
+
+  PlatformTextInput* TextInput() noexcept override {
+    return text_input_.get();
+  }
+
+  NSTextInputContext* InputContext() const noexcept {
+    return text_input_ ? text_input_->InputContext() : nil;
+  }
+
+  bool IsTextInputActive() const noexcept {
+    return text_input_ && text_input_->IsActive();
+  }
+
+  bool HandleTextInputEvent(NSEvent* event) {
+    return text_input_ && text_input_->HandleEvent(event);
+  }
+
+  void ApplicationActiveChanged(bool active) {
+    UpdateWindowLifecycleState();
+    if (text_input_) {
+      text_input_->ApplicationActiveChanged(active);
+    }
+  }
+
+  /// Publishes this NSWindow attachment's visibility, minimization, and key-window state on the main thread.
+  void UpdateWindowLifecycleState() {
+    if (!IsInitialized()) return;
+    const auto state = window_ == nil || !window_.visible || window_.miniaturized || NSApplication.sharedApplication.hidden
+        ? WindowLifecycleState::Background
+        : window_.keyWindow && NSApplication.sharedApplication.active
+            ? WindowLifecycleState::Active : WindowLifecycleState::Inactive;
+    if (state != WindowLifecycleState::Background) RefreshSystemTheme();
+    UiWindow::UpdateWindowLifecycleState(state);
+  }
+
+  void InvalidateTextInputGeometry() {
+    if (text_input_) {
+      text_input_->InvalidateGeometry();
+    }
+  }
+
+  std::shared_ptr<FilePickerTransport> CreateFilePickerTransport() override {
+    return CreateMacFilePickerTransport([this] { return window_; });
+  }
+
+  ResourceConfiguration Configuration() const {
+    auto configuration = ApplicationRuntime().Resources()->Configuration();
+    if (window_.screen != nil) configuration.display_scale = static_cast<float>(window_.screen.backingScaleFactor);
+    return configuration;
+  }
+  NSArray* AccessibilityRootChildren() {
+    return accessibility_ ? accessibility_->RootChildren() : @[];
+  }
+
+private:
+  float SystemTitleBarHeight(Size viewport) const noexcept {
+    if (window_ == nil || view_ == nil) {
+      return 0.0F;
+    }
+    const NSRect content_layout = [view_ convertRect:window_.contentLayoutRect fromView:nil];
+    const float height = static_cast<float>(NSMinY(content_layout));
+    return std::isfinite(height) ? std::clamp(height, 0.0F, viewport.height) : 0.0F;
+  }
+
+  std::optional<Rect> SystemTitleBarControlBounds() const noexcept {
+    if (window_ == nil || view_ == nil) {
+      return std::nullopt;
+    }
+    NSRect bounds = NSZeroRect;
+    bool has_bounds = false;
+    const NSWindowButton button_types[] = {
+        NSWindowCloseButton,
+        NSWindowMiniaturizeButton,
+        NSWindowZoomButton,
+    };
+    for (NSWindowButton button_type : button_types) {
+      NSButton* button = [window_ standardWindowButton:button_type];
+      if (button == nil || button.superview == nil || [button isHiddenOrHasHiddenAncestor]) {
+        continue;
+      }
+      const NSRect converted = [view_ convertRect:button.bounds fromView:button];
+      bounds = has_bounds ? NSUnionRect(bounds, converted) : converted;
+      has_bounds = true;
+    }
+    if (!has_bounds) {
+      return std::nullopt;
+    }
+    return Rect{
+        static_cast<float>(bounds.origin.x),
+        static_cast<float>(bounds.origin.y),
+        static_cast<float>(bounds.size.width),
+        static_cast<float>(bounds.size.height),
+    };
+  }
+
+  void AlignSystemTitleBarControls(const Rect& control_bounds, float title_bar_height) {
+    const float target_y = ResolveMacTitleBarControlOriginY(title_bar_height, control_bounds.height);
+    const float delta_y = target_y - control_bounds.y;
+    if (std::abs(delta_y) <= 0.01F) {
+      return;
+    }
+    const NSWindowButton button_types[] = {
+        NSWindowCloseButton,
+        NSWindowMiniaturizeButton,
+        NSWindowZoomButton,
+    };
+    for (NSWindowButton button_type : button_types) {
+      NSButton* button = [window_ standardWindowButton:button_type];
+      if (button == nil || button.superview == nil || [button isHiddenOrHasHiddenAncestor]) {
+        continue;
+      }
+      NSPoint origin = [view_ convertPoint:button.frame.origin fromView:button.superview];
+      origin.y += static_cast<CGFloat>(delta_y);
+      [button setFrameOrigin:[button.superview convertPoint:origin fromView:view_]];
+    }
+  }
+
+  std::optional<WindowTitleBarMetrics> UpdateTitleBarLayout(Size viewport) noexcept {
+    if (!custom_chrome_ || (window_.styleMask & NSWindowStyleMaskFullScreen) != 0) {
+      return std::nullopt;
+    }
+    const std::optional<Rect> system_controls = SystemTitleBarControlBounds();
+    const WindowTitleBarMetrics metrics = ResolveMacTitleBarMetrics(
+        custom_title_bar_height_,
+        SystemTitleBarHeight(viewport),
+        viewport,
+        system_controls,
+        window_ != nil && [window_ isZoomed]
+    );
+    if (system_controls.has_value()) {
+      AlignSystemTitleBarControls(*system_controls, metrics.height);
+    }
+    return metrics;
+  }
+
+  void ScheduleFrame(double deadline) {
+    if (frame_scheduler_ == nil) {
+      return;
+    }
+    if (scheduled_frame_deadline_.has_value() && *scheduled_frame_deadline_ <= deadline) {
+      return;
+    }
+    scheduled_frame_deadline_ = deadline;
+    const double maximum_delay =
+        static_cast<double>(std::numeric_limits<std::int64_t>::max()) / static_cast<double>(NSEC_PER_SEC);
+    [frame_scheduler_ requestFrameAfter:std::min(std::max(0.0, deadline - Now()), maximum_delay)];
+  }
+
+  void FlushDeferredFrame() {
+    if (const std::optional<double> deadline =
+            frame_coordinator_.TakeDeferred(frame_scheduler_ != nil && view_ != nil)) {
+      ScheduleFrame(*deadline);
+    }
+  }
+
+  bool InvalidateDamage(const DamageRegion& damage) {
+    if (view_ == nil) {
+      return false;
+    }
+    if (damage.full) {
+      [view_ setNeedsDisplay:YES];
+      frame_coordinator_.MarkPaintPending();
+      return true;
+    }
+
+    bool invalidated = false;
+    for (const Rect& rect : damage.rects) {
+      if (!std::isfinite(rect.x) || !std::isfinite(rect.y) || !std::isfinite(rect.width) ||
+          !std::isfinite(rect.height)) {
+        [view_ setNeedsDisplay:YES];
+        frame_coordinator_.MarkPaintPending();
+        return true;
+      }
+      if (rect.IsEmpty()) {
+        continue;
+      }
+      NSRect dirty_rect = NSIntersectionRect(NSMakeRect(rect.x, rect.y, rect.width, rect.height), view_.bounds);
+      if (NSIsEmptyRect(dirty_rect)) {
+        continue;
+      }
+      NSRect backing_rect = [view_ convertRectToBacking:dirty_rect];
+      const CGFloat left = std::floor(NSMinX(backing_rect));
+      const CGFloat top = std::floor(NSMinY(backing_rect));
+      const CGFloat right = std::ceil(NSMaxX(backing_rect));
+      const CGFloat bottom = std::ceil(NSMaxY(backing_rect));
+      backing_rect = NSMakeRect(left, top, right - left, bottom - top);
+      [view_ setNeedsDisplayInRect:[view_ convertRectFromBacking:backing_rect]];
+      invalidated = true;
+    }
+    if (invalidated) {
+      frame_coordinator_.MarkPaintPending();
+    }
+    return invalidated;
+  }
+
+  AppKitRenderer renderer_;
+  bool custom_chrome_ = false;
+  bool borderless_ = false;
+  bool activatable_ = true;
+  float custom_title_bar_height_ = 0.0F;
+  __strong NSWindow* window_ = nil;
+  __strong PingCoreView* view_ = nil;
+  __strong PingCoreWindowDelegate* delegate_ = nil;
+  __strong PingCoreFrameScheduler* frame_scheduler_ = nil;
+  std::unique_ptr<MacTextInput> text_input_;
+  std::unique_ptr<MacAccessibility> accessibility_;
+  FrameCoordinator frame_coordinator_;
+  std::unique_ptr<AppKitPlatformViews> platform_views_;
+  std::optional<double> scheduled_frame_deadline_;
+  const RenderFrame* committed_frame_ = nullptr;
+  bool performing_minimize_ = false;
+  bool performing_close_ = false;
+  bool fullscreen_transition_ = false;
+  std::optional<bool> pending_fullscreen_;
+};
+
+std::unique_ptr<UiWindow> MacRuntime::CreateUiWindow(ViewFactory content, const WindowOptions& options) {
+  auto window = std::make_unique<MacUiWindow>();
+  window->Initialize(*this, std::move(content), options);
+  return window;
+}
+
+void MacRuntime::UpdateWindows() {
+  for (NSWindow* window in NSApplication.sharedApplication.windows) {
+    id<NSWindowDelegate> delegate = window.delegate;
+    if (![(id)delegate isKindOfClass:PingCoreWindowDelegate.class]) continue;
+    auto* ui = ((PingCoreWindowDelegate*)delegate)->pingcoreWindow;
+    if (ui == nullptr || !ui->IsInitialized()) continue;
+    ExecutionGuard guard(InternalAccess::WindowExecution(*ui));
+    ui->ApplicationActiveChanged(NSApplication.sharedApplication.active);
+  }
+}
+
+int RunPlatformApplication(const Application& application) {
+  @autoreleasepool {
+    MacRuntime runtime;
+    runtime.Start(application);
+    UseApplication().OpenWindow(application.root_factory, application.options.window);
+    [NSApplication.sharedApplication run];
+    runtime.RethrowFailure();
+    return 0;
+  }
+}
+
+} // namespace pingcore::detail
+
+namespace pingcore::macos {
+
+NSWindow* GetPlatformWindow(const WindowHandle& window) {
+  auto* attachment = dynamic_cast<pingcore::detail::MacUiWindow*>(pingcore::detail::WindowService::AttachedWindow(window));
+  return attachment ? attachment->Window() : nil;
+}
+
+} // namespace pingcore::macos
+
+namespace pingcore::macos::detail {
+
+NSWindow* GetAppKitWindow(UiWindow& ui_window) {
+  auto* mac_window = dynamic_cast<pingcore::detail::MacUiWindow*>(&ui_window);
+  if (mac_window == nullptr || mac_window->Window() == nil) {
+    throw std::logic_error("PingCore macOS platform module requires an owning NSWindow");
+  }
+  return mac_window->Window();
+}
+
+} // namespace pingcore::macos::detail
+
+@implementation PingCoreWindow
+
+- (BOOL)canBecomeKeyWindow {
+  return (self.styleMask & NSWindowStyleMaskTitled) == 0 || [super canBecomeKeyWindow];
+}
+
+- (BOOL)canBecomeMainWindow {
+  return (self.styleMask & NSWindowStyleMaskTitled) == 0 || [super canBecomeMainWindow];
+}
+
+- (void)sendEvent:(NSEvent*)event {
+  id<NSWindowDelegate> delegate = self.delegate;
+  auto* window = [(id)delegate isKindOfClass:PingCoreWindowDelegate.class]
+      ? ((PingCoreWindowDelegate*)delegate)->pingcoreWindow : nullptr;
+  pingcore::detail::ExecutionGuard guard(window == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*window));
+  if (window == nullptr || !window->BeginPlatformViewFocusTraversal(event)) {
+    [super sendEvent:event];
+    return;
+  }
+  @try {
+    [super sendEvent:event];
+  } @finally {
+    window->EndPlatformViewFocusTraversal();
+  }
+}
+
+@end
+
+@implementation PingCoreNonActivatingPanel
+
+- (BOOL)canBecomeKeyWindow { return NO; }
+- (BOOL)canBecomeMainWindow { return NO; }
+
+@end
+
+@implementation PingCoreView
+
+- (NSDragOperation)draggingSession:(NSDraggingSession*)session
+    sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
+  PINGCORE_UNUSED(session);
+  return context == NSDraggingContextWithinApplication && pingcoreOutgoingDrag && pingcoreOutgoingDrag->Active()
+             ? NSDragOperationCopy : NSDragOperationNone;
+}
+
+- (void)draggingSession:(NSDraggingSession*)session endedAtPoint:(NSPoint)point operation:(NSDragOperation)operation {
+  PINGCORE_UNUSED(session);
+  PINGCORE_UNUSED(point);
+  PINGCORE_UNUSED(operation);
+  auto drag = std::exchange(pingcoreOutgoingDrag, {});
+  if (drag) {
+    pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+        pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+    try { drag->Finish(false); } catch (...) {}
+  }
+}
+
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  [self draggingExited:nil];
+  if (pingcoreWindow == nullptr || !(sender.draggingSourceOperationMask & NSDragOperationCopy)) {
+    return NSDragOperationNone;
+  }
+  const NSPoint position = [self convertPoint:sender.draggingLocation fromView:nil];
+  if (auto drag = pingcore::detail::LocalApplicationDrag(sender)) {
+    pingcoreIncomingDrag = drag;
+    try {
+      return drag->Move(*pingcoreWindow, {static_cast<float>(position.x), static_cast<float>(position.y)})
+                 ? NSDragOperationCopy : NSDragOperationNone;
+    } catch (...) {
+      [self draggingExited:nil];
+      return NSDragOperationNone;
+    }
+  }
+  if (![sender.draggingPasteboard.types containsObject:NSPasteboardTypeFileURL]) return NSDragOperationNone;
+  pingcoreFileDropHover = YES;
+  ++pingcoreFileDropSession;
+  try {
+    const bool accepted = pingcoreWindow->HandleFileDragEntered(
+        pingcoreFileDropSession, {}, {static_cast<float>(position.x), static_cast<float>(position.y)}
+    );
+    return accepted ? NSDragOperationCopy : NSDragOperationNone;
+  } catch (...) {
+    [self draggingExited:nil];
+    return NSDragOperationNone;
+  }
+}
+
+- (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)sender {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  if (!(sender.draggingSourceOperationMask & NSDragOperationCopy)) {
+    [self draggingExited:nil];
+    return NSDragOperationNone;
+  }
+  if (const auto drag = pingcoreIncomingDrag; drag && pingcoreWindow != nullptr) {
+    const NSPoint position = [self convertPoint:sender.draggingLocation fromView:nil];
+    try {
+      return drag->Move(*pingcoreWindow, {static_cast<float>(position.x), static_cast<float>(position.y)})
+                 ? NSDragOperationCopy : NSDragOperationNone;
+    } catch (...) {
+      [self draggingExited:nil];
+      return NSDragOperationNone;
+    }
+  }
+  if (!pingcoreFileDropHover) {
+    return [self draggingEntered:sender];
+  }
+  const NSPoint position = [self convertPoint:sender.draggingLocation fromView:nil];
+  try {
+    return pingcoreWindow != nullptr && pingcoreWindow->HandleFileDragMoved(
+        pingcoreFileDropSession, {}, {static_cast<float>(position.x), static_cast<float>(position.y)}
+    ) ? NSDragOperationCopy : NSDragOperationNone;
+  } catch (...) {
+    [self draggingExited:nil];
+    return NSDragOperationNone;
+  }
+}
+
+- (void)draggingExited:(id<NSDraggingInfo>)sender {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  if (auto drag = std::exchange(pingcoreIncomingDrag, {}); drag && pingcoreWindow != nullptr) {
+    try { drag->Leave(*pingcoreWindow); } catch (...) {}
+  }
+  if (pingcoreFileDropHover && pingcoreWindow != nullptr) {
+    pingcoreFileDropHover = NO;
+    try {
+      pingcoreWindow->HandleFileDragExited(pingcoreFileDropSession);
+    } catch (...) {
+    }
+  }
+}
+
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  if (auto drag = std::exchange(pingcoreIncomingDrag, {})) {
+    if (pingcoreWindow == nullptr || pingcore::detail::LocalApplicationDrag(sender) != drag) return NO;
+    const NSPoint position = [self convertPoint:sender.draggingLocation fromView:nil];
+    try {
+      return drag->Drop(*pingcoreWindow, {static_cast<float>(position.x), static_cast<float>(position.y)});
+    } catch (...) {
+      return NO;
+    }
+  }
+  if (pingcoreWindow == nullptr || !pingcoreFileDropHover ||
+      !(sender.draggingSourceOperationMask & NSDragOperationCopy)) {
+    [self draggingExited:nil];
+    return NO;
+  }
+  const NSPoint position = [self convertPoint:sender.draggingLocation fromView:nil];
+  try {
+    const bool accepted = pingcoreWindow->HandleFileDrop(
+        pingcoreFileDropSession, {}, {static_cast<float>(position.x), static_cast<float>(position.y)},
+        pingcore::detail::CaptureMacFileDrop(sender.draggingPasteboard)
+    );
+    [self draggingExited:nil];
+    return accepted;
+  } catch (...) {
+    [self draggingExited:nil];
+    return NO;
+  }
+}
+
+- (void)draggingEnded:(id<NSDraggingInfo>)sender {
+  [self draggingExited:sender];
+}
+
+- (BOOL)isFlipped {
+  return YES;
+}
+
+- (NSView*)hitTest:(NSPoint)point {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  const NSPoint local_point = self.superview == nil ? point : [self convertPoint:point fromView:self.superview];
+  if (!NSPointInRect(local_point, self.bounds)) {
+    return nil;
+  }
+  if (pingcoreWindow != nullptr && pingcoreWindow->IsInitialized()) {
+    NSView* platform_view = pingcoreWindow->HitTestPlatformView({
+        static_cast<float>(local_point.x),
+        static_cast<float>(local_point.y),
+    });
+    if (platform_view != nil) {
+      return platform_view;
+    }
+  }
+  return self;
+}
+
+- (BOOL)acceptsFirstResponder {
+  return YES;
+}
+
+- (BOOL)becomeFirstResponder {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  const BOOL became_first_responder = [super becomeFirstResponder];
+  if (became_first_responder && pingcoreWindow != nullptr) {
+    pingcoreWindow->SynchronizePlatformViewFocus(self);
+  }
+  return became_first_responder;
+}
+
+- (BOOL)isAccessibilityElement {
+  return NO;
+}
+
+- (NSArray*)accessibilityChildren {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  return pingcoreWindow == nullptr ? @[] : pingcoreWindow->AccessibilityRootChildren();
+}
+
+- (void)setFrameSize:(NSSize)newSize {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  [super setFrameSize:newSize];
+  if (pingcoreWindow != nullptr && pingcoreWindow->IsInitialized()) {
+    pingcoreWindow->WindowGeometryChanged();
+    pingcoreWindow->CommitFrameAndInvalidate();
+  }
+}
+
+- (void)setFrameOrigin:(NSPoint)newOrigin {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  [super setFrameOrigin:newOrigin];
+  if (pingcoreWindow != nullptr && pingcoreWindow->IsInitialized()) {
+    pingcoreWindow->InvalidateTextInputGeometry();
+  }
+}
+
+- (void)setBoundsOrigin:(NSPoint)newOrigin {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  [super setBoundsOrigin:newOrigin];
+  if (pingcoreWindow != nullptr && pingcoreWindow->IsInitialized()) {
+    pingcoreWindow->InvalidateTextInputGeometry();
+  }
+}
+
+- (void)viewDidMoveToWindow {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  [super viewDidMoveToWindow];
+  if (pingcoreWindow != nullptr && pingcoreWindow->IsInitialized()) {
+    pingcoreWindow->RefreshSystemTheme();
+    pingcoreWindow->WindowGeometryChanged();
+  }
+}
+
+- (void)viewDidMoveToSuperview {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  [super viewDidMoveToSuperview];
+  if (pingcoreWindow != nullptr && pingcoreWindow->IsInitialized()) {
+    pingcoreWindow->WindowGeometryChanged();
+  }
+}
+
+- (void)viewDidChangeBackingProperties {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  [super viewDidChangeBackingProperties];
+  if (pingcoreWindow != nullptr && pingcoreWindow->IsInitialized()) {
+    pingcoreWindow->UpdateResourceConfiguration();
+    pingcoreWindow->InvalidateAppKitSurface();
+    pingcoreWindow->WindowGeometryChanged();
+  }
+}
+
+- (void)viewDidChangeEffectiveAppearance {
+  [super viewDidChangeEffectiveAppearance];
+  if (pingcoreWindow != nullptr) pingcoreWindow->RefreshSystemTheme();
+}
+
+- (void)resourceConfigurationDidChange:(NSNotification*)notification {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  if (pingcoreWindow != nullptr && pingcoreWindow->IsInitialized()) {
+    pingcoreWindow->UpdateResourceConfiguration();
+  }
+}
+
+- (NSTextInputContext*)inputContext {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  if (pingcoreWindow != nullptr && pingcoreWindow->IsInitialized()) {
+    NSTextInputContext* context = pingcoreWindow->InputContext();
+    if (context != nil) {
+      return context;
+    }
+  }
+  return [super inputContext];
+}
+
+- (void)updateTrackingAreas {
+  if (pingcoreTrackingArea != nil) {
+    [self removeTrackingArea:pingcoreTrackingArea];
+  }
+  pingcoreTrackingArea = [[NSTrackingArea alloc] initWithRect:NSZeroRect
+                                                     options:NSTrackingMouseEnteredAndExited | NSTrackingMouseMoved |
+                                                             NSTrackingActiveInKeyWindow | NSTrackingInVisibleRect
+                                                       owner:self
+                                                    userInfo:nil];
+  [self addTrackingArea:pingcoreTrackingArea];
+  [super updateTrackingAreas];
+}
+
+- (void)resetCursorRects {
+  [super resetCursorRects];
+  [self addCursorRect:self.bounds cursor:pingcorePointerCursor ?: NSCursor.arrowCursor];
+}
+
+- (void)setPingCorePointerCursor:(NSCursor*)cursor {
+  NSCursor* resolved = cursor ?: NSCursor.arrowCursor;
+  if (pingcorePointerCursor == resolved) {
+    return;
+  }
+  pingcorePointerCursor = resolved;
+  [self.window invalidateCursorRectsForView:self];
+}
+
+- (void)commitPingCoreFrame {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  if (pingcoreWindow != nullptr && pingcoreWindow->IsInitialized()) {
+    pingcoreWindow->CommitFrameAndInvalidate();
+  }
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  [super drawRect:dirtyRect];
+  if (pingcoreWindow == nullptr || !pingcoreWindow->IsInitialized()) {
+    return;
+  }
+
+  CGContextRef context = NSGraphicsContext.currentContext.CGContext;
+  pingcoreWindow->DrawCommittedFrame(context, dirtyRect);
+}
+
+- (void)sendPointerEvent:(NSEvent*)event type:(pingcore::PointerEventType)type {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  if (pingcoreWindow == nullptr || !pingcoreWindow->IsInitialized()) {
+    return;
+  }
+
+  const NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+  pingcorePointerPosition = point;
+  pingcoreWindow->HandlePointerEvent({
+      type,
+      0,
+      {
+          static_cast<float>(point.x),
+          static_cast<float>(point.y),
+      },
+      pingcore::PointerDeviceKind::Mouse,
+      type == pingcore::PointerEventType::Down || type == pingcore::PointerEventType::Up
+          ? MacPointerButton(event.buttonNumber)
+          : pingcore::PointerButton::None,
+      type == pingcore::PointerEventType::Cancel
+          ? pingcore::PointerButton::None
+          : MacPressedButtons(NSEvent.pressedMouseButtons),
+      {(event.modifierFlags & NSEventModifierFlagShift) != 0,
+       (event.modifierFlags & NSEventModifierFlagControl) != 0,
+       (event.modifierFlags & NSEventModifierFlagOption) != 0,
+       (event.modifierFlags & NSEventModifierFlagCommand) != 0},
+  });
+}
+
+- (void)cancelPointer {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  if (pingcoreWindow == nullptr || !pingcoreWindow->IsInitialized()) {
+    return;
+  }
+  pingcoreDragPress = nil;
+  if (pingcoreOutgoingDrag) return;
+  pingcoreWindow->HandlePointerEvent({
+      pingcore::PointerEventType::Cancel,
+      0,
+      {
+          static_cast<float>(pingcorePointerPosition.x),
+          static_cast<float>(pingcorePointerPosition.y),
+      },
+      pingcore::PointerDeviceKind::Mouse,
+      pingcore::PointerButton::None,
+      pingcore::PointerButton::None,
+  });
+}
+
+- (BOOL)sendKeyEvent:(NSEvent*)event type:(pingcore::KeyEventType)type {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  if (pingcoreWindow == nullptr || !pingcoreWindow->IsInitialized()) {
+    return NO;
+  }
+  return pingcoreWindow->HandleKeyEvent(pingcore::detail::MakeMacKeyEvent(event, type));
+}
+
+- (BOOL)acceptsFirstMouse:(NSEvent*)event {
+  return [self.window isKindOfClass:PingCoreNonActivatingPanel.class] || [super acceptsFirstMouse:event];
+}
+
+- (void)mouseDown:(NSEvent*)event {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  if (pingcoreWindow != nullptr && pingcoreWindow->BeginWindowDrag(event)) {
+    return;
+  }
+  pingcoreDragPress = event;
+  if (self.window.canBecomeKeyWindow) [self.window makeFirstResponder:self];
+  [self sendPointerEvent:event type:pingcore::PointerEventType::Down];
+}
+
+- (void)mouseMoved:(NSEvent*)event {
+  [self sendPointerEvent:event type:pingcore::PointerEventType::Move];
+}
+
+- (void)mouseDragged:(NSEvent*)event {
+  [self sendPointerEvent:event type:pingcore::PointerEventType::Move];
+}
+
+- (void)mouseExited:(NSEvent*)event {
+  [self cancelPointer];
+}
+
+- (void)mouseUp:(NSEvent*)event {
+  pingcoreDragPress = nil;
+  [self sendPointerEvent:event type:pingcore::PointerEventType::Up];
+}
+
+- (void)rightMouseDown:(NSEvent*)event {
+  if (self.window.canBecomeKeyWindow) [self.window makeFirstResponder:self];
+  [self sendPointerEvent:event type:pingcore::PointerEventType::Down];
+}
+
+- (void)rightMouseDragged:(NSEvent*)event {
+  [self sendPointerEvent:event type:pingcore::PointerEventType::Move];
+}
+
+- (void)rightMouseUp:(NSEvent*)event {
+  [self sendPointerEvent:event type:pingcore::PointerEventType::Up];
+}
+
+- (void)otherMouseDown:(NSEvent*)event {
+  if (self.window.canBecomeKeyWindow) [self.window makeFirstResponder:self];
+  [self sendPointerEvent:event type:pingcore::PointerEventType::Down];
+}
+
+- (void)otherMouseDragged:(NSEvent*)event {
+  [self sendPointerEvent:event type:pingcore::PointerEventType::Move];
+}
+
+- (void)otherMouseUp:(NSEvent*)event {
+  [self sendPointerEvent:event type:pingcore::PointerEventType::Up];
+}
+
+- (void)keyDown:(NSEvent*)event {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  if (pingcoreWindow != nullptr && pingcoreWindow->IsTextInputActive()) {
+    if (!pingcoreWindow->HandleTextInputEvent(event)) {
+      [super keyDown:event];
+    }
+    return;
+  }
+  if (![self sendKeyEvent:event type:pingcore::KeyEventType::Down]) {
+    [super keyDown:event];
+  }
+}
+
+- (void)keyUp:(NSEvent*)event {
+  if (![self sendKeyEvent:event type:pingcore::KeyEventType::Up]) {
+    [super keyUp:event];
+  }
+}
+
+- (void)flagsChanged:(NSEvent*)event {
+  const pingcore::KeyEvent key_event = pingcore::detail::MakeMacKeyEvent(event, pingcore::KeyEventType::Down);
+  NSEventModifierFlags modifier_flag = 0;
+  std::uint8_t modifier_bit = 0;
+  switch (key_event.key) {
+  case pingcore::Key::ShiftLeft:
+    modifier_bit = 1U << 0U;
+    modifier_flag = NSEventModifierFlagShift;
+    break;
+  case pingcore::Key::ShiftRight:
+    modifier_bit = 1U << 1U;
+    modifier_flag = NSEventModifierFlagShift;
+    break;
+  case pingcore::Key::ControlLeft:
+    modifier_bit = 1U << 2U;
+    modifier_flag = NSEventModifierFlagControl;
+    break;
+  case pingcore::Key::ControlRight:
+    modifier_bit = 1U << 3U;
+    modifier_flag = NSEventModifierFlagControl;
+    break;
+  case pingcore::Key::AltLeft:
+    modifier_bit = 1U << 4U;
+    modifier_flag = NSEventModifierFlagOption;
+    break;
+  case pingcore::Key::AltRight:
+    modifier_bit = 1U << 5U;
+    modifier_flag = NSEventModifierFlagOption;
+    break;
+  case pingcore::Key::MetaLeft:
+    modifier_bit = 1U << 6U;
+    modifier_flag = NSEventModifierFlagCommand;
+    break;
+  case pingcore::Key::MetaRight:
+    modifier_bit = 1U << 7U;
+    modifier_flag = NSEventModifierFlagCommand;
+    break;
+  default:
+    break;
+  }
+
+  if (key_event.key == pingcore::Key::CapsLock) {
+    const pingcore::KeyEventType type = (event.modifierFlags & NSEventModifierFlagCapsLock) != 0
+                                           ? pingcore::KeyEventType::Down
+                                           : pingcore::KeyEventType::Up;
+    if (![self sendKeyEvent:event type:type]) {
+      [super flagsChanged:event];
+    }
+    return;
+  }
+  if (modifier_bit == 0) {
+    [super flagsChanged:event];
+    return;
+  }
+  const bool was_down = (pingcoreModifierKeys & modifier_bit) != 0;
+  const bool aggregate_down = (event.modifierFlags & modifier_flag) != 0;
+  const bool is_down = aggregate_down && !was_down;
+  if (is_down) {
+    pingcoreModifierKeys |= modifier_bit;
+  } else {
+    pingcoreModifierKeys &= static_cast<std::uint8_t>(~modifier_bit);
+  }
+  if (![self sendKeyEvent:event type:is_down ? pingcore::KeyEventType::Down : pingcore::KeyEventType::Up]) {
+    [super flagsChanged:event];
+  }
+}
+
+- (void)cancelOperation:(id)sender {
+  [self cancelPointer];
+}
+
+- (void)viewWillMoveToWindow:(NSWindow*)newWindow {
+  if (newWindow == nil) {
+    [self cancelPointer];
+    pingcoreModifierKeys = 0;
+  }
+  [super viewWillMoveToWindow:newWindow];
+}
+
+- (void)scrollWheel:(NSEvent*)event {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  if (pingcoreWindow == nullptr || !pingcoreWindow->IsInitialized()) {
+    return;
+  }
+
+  const NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+  const float scale = event.hasPreciseScrollingDeltas ? 1.0F : 12.0F;
+  const pingcore::Point consumed = pingcoreWindow->HandleScrollInput({
+      {
+          static_cast<float>(point.x),
+          static_cast<float>(point.y),
+      },
+      static_cast<float>(-event.scrollingDeltaX) * scale,
+      static_cast<float>(-event.scrollingDeltaY) * scale,
+      {
+          (event.modifierFlags & NSEventModifierFlagShift) != 0,
+          (event.modifierFlags & NSEventModifierFlagControl) != 0,
+          (event.modifierFlags & NSEventModifierFlagOption) != 0,
+          (event.modifierFlags & NSEventModifierFlagCommand) != 0,
+      },
+  });
+  if (consumed.x == 0.0F && consumed.y == 0.0F) {
+    [super scrollWheel:event];
+  }
+}
+
+@end
+
+@implementation PingCoreApplicationDelegate
+
+- (void)userNotificationCenter:(UNUserNotificationCenter*)center
+       willPresentNotification:(UNNotification*)notification
+         withCompletionHandler:(void (^)(UNNotificationPresentationOptions options))completionHandler {
+  completionHandler(pingcore::detail::MacLocalNotificationPresentationOptions(notification.request));
+}
+
+- (void)userNotificationCenter:(UNUserNotificationCenter*)center
+    didReceiveNotificationResponse:(UNNotificationResponse*)response
+             withCompletionHandler:(void (^)(void))completionHandler {
+  std::optional<pingcore::NotificationActivation> activation =
+      pingcore::detail::DecodeMacLocalNotificationActivation(response.notification.request, response.actionIdentifier);
+  if (!activation.has_value()) {
+    completionHandler();
+    return;
+  }
+
+  if ([NSThread isMainThread]) {
+    if (pingcoreApplicationRuntime != nullptr) {
+      pingcoreApplicationRuntime->HandleNotificationActivation(std::move(*activation));
+    }
+    completionHandler();
+    return;
+  }
+
+  // Retain the complete snapshot across the dispatch boundary, including application data.
+  const pingcore::NotificationActivation notification_activation = std::move(*activation);
+  dispatch_async(dispatch_get_main_queue(), ^{
+    if (pingcoreApplicationRuntime != nullptr) {
+      pingcoreApplicationRuntime->HandleNotificationActivation(notification_activation);
+    }
+    completionHandler();
+  });
+}
+
+- (void)application:(NSApplication*)application openURLs:(NSArray<NSURL*>*)urls {
+  if (pingcoreApplicationRuntime != nullptr) {
+    pingcoreApplicationRuntime->OpenURLs(urls);
+  }
+}
+
+- (void)applicationDidBecomeActive:(NSNotification*)notification {
+  if (pingcoreApplicationRuntime != nullptr) pingcoreApplicationRuntime->UpdateLifecycleState();
+  if (pingcoreApplicationRuntime != nullptr) pingcoreApplicationRuntime->UpdateWindows();
+}
+
+- (void)applicationDidResignActive:(NSNotification*)notification {
+  if (pingcoreApplicationRuntime != nullptr) pingcoreApplicationRuntime->UpdateLifecycleState();
+  if (pingcoreApplicationRuntime != nullptr) pingcoreApplicationRuntime->UpdateWindows();
+}
+
+- (void)applicationDidHide:(NSNotification*)notification {
+  if (pingcoreApplicationRuntime != nullptr) pingcoreApplicationRuntime->UpdateLifecycleState();
+  if (pingcoreApplicationRuntime != nullptr) pingcoreApplicationRuntime->UpdateWindows();
+}
+
+- (void)applicationDidUnhide:(NSNotification*)notification {
+  if (pingcoreApplicationRuntime != nullptr) pingcoreApplicationRuntime->UpdateLifecycleState();
+  if (pingcoreApplicationRuntime != nullptr) pingcoreApplicationRuntime->UpdateWindows();
+}
+
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)sender {
+  return pingcoreApplicationRuntime == nullptr ? NSTerminateNow : pingcoreApplicationRuntime->ShouldTerminate();
+}
+
+- (void)resourceConfigurationDidChange:(NSNotification*)notification {
+  if (pingcoreApplicationRuntime != nullptr) pingcoreApplicationRuntime->UpdateResourceConfiguration();
+}
+
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender {
+  return NO;
+}
+
+@end
+
+@implementation PingCoreWindowDelegate
+
+- (void)windowWillClose:(NSNotification*)notification {
+  if (pingcoreWindow == nullptr) return;
+  pingcore::detail::ExecutionGuard guard(pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  pingcoreWindow->NativeWindowClosed();
+}
+
+- (BOOL)windowShouldClose:(NSWindow*)sender {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  return pingcoreWindow == nullptr || pingcoreWindow->AllowWindowRequest(pingcore::WindowCommand::Close);
+}
+
+- (BOOL)windowShouldMiniaturize:(NSWindow*)sender {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  return pingcoreWindow == nullptr || pingcoreWindow->AllowWindowRequest(pingcore::WindowCommand::Minimize);
+}
+
+- (void)windowDidMove:(NSNotification*)notification {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  if (pingcoreWindow != nullptr && pingcoreWindow->IsInitialized()) {
+    pingcoreWindow->InvalidateTextInputGeometry();
+  }
+}
+
+- (void)windowDidUpdate:(NSNotification*)notification {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  if (pingcoreWindow != nullptr && pingcoreWindow->IsInitialized()) {
+    pingcoreWindow->SynchronizePlatformViewFocus();
+  }
+}
+
+- (void)windowDidResize:(NSNotification*)notification {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  if (pingcoreWindow != nullptr && pingcoreWindow->IsInitialized()) {
+    pingcoreWindow->WindowGeometryChanged();
+  }
+}
+
+- (void)windowDidChangeScreen:(NSNotification*)notification {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  if (pingcoreWindow != nullptr && pingcoreWindow->IsInitialized()) {
+    pingcoreWindow->UpdateResourceConfiguration();
+    pingcoreWindow->WindowGeometryChanged();
+  }
+}
+
+- (void)windowWillEnterFullScreen:(NSNotification*)notification {
+  if (pingcoreWindow != nullptr) pingcoreWindow->FullscreenTransitionStarted();
+}
+
+- (void)windowWillExitFullScreen:(NSNotification*)notification {
+  if (pingcoreWindow != nullptr) pingcoreWindow->FullscreenTransitionStarted();
+}
+
+- (void)windowDidEnterFullScreen:(NSNotification*)notification {
+  if (pingcoreWindow != nullptr) pingcoreWindow->FullscreenTransitionFinished(true);
+}
+
+- (void)windowDidExitFullScreen:(NSNotification*)notification {
+  if (pingcoreWindow != nullptr) pingcoreWindow->FullscreenTransitionFinished(false);
+}
+
+- (void)windowDidFailToEnterFullScreen:(NSWindow*)window {
+  if (pingcoreWindow != nullptr) pingcoreWindow->FullscreenTransitionFinished(std::nullopt);
+}
+
+- (void)windowDidFailToExitFullScreen:(NSWindow*)window {
+  if (pingcoreWindow != nullptr) pingcoreWindow->FullscreenTransitionFinished(std::nullopt);
+}
+
+- (void)windowDidBecomeKey:(NSNotification*)notification {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  if (pingcoreWindow != nullptr && pingcoreWindow->IsInitialized()) pingcoreWindow->UpdateWindowLifecycleState();
+}
+
+- (void)windowDidResignKey:(NSNotification*)notification {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  if (pingcoreWindow != nullptr && pingcoreWindow->IsInitialized()) pingcoreWindow->UpdateWindowLifecycleState();
+}
+
+- (void)windowDidMiniaturize:(NSNotification*)notification {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  if (pingcoreWindow != nullptr && pingcoreWindow->IsInitialized()) pingcoreWindow->UpdateWindowLifecycleState();
+}
+
+- (void)windowDidDeminiaturize:(NSNotification*)notification {
+  pingcore::detail::ExecutionGuard guard(pingcoreWindow == nullptr ? nullptr :
+      pingcore::detail::InternalAccess::WindowExecution(*pingcoreWindow));
+  if (pingcoreWindow != nullptr && pingcoreWindow->IsInitialized()) pingcoreWindow->UpdateWindowLifecycleState();
+}
+
+@end

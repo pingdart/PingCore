@@ -1,0 +1,1577 @@
+#include "runtime_test_support.h"
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <stop_token>
+#include <stdexcept>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "macros_internal.h"
+#include "runtime/task_internal.h"
+
+namespace pingcore::test {
+
+namespace {
+
+static_assert(std::move_constructible<Task<int>>);
+static_assert(!std::copy_constructible<Task<int>>);
+static_assert(std::copy_constructible<TaskScope>);
+static_assert(std::copy_constructible<TaskHandle>);
+static_assert(std::copy_constructible<WorkerSequence>);
+static_assert(std::copy_constructible<CallbackCompletion<int>>);
+static_assert(std::copy_constructible<CallbackCompletion<void>>);
+static_assert(!std::default_initializable<CallbackCompletion<int>>);
+static_assert(!std::default_initializable<CallbackCompletion<void>>);
+static_assert(std::same_as<decltype(RunWorker([] { return 1; })), Task<int>>);
+static_assert(std::same_as<decltype(WorkerSequence{}.Run([](std::stop_token) { return 1; })), Task<int>>);
+
+class ThreadSafeTaskQueue {
+public:
+  UiThreadDispatcher Dispatcher() {
+    return [this](std::function<void()> callback) {
+      {
+        std::scoped_lock lock(mutex_);
+        callbacks_.push_back(std::move(callback));
+      }
+      condition_.notify_one();
+    };
+  }
+
+  void Drain() {
+    for (;;) {
+      std::vector<std::function<void()>> callbacks;
+      {
+        std::scoped_lock lock(mutex_);
+        callbacks = std::move(callbacks_);
+      }
+      if (callbacks.empty()) {
+        return;
+      }
+      for (auto& callback : callbacks) {
+        callback();
+      }
+    }
+  }
+
+  [[nodiscard]] bool WaitForWork() {
+    std::unique_lock lock(mutex_);
+    return condition_.wait_for(lock, std::chrono::seconds(5), [this] { return !callbacks_.empty(); });
+  }
+
+private:
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  std::vector<std::function<void()>> callbacks_;
+};
+
+template <class Predicate> void DrainUntil(ThreadSafeTaskQueue& queue, Predicate predicate) {
+  while (!predicate()) {
+    REQUIRE(queue.WaitForWork());
+    queue.Drain();
+  }
+}
+
+class WorkerGate {
+public:
+  ~WorkerGate() {
+    Release();
+  }
+
+  void EnterAndWait() {
+    std::unique_lock lock(mutex_);
+    ++started_;
+    condition_.notify_all();
+    condition_.wait(lock, [this] { return released_; });
+    ++departed_;
+    condition_.notify_all();
+  }
+
+  [[nodiscard]] bool WaitForStarted(std::size_t count) {
+    std::unique_lock lock(mutex_);
+    return condition_.wait_for(lock, std::chrono::seconds(5), [this, count] { return started_ >= count; });
+  }
+
+  [[nodiscard]] bool WaitForDeparted(std::size_t count) {
+    std::unique_lock lock(mutex_);
+    return condition_.wait_for(lock, std::chrono::seconds(5), [this, count] { return departed_ >= count; });
+  }
+
+  [[nodiscard]] std::size_t Started() const {
+    std::scoped_lock lock(mutex_);
+    return started_;
+  }
+
+  void Release() {
+    {
+      std::scoped_lock lock(mutex_);
+      released_ = true;
+    }
+    condition_.notify_all();
+  }
+
+private:
+  mutable std::mutex mutex_;
+  std::condition_variable condition_;
+  std::size_t started_ = 0;
+  std::size_t departed_ = 0;
+  bool released_ = false;
+};
+
+class StopAwareWorkerGate {
+public:
+  void EnterAndWait(std::stop_token stop_token) {
+    std::stop_callback stop_callback(stop_token, [this] {
+      {
+        std::scoped_lock lock(mutex_);
+        stopped_ = true;
+      }
+      condition_.notify_all();
+    });
+    std::unique_lock lock(mutex_);
+    started_ = true;
+    condition_.notify_all();
+    condition_.wait(lock, [this] { return stopped_; });
+    cleaned_ = true;
+    condition_.notify_all();
+  }
+
+  [[nodiscard]] bool WaitForStarted() {
+    std::unique_lock lock(mutex_);
+    return condition_.wait_for(lock, std::chrono::seconds(5), [this] { return started_; });
+  }
+
+  [[nodiscard]] bool WaitForCleanup() {
+    std::unique_lock lock(mutex_);
+    return condition_.wait_for(lock, std::chrono::seconds(5), [this] { return cleaned_; });
+  }
+
+  [[nodiscard]] bool Cleaned() const {
+    std::scoped_lock lock(mutex_);
+    return cleaned_;
+  }
+
+private:
+  mutable std::mutex mutex_;
+  std::condition_variable condition_;
+  bool started_ = false;
+  bool stopped_ = false;
+  bool cleaned_ = false;
+};
+
+struct ManualSuspensionState {
+  static Task<void> Wait(std::shared_ptr<ManualSuspensionState> state) {
+    return AwaitCallback<void>([state = std::move(state)](CallbackCompletion<void> completion) {
+      {
+        std::scoped_lock lock(state->mutex);
+        state->completion = std::move(completion);
+      }
+      return [state] {
+        std::scoped_lock lock(state->mutex);
+        state->completion.reset();
+        state->canceled = true;
+      };
+    });
+  }
+
+  void Resume() {
+    std::optional<CallbackCompletion<void>> pending;
+    {
+      std::scoped_lock lock(mutex);
+      pending = std::exchange(completion, std::nullopt);
+    }
+    if (pending) pending->Complete();
+  }
+
+  std::mutex mutex;
+  std::optional<CallbackCompletion<void>> completion;
+  bool canceled = false;
+};
+
+TaskScope captured_task_scope;
+TaskScope captured_child_task_scope;
+State<int> task_value;
+State<int> task_recompose_trigger;
+State<bool> task_child_visible;
+State<bool> post_child_visible;
+TaskScope captured_post_child_scope;
+std::shared_ptr<ManualSuspensionState> child_suspension;
+int child_task_completions = 0;
+bool child_cleanup_preceded_scope_cancellation = false;
+StateList<int> task_keyed_items;
+std::unordered_map<int, std::shared_ptr<ManualSuspensionState>> keyed_suspensions;
+ScrollController task_virtual_scroll;
+std::shared_ptr<ManualSuspensionState> virtual_suspension;
+int composition_task_starts = 0;
+int composition_post_runs = 0;
+
+int AddWorkerValues(int left, int right) {
+  return left + right;
+}
+
+Task<int> TaskValue(int value) {
+  co_return value;
+}
+
+Task<int> FailingTaskValue() {
+  throw std::runtime_error("task failed");
+  co_return 0;
+}
+
+Task<void> DirectTask(int* starts) {
+  ++*starts;
+  co_return;
+}
+
+Task<void> DelayedStateTask(State<int> state, std::thread::id* resumed_thread) {
+  co_await Delay(3ms);
+  *resumed_thread = std::this_thread::get_id();
+  state = 7;
+}
+
+Task<void> SuspendedTask(std::shared_ptr<ManualSuspensionState> suspension, int* completions = nullptr) {
+  co_await ManualSuspensionState::Wait(std::move(suspension));
+  if (completions != nullptr) {
+    ++*completions;
+  }
+}
+
+View TaskScopeApp() {
+  captured_task_scope = UseTaskScope();
+  task_value = UseState(0);
+  task_recompose_trigger = UseState(0);
+  return Text::Format("{}:{}", task_value, task_recompose_trigger);
+}
+
+View CallbackEnvironmentApp() {
+  return ProvideEnvironment(Locale::FromLanguageTag("fr-FR"), Scope(TaskScopeApp));
+}
+
+View TaskChild() {
+  captured_child_task_scope = UseTaskScope();
+  Lifecycle([tasks = captured_child_task_scope] {
+    tasks.Launch(SuspendedTask(child_suspension, &child_task_completions));
+    return [] { child_cleanup_preceded_scope_cancellation = !child_suspension->canceled; };
+  });
+  return Text("child");
+}
+
+View TaskUnmountApp() {
+  task_child_visible = UseState(true);
+  if (task_child_visible) {
+    return Scope(TaskChild);
+  }
+  return Text("removed");
+}
+
+View TaskKeyedApp() {
+  task_keyed_items = UseStateList<int>({1, 2});
+  return Column {
+    ForEach(task_keyed_items, [](int item) {
+      return Scope([item] {
+        auto tasks = UseTaskScope();
+        Lifecycle([tasks, item] { tasks.Launch(SuspendedTask(keyed_suspensions.at(item))); });
+        return Text::Format("{}", item);
+      }).Key(item);
+    }),
+  };
+}
+
+View TaskVirtualItem(std::size_t index) {
+  return Scope([index] {
+    if (index == 0) {
+      auto tasks = UseTaskScope();
+      Lifecycle([tasks] { tasks.Launch(SuspendedTask(virtual_suspension)); });
+    }
+    return Text::Format("{}", index);
+  }).Key(index);
+}
+
+View TaskVirtualListApp() {
+  auto scroll = UseScrollController();
+  task_virtual_scroll = scroll;
+  return VirtualList(std::size_t{100}, TaskVirtualItem)
+      .Controller(scroll)
+      .ItemExtent(20.0F)
+      .CacheExtent(0.0F);
+}
+
+View IllegalTaskLaunchApp() {
+  auto tasks = UseTaskScope();
+  tasks.Launch(DirectTask(&composition_task_starts));
+  return Text("invalid");
+}
+
+View PostChild() {
+  captured_post_child_scope = UseTaskScope();
+  return Text("child");
+}
+
+View PostUnmountApp() {
+  post_child_visible = UseState(true);
+  if (post_child_visible) {
+    return Scope(PostChild);
+  }
+  return Text("removed");
+}
+
+View IllegalTaskPostApp() {
+  auto tasks = UseTaskScope();
+  tasks.Post([] { ++composition_post_runs; });
+  return Text("invalid");
+}
+
+} // namespace
+
+TEST_CASE("TaskScopeLaunchIsLazyAndComposesNestedTaskValuesAndExceptions") {
+  captured_task_scope = {};
+  task_value = State<int>{};
+  int direct_starts = 0;
+  int factory_starts = 0;
+  TestPlatform platform;
+  UiWindow runtime(TaskScopeApp, platform);
+
+  runtime.BuildFrame();
+  captured_task_scope.Launch(DirectTask(&direct_starts));
+  captured_task_scope.Launch([state = task_value, &factory_starts]() -> Task<void> {
+    ++factory_starts;
+    state = co_await TaskValue(41);
+    try {
+      co_await FailingTaskValue();
+    } catch (const std::runtime_error&) {
+      state += 1;
+    }
+  });
+
+  REQUIRE(direct_starts == 0);
+  REQUIRE(factory_starts == 0);
+  REQUIRE(task_value.Get() == 0);
+
+  platform.RunPlatformModuleTasks();
+
+  REQUIRE(direct_starts == 1);
+  REQUIRE(factory_starts == 1);
+  REQUIRE(task_value.Get() == 42);
+}
+
+TEST_CASE("DelayIsLazyAndResumesAfterItsDeadlineOnTheOwningUIThread") {
+  captured_task_scope = {};
+  task_value = State<int>{};
+  TestPlatform platform;
+  UiWindow runtime(TaskScopeApp, platform);
+  runtime.BuildFrame();
+  const std::thread::id ui_thread = std::this_thread::get_id();
+
+  std::thread::id resumed_thread;
+  Task<void> delayed = DelayedStateTask(task_value, &resumed_thread);
+  REQUIRE(platform.requested_deadlines.empty());
+
+  captured_task_scope.Launch(std::move(delayed));
+  REQUIRE(platform.requested_deadlines.empty());
+  platform.RunPlatformModuleTasks();
+  REQUIRE(platform.requested_deadlines.empty());
+
+  platform.AdvanceTime(0.002);
+  platform.RunPlatformModuleTasks();
+  REQUIRE(task_value.Get() == 0);
+
+  platform.AdvanceTime(0.001);
+  platform.RunPlatformModuleTasks();
+  REQUIRE(task_value.Get() == 7);
+  REQUIRE(resumed_thread == ui_thread);
+}
+
+TEST_CASE("DelayOrdersDeadlinesAndDefersZeroDurationChains") {
+  captured_task_scope = {};
+  TestPlatform platform;
+  UiWindow runtime(TaskScopeApp, platform);
+  runtime.BuildFrame();
+  std::vector<int> completions;
+
+  captured_task_scope.Launch([&completions]() -> Task<void> {
+    co_await Delay(3s);
+    completions.push_back(3);
+  });
+  captured_task_scope.Launch([&completions]() -> Task<void> {
+    co_await Delay(3ms);
+    completions.push_back(1);
+    co_await Delay(0ms);
+    completions.push_back(2);
+  });
+  platform.RunPlatformModuleTasks();
+
+  platform.AdvanceTime(0.003);
+  platform.RunPlatformModuleTasks();
+  REQUIRE(completions == std::vector<int>{1});
+
+  platform.RunPlatformModuleTasks();
+  REQUIRE(completions == std::vector<int>{1, 2});
+
+  platform.AdvanceTime(2.997);
+  platform.RunPlatformModuleTasks();
+  REQUIRE(completions == std::vector<int>{1, 2, 3});
+}
+
+TEST_CASE("DelayCancellationPreventsLaterResumption") {
+  captured_task_scope = {};
+  TestPlatform platform;
+  UiWindow runtime(TaskScopeApp, platform);
+  runtime.BuildFrame();
+  int completions = 0;
+
+  TaskHandle delayed = captured_task_scope.Launch([&completions]() -> Task<void> {
+    co_await Delay(3s);
+    ++completions;
+  });
+  platform.RunPlatformModuleTasks();
+  delayed.Cancel();
+
+  platform.AdvanceTime(3.0);
+  platform.RunPlatformModuleTasks();
+  REQUIRE(completions == 0);
+}
+
+TEST_CASE("DelayRejectsInvalidDurations") {
+  REQUIRE_THROWS_AS(Delay(std::chrono::duration<double>{-1.0}), std::invalid_argument);
+  REQUIRE_THROWS_AS(
+      Delay(std::chrono::duration<double>{std::numeric_limits<double>::infinity()}),
+      std::invalid_argument
+  );
+  REQUIRE_THROWS_AS(
+      Delay(std::chrono::duration<double>{std::numeric_limits<double>::quiet_NaN()}),
+      std::invalid_argument
+  );
+}
+
+TEST_CASE("TaskHandleCancellationIsIndividualAndIgnoredHandlesRemainScopeOwned") {
+  captured_task_scope = {};
+  TestPlatform platform;
+  UiWindow runtime(TaskScopeApp, platform);
+  runtime.BuildFrame();
+
+  int canceled_starts = 0;
+  TaskHandle canceled = captured_task_scope.Launch(DirectTask(&canceled_starts));
+  canceled.Cancel();
+  canceled.Cancel();
+
+  auto suspension = std::make_shared<ManualSuspensionState>();
+  int completions = 0;
+  captured_task_scope.Launch(SuspendedTask(suspension, &completions));
+  platform.RunPlatformModuleTasks();
+
+  REQUIRE(canceled_starts == 0);
+  REQUIRE(completions == 0);
+  REQUIRE_FALSE(suspension->canceled);
+
+  suspension->Resume();
+  platform.RunPlatformModuleTasks();
+  REQUIRE(completions == 1);
+}
+
+TEST_CASE("TaskScopeSurvivesCompatibleRecomposition") {
+  captured_task_scope = {};
+  TestPlatform platform;
+  UiWindow runtime(TaskScopeApp, platform);
+  runtime.BuildFrame();
+
+  auto suspension = std::make_shared<ManualSuspensionState>();
+  int completions = 0;
+  captured_task_scope.Launch(SuspendedTask(suspension, &completions));
+  platform.RunPlatformModuleTasks();
+
+  task_recompose_trigger = 1;
+  runtime.BuildFrame();
+  REQUIRE_FALSE(suspension->canceled);
+
+  suspension->Resume();
+  platform.RunPlatformModuleTasks();
+  REQUIRE(completions == 1);
+}
+
+TEST_CASE("TaskScopeFollowsKeyedMovementAndClosesOnlyRemovedChildren") {
+  task_keyed_items = {};
+  keyed_suspensions = {
+      {1, std::make_shared<ManualSuspensionState>()},
+      {2, std::make_shared<ManualSuspensionState>()},
+  };
+  TestPlatform platform;
+  UiWindow runtime(TaskKeyedApp, platform);
+
+  runtime.BuildFrame();
+  platform.RunPlatformModuleTasks();
+  task_keyed_items.Move(1, 0);
+  runtime.BuildFrame();
+
+  REQUIRE_FALSE(keyed_suspensions.at(1)->canceled);
+  REQUIRE_FALSE(keyed_suspensions.at(2)->canceled);
+
+  task_keyed_items.Erase(0);
+  runtime.BuildFrame();
+  REQUIRE_FALSE(keyed_suspensions.at(1)->canceled);
+  REQUIRE(keyed_suspensions.at(2)->canceled);
+}
+
+TEST_CASE("VirtualItemEvictionClosesItsTaskScope") {
+  virtual_suspension = std::make_shared<ManualSuspensionState>();
+  TestPlatform platform;
+  UiWindow runtime(TaskVirtualListApp, platform);
+  runtime.SetWindowMetrics({.viewport = {100.0F, 40.0F}});
+
+  runtime.BuildFrame();
+  platform.RunPlatformModuleTasks();
+  REQUIRE_FALSE(virtual_suspension->canceled);
+
+  REQUIRE(task_virtual_scroll.ScrollToItem(50));
+  runtime.BuildFrame();
+  REQUIRE(virtual_suspension->canceled);
+}
+
+TEST_CASE("UnmountClosesTaskScopeAfterLifecycleCleanupAndRejectsLaterLaunch") {
+  captured_child_task_scope = {};
+  child_suspension = std::make_shared<ManualSuspensionState>();
+  child_task_completions = 0;
+  child_cleanup_preceded_scope_cancellation = false;
+  TestPlatform platform;
+  UiWindow runtime(TaskUnmountApp, platform);
+
+  runtime.BuildFrame();
+  platform.RunPlatformModuleTasks();
+  REQUIRE_FALSE(child_suspension->canceled);
+
+  task_child_visible = false;
+  runtime.BuildFrame();
+
+  REQUIRE(child_suspension->canceled);
+  REQUIRE(child_cleanup_preceded_scope_cancellation);
+  REQUIRE(child_task_completions == 0);
+  child_suspension->Resume();
+  platform.RunPlatformModuleTasks();
+  REQUIRE(child_task_completions == 0);
+  REQUIRE_THROWS_AS(captured_child_task_scope.Launch(DirectTask(&child_task_completions)), std::logic_error);
+}
+
+TEST_CASE("RuntimeDestructionClosesRunningTaskScopes") {
+  captured_task_scope = {};
+  auto suspension = std::make_shared<ManualSuspensionState>();
+  TestPlatform platform;
+  {
+    UiWindow runtime(TaskScopeApp, platform);
+    runtime.BuildFrame();
+    captured_task_scope.Launch(SuspendedTask(suspension));
+    platform.RunPlatformModuleTasks();
+    REQUIRE_FALSE(suspension->canceled);
+  }
+  REQUIRE(suspension->canceled);
+}
+
+TEST_CASE("PingCoreAwaitableRestoresTaskExecutionToTheOwningUIThread") {
+#if defined(__EMSCRIPTEN__)
+  SKIP("PingCore Web has no worker-thread execution capability");
+#endif
+  captured_task_scope = {};
+  task_value = State<int>{};
+  std::mutex queue_mutex;
+  std::vector<std::function<void()>> queued;
+  const std::thread::id ui_thread = std::this_thread::get_id();
+  TestPlatform platform([&](std::function<void()> callback) {
+    std::scoped_lock lock(queue_mutex);
+    queued.push_back(std::move(callback));
+  });
+  const auto drain = [&] {
+    for (;;) {
+      std::vector<std::function<void()>> current;
+      {
+        std::scoped_lock lock(queue_mutex);
+        current = std::move(queued);
+      }
+      if (current.empty()) {
+        return;
+      }
+      for (const auto& callback : current) {
+        callback();
+      }
+    }
+  };
+  UiWindow runtime(TaskScopeApp, platform);
+  runtime.BuildFrame();
+
+  auto suspension = std::make_shared<ManualSuspensionState>();
+  std::thread::id resumed_thread;
+  captured_task_scope.Launch([state = task_value, suspension, &resumed_thread]() -> Task<void> {
+    co_await ManualSuspensionState::Wait(suspension);
+    resumed_thread = std::this_thread::get_id();
+    state = 7;
+  });
+  drain();
+
+  std::thread worker([suspension] { suspension->Resume(); });
+  worker.join();
+  REQUIRE(task_value.Get() == 0);
+
+  drain();
+  REQUIRE(resumed_thread == ui_thread);
+  REQUIRE(task_value.Get() == 7);
+}
+
+#if !defined(__EMSCRIPTEN__)
+
+TEST_CASE("RunWorkerOwnsItsInvocationAndRestoresResultsAndExceptionsToTheUIThread") {
+  captured_task_scope = {};
+  ThreadSafeTaskQueue queue;
+  TestPlatform platform(queue.Dispatcher());
+  UiWindow runtime(TaskScopeApp, platform);
+  runtime.BuildFrame();
+  const std::thread::id ui_thread = std::this_thread::get_id();
+  std::thread::id worker_thread;
+  std::thread::id resumed_thread;
+  int result = 0;
+  bool completed = false;
+  bool caught = false;
+
+  captured_task_scope.Launch([&]() -> Task<void> {
+    const int sum = co_await RunWorker(AddWorkerValues, 20, 22);
+    auto owned = co_await RunWorker(
+        [&worker_thread](std::unique_ptr<int> value) {
+          worker_thread = std::this_thread::get_id();
+          ++*value;
+          return value;
+        },
+        std::make_unique<int>(sum)
+    );
+    co_await RunWorker([] {});
+    try {
+      co_await RunWorker([]() -> int { throw std::runtime_error("worker failed"); });
+    } catch (const std::runtime_error&) {
+      caught = true;
+    }
+    resumed_thread = std::this_thread::get_id();
+    result = *owned;
+    completed = true;
+  });
+
+  REQUIRE_FALSE(completed);
+  queue.Drain();
+  DrainUntil(queue, [&] { return completed; });
+
+  REQUIRE(result == 43);
+  REQUIRE(caught);
+  REQUIRE(worker_thread != ui_thread);
+  REQUIRE(resumed_thread == ui_thread);
+}
+
+TEST_CASE("RunWorkerUsesBoundedConcurrencyAndDiscardsCanceledWork") {
+  captured_task_scope = {};
+  ThreadSafeTaskQueue queue;
+  TestPlatform platform(queue.Dispatcher());
+  UiWindow runtime(TaskScopeApp, platform);
+  runtime.BuildFrame();
+  const std::size_t worker_count = detail::WorkerConcurrency();
+  REQUIRE(worker_count > 0);
+  WorkerGate gate;
+  std::vector<TaskHandle> running;
+  running.reserve(worker_count);
+  int completions = 0;
+
+  for (std::size_t index = 0; index < worker_count; ++index) {
+    running.push_back(captured_task_scope.Launch([&]() -> Task<void> {
+      co_await RunWorker([&gate] { gate.EnterAndWait(); });
+      ++completions;
+    }));
+  }
+  queue.Drain();
+  REQUIRE(gate.WaitForStarted(worker_count));
+  REQUIRE(gate.Started() == worker_count);
+
+  std::atomic<bool> queued_executed = false;
+  TaskHandle queued = captured_task_scope.Launch([&]() -> Task<void> {
+    co_await RunWorker([&queued_executed] { queued_executed = true; });
+    ++completions;
+  });
+  queue.Drain();
+  running.front().Cancel();
+  queued.Cancel();
+  gate.Release();
+
+  DrainUntil(queue, [&] { return completions == static_cast<int>(worker_count - 1); });
+  REQUIRE(gate.WaitForDeparted(worker_count));
+  REQUIRE_FALSE(queued_executed);
+}
+
+TEST_CASE("WorkerSequenceSerializesOperationsAcrossCopiedHandles") {
+  captured_task_scope = {};
+  ThreadSafeTaskQueue queue;
+  TestPlatform platform(queue.Dispatcher());
+  UiWindow runtime(TaskScopeApp, platform);
+  runtime.BuildFrame();
+  const std::thread::id ui_thread = std::this_thread::get_id();
+  std::thread::id resumed_thread;
+  WorkerGate first_gate;
+  std::atomic<bool> second_started = false;
+  std::vector<int> order;
+  int result = 0;
+  int completions = 0;
+
+  {
+    WorkerSequence sequence;
+    WorkerSequence copied_sequence = sequence;
+    auto first = sequence.Run(
+        [&](std::stop_token, std::unique_ptr<int> value) {
+          order.push_back(1);
+          first_gate.EnterAndWait();
+          ++*value;
+          return value;
+        },
+        std::make_unique<int>(41)
+    );
+    auto second = copied_sequence.Run([&](std::stop_token) {
+      second_started = true;
+      order.push_back(2);
+    });
+    captured_task_scope.Launch([&, work = std::move(first)]() mutable -> Task<void> {
+      auto owned = co_await std::move(work);
+      result = *owned;
+      ++completions;
+    });
+    captured_task_scope.Launch([&, work = std::move(second)]() mutable -> Task<void> {
+      co_await std::move(work);
+      resumed_thread = std::this_thread::get_id();
+      ++completions;
+    });
+  }
+  queue.Drain();
+
+  REQUIRE(first_gate.WaitForStarted(1));
+  REQUIRE_FALSE(second_started);
+  first_gate.Release();
+  DrainUntil(queue, [&] { return completions == 2; });
+
+  REQUIRE(result == 42);
+  REQUIRE(order == std::vector<int>{1, 2});
+  REQUIRE(resumed_thread == ui_thread);
+}
+
+TEST_CASE("IndependentWorkerSequencesCanUseTheSharedPoolConcurrently") {
+  if (detail::WorkerConcurrency() < 2) {
+    return;
+  }
+  captured_task_scope = {};
+  ThreadSafeTaskQueue queue;
+  TestPlatform platform(queue.Dispatcher());
+  UiWindow runtime(TaskScopeApp, platform);
+  runtime.BuildFrame();
+  WorkerSequence first_sequence;
+  WorkerSequence second_sequence;
+  WorkerGate gate;
+  int completions = 0;
+
+  captured_task_scope.Launch([&]() -> Task<void> {
+    co_await first_sequence.Run([&](std::stop_token) { gate.EnterAndWait(); });
+    ++completions;
+  });
+  captured_task_scope.Launch([&]() -> Task<void> {
+    co_await second_sequence.Run([&](std::stop_token) { gate.EnterAndWait(); });
+    ++completions;
+  });
+  queue.Drain();
+
+  REQUIRE(gate.WaitForStarted(2));
+  gate.Release();
+  DrainUntil(queue, [&] { return completions == 2; });
+}
+
+TEST_CASE("WorkerSequenceAndRunWorkerCanUseTheSharedPoolConcurrently") {
+  if (detail::WorkerConcurrency() < 2) {
+    return;
+  }
+  captured_task_scope = {};
+  ThreadSafeTaskQueue queue;
+  TestPlatform platform(queue.Dispatcher());
+  UiWindow runtime(TaskScopeApp, platform);
+  runtime.BuildFrame();
+  WorkerSequence sequence;
+  WorkerGate gate;
+  int completions = 0;
+
+  captured_task_scope.Launch([&]() -> Task<void> {
+    co_await sequence.Run([&](std::stop_token) { gate.EnterAndWait(); });
+    ++completions;
+  });
+  captured_task_scope.Launch([&]() -> Task<void> {
+    co_await RunWorker([&] { gate.EnterAndWait(); });
+    ++completions;
+  });
+  queue.Drain();
+
+  REQUIRE(gate.WaitForStarted(2));
+  gate.Release();
+  DrainUntil(queue, [&] { return completions == 2; });
+}
+
+TEST_CASE("WorkerSequenceCancellationSkipsQueuedWorkAndStopsActiveWorkCooperatively") {
+  captured_task_scope = {};
+  ThreadSafeTaskQueue queue;
+  TestPlatform platform(queue.Dispatcher());
+  UiWindow runtime(TaskScopeApp, platform);
+  runtime.BuildFrame();
+  WorkerSequence sequence;
+  StopAwareWorkerGate active_gate;
+  std::atomic<bool> queued_executed = false;
+  bool active_resumed = false;
+  bool trailing_completed = false;
+  bool trailing_started_after_cleanup = false;
+
+  TaskHandle active = captured_task_scope.Launch([&]() -> Task<void> {
+    co_await sequence.Run([&](std::stop_token stop_token) {
+      active_gate.EnterAndWait(stop_token);
+      throw std::runtime_error("canceled sequence operation failed");
+    });
+    active_resumed = true;
+  });
+  TaskHandle queued = captured_task_scope.Launch([&]() -> Task<void> {
+    co_await sequence.Run([&](std::stop_token) { queued_executed = true; });
+  });
+  captured_task_scope.Launch([&]() -> Task<void> {
+    co_await sequence.Run([&](std::stop_token) {
+      trailing_started_after_cleanup = active_gate.Cleaned();
+    });
+    trailing_completed = true;
+  });
+  queue.Drain();
+  REQUIRE(active_gate.WaitForStarted());
+
+  queued.Cancel();
+  active.Cancel();
+  queue.Drain();
+  REQUIRE(active_gate.WaitForCleanup());
+  DrainUntil(queue, [&] { return trailing_completed; });
+
+  REQUIRE_FALSE(active_resumed);
+  REQUIRE_FALSE(queued_executed);
+  REQUIRE(trailing_started_after_cleanup);
+}
+
+TEST_CASE("WorkerSequencePromotesTheNextOperationAfterAnException") {
+  captured_task_scope = {};
+  ThreadSafeTaskQueue queue;
+  TestPlatform platform(queue.Dispatcher());
+  UiWindow runtime(TaskScopeApp, platform);
+  runtime.BuildFrame();
+  WorkerSequence sequence;
+  bool caught = false;
+  int result = 0;
+  int completions = 0;
+
+  captured_task_scope.Launch([&]() -> Task<void> {
+    try {
+      co_await sequence.Run([](std::stop_token) -> int {
+        throw std::runtime_error("sequenced worker failed");
+      });
+    } catch (const std::runtime_error&) {
+      caught = true;
+    }
+    ++completions;
+  });
+  captured_task_scope.Launch([&]() -> Task<void> {
+    result = co_await sequence.Run([](std::stop_token) { return 7; });
+    ++completions;
+  });
+  queue.Drain();
+  DrainUntil(queue, [&] { return completions == 2; });
+
+  REQUIRE(caught);
+  REQUIRE(result == 7);
+}
+
+TEST_CASE("RuntimeDestructionDiscardsARunningWorkerResult") {
+  captured_task_scope = {};
+  ThreadSafeTaskQueue queue;
+  TestPlatform platform(queue.Dispatcher());
+  WorkerGate gate;
+  bool resumed = false;
+  {
+    UiWindow runtime(TaskScopeApp, platform);
+    runtime.BuildFrame();
+    captured_task_scope.Launch([&]() -> Task<void> {
+      co_await RunWorker([&gate] { gate.EnterAndWait(); });
+      resumed = true;
+    });
+    queue.Drain();
+    REQUIRE(gate.WaitForStarted(1));
+  }
+
+  gate.Release();
+  REQUIRE(gate.WaitForDeparted(1));
+  queue.Drain();
+  REQUIRE_FALSE(resumed);
+}
+
+TEST_CASE("RuntimeDestructionCancelsAWorkerSequenceAndSkipsItsQueuedWork") {
+  captured_task_scope = {};
+  ThreadSafeTaskQueue queue;
+  TestPlatform platform(queue.Dispatcher());
+  StopAwareWorkerGate active_gate;
+  std::atomic<bool> queued_executed = false;
+  bool resumed = false;
+  {
+    UiWindow runtime(TaskScopeApp, platform);
+    runtime.BuildFrame();
+    WorkerSequence sequence;
+    captured_task_scope.Launch([&, sequence]() -> Task<void> {
+      co_await sequence.Run([&](std::stop_token stop_token) { active_gate.EnterAndWait(stop_token); });
+      resumed = true;
+    });
+    captured_task_scope.Launch([&, sequence]() -> Task<void> {
+      co_await sequence.Run([&](std::stop_token) { queued_executed = true; });
+    });
+    queue.Drain();
+    REQUIRE(active_gate.WaitForStarted());
+  }
+
+  REQUIRE(active_gate.WaitForCleanup());
+  queue.Drain();
+  REQUIRE_FALSE(resumed);
+  REQUIRE_FALSE(queued_executed);
+}
+
+#else
+
+TEST_CASE("RunWorkerReportsUnavailableWebWorkerExecution") {
+  captured_task_scope = {};
+  TestPlatform platform;
+  UiWindow runtime(TaskScopeApp, platform);
+  runtime.BuildFrame();
+  bool unavailable = false;
+
+  captured_task_scope.Launch([&]() -> Task<void> {
+    try {
+      co_await RunWorker([] { return 1; });
+    } catch (const std::runtime_error&) {
+      unavailable = true;
+    }
+  });
+  platform.RunPlatformModuleTasks();
+
+  REQUIRE(unavailable);
+}
+
+TEST_CASE("WorkerSequenceReportsUnavailableWebWorkerExecution") {
+  captured_task_scope = {};
+  TestPlatform platform;
+  UiWindow runtime(TaskScopeApp, platform);
+  runtime.BuildFrame();
+  WorkerSequence sequence;
+  bool unavailable = false;
+  bool invoked = false;
+
+  captured_task_scope.Launch([&]() -> Task<void> {
+    try {
+      co_await sequence.Run([&](std::stop_token) {
+        invoked = true;
+        return 1;
+      });
+    } catch (const std::runtime_error&) {
+      unavailable = true;
+    }
+  });
+  platform.RunPlatformModuleTasks();
+
+  REQUIRE(unavailable);
+  REQUIRE_FALSE(invoked);
+}
+
+#endif
+
+TEST_CASE("TaskScopePostDefersOwnedCallbacksAndPreservesOrder") {
+  captured_task_scope = {};
+  ThreadSafeTaskQueue queue;
+  TestPlatform platform(queue.Dispatcher());
+  UiWindow runtime(TaskScopeApp, platform);
+  runtime.BuildFrame();
+  const std::thread::id ui_thread = std::this_thread::get_id();
+  std::thread::id callback_thread;
+  std::vector<int> values;
+
+  captured_task_scope.Post([value = std::make_unique<int>(1), &values] { values.push_back(*value); });
+  REQUIRE(values.empty());
+  queue.Drain();
+  REQUIRE(values == std::vector<int>{1});
+
+  const auto post = [tasks = captured_task_scope, &values, &callback_thread] {
+    tasks.Post([&values, &callback_thread] {
+      callback_thread = std::this_thread::get_id();
+      values.push_back(2);
+    });
+    tasks.Post([&values] { values.push_back(3); });
+  };
+#if defined(__EMSCRIPTEN__)
+  post();
+#else
+  std::thread external(post);
+  external.join();
+#endif
+  REQUIRE(values == std::vector<int>{1});
+
+  queue.Drain();
+  REQUIRE(values == std::vector<int>{1, 2, 3});
+  REQUIRE(callback_thread == ui_thread);
+}
+
+TEST_CASE("TaskScopePostSuppressesCallbacksAfterScopeAndRuntimeClosure") {
+  captured_post_child_scope = {};
+  post_child_visible = State<bool>{};
+  ThreadSafeTaskQueue queue;
+  TestPlatform platform(queue.Dispatcher());
+  int callbacks = 0;
+  UiWindow runtime(PostUnmountApp, platform);
+  runtime.BuildFrame();
+
+  captured_post_child_scope.Post([&callbacks] { ++callbacks; });
+  post_child_visible = false;
+  runtime.BuildFrame();
+  queue.Drain();
+  REQUIRE(callbacks == 0);
+
+  captured_post_child_scope.Post([&callbacks] { ++callbacks; });
+  queue.Drain();
+  REQUIRE(callbacks == 0);
+
+  {
+    TestPlatform pending_platform(queue.Dispatcher());
+    UiWindow pending_runtime(TaskScopeApp, pending_platform);
+    pending_runtime.BuildFrame();
+    captured_task_scope.Post([&callbacks] { ++callbacks; });
+  }
+  queue.Drain();
+  REQUIRE(callbacks == 0);
+}
+
+TEST_CASE("TaskScopeReportsInvalidUsage") {
+  int starts = 0;
+  REQUIRE_THROWS_AS(UseTaskScope(), std::logic_error);
+  REQUIRE_THROWS_AS(TaskScope{}.Launch(DirectTask(&starts)), std::logic_error);
+  REQUIRE_THROWS_AS(TaskScope{}.Post([] {}), std::logic_error);
+
+  TestPlatform valid_platform;
+  UiWindow valid_runtime(TaskScopeApp, valid_platform);
+  valid_runtime.BuildFrame();
+  Task<void> empty;
+  REQUIRE_THROWS_AS(captured_task_scope.Launch(std::move(empty)), std::logic_error);
+
+  REQUIRE_THROWS_AS(TestPlatform(UiThreadDispatcher{}), std::invalid_argument);
+
+  composition_task_starts = 0;
+  TestPlatform dispatched_platform;
+  UiWindow composition_runtime(IllegalTaskLaunchApp, dispatched_platform);
+  REQUIRE_THROWS_AS(composition_runtime.BuildFrame(), std::logic_error);
+  dispatched_platform.RunPlatformModuleTasks();
+  REQUIRE(composition_task_starts == 0);
+
+  composition_post_runs = 0;
+  TestPlatform post_platform;
+  UiWindow post_runtime(IllegalTaskPostApp, post_platform);
+  REQUIRE_THROWS_AS(post_runtime.BuildFrame(), std::logic_error);
+  post_platform.RunPlatformModuleTasks();
+  REQUIRE(composition_post_runs == 0);
+}
+
+TEST_CASE("AwaitCallbackOwnsLazyMoveOnlyInputsAndDefersInlineCompletion") {
+  TestPlatform platform;
+  UiWindow runtime(TaskScopeApp, platform);
+  runtime.BuildFrame();
+  auto owner = std::make_shared<int>(42);
+  std::weak_ptr<int> weak_owner = owner;
+  int starts = 0;
+  int result = 0;
+  int cancellations = 0;
+  bool returned = false;
+  auto task = AwaitCallback<std::unique_ptr<int>>(
+      [owner = std::move(owner), value = std::make_unique<int>(7), &starts, &returned,
+       &cancellations, &platform](CallbackCompletion<std::unique_ptr<int>> completion) mutable {
+        ++starts;
+        *value += *owner;
+        completion.Complete(std::move(value));
+        platform.RunPlatformModuleTasks();
+        returned = true;
+        return [&cancellations] { ++cancellations; };
+      }
+  );
+  REQUIRE(starts == 0);
+  REQUIRE_FALSE(weak_owner.expired());
+  captured_task_scope.Launch([task = std::move(task), &result, &returned]() mutable -> Task<void> {
+    auto value = co_await std::move(task);
+    REQUIRE(returned);
+    result = *value;
+  });
+  REQUIRE(starts == 0);
+  platform.RunPlatformModuleTasks();
+  REQUIRE(starts == 1);
+  REQUIRE(result == 49);
+  REQUIRE(cancellations == 0);
+  REQUIRE(weak_owner.expired());
+
+  auto unused_owner = std::make_shared<int>();
+  std::weak_ptr<int> weak_unused = unused_owner;
+  {
+    auto unused = AwaitCallback<void>([owner = std::move(unused_owner), &starts](auto) {
+      ++starts;
+      return std::function<void()>{};
+    });
+    REQUIRE_FALSE(weak_unused.expired());
+  }
+  REQUIRE(weak_unused.expired());
+  REQUIRE(starts == 1);
+}
+
+TEST_CASE("AwaitCallbackPropagatesFailuresAndAcceptsOnlyTheFirstSubmission") {
+  TestPlatform platform;
+  UiWindow runtime(TaskScopeApp, platform);
+  runtime.BuildFrame();
+  int caught = 0;
+  int result = 0;
+  bool completed = false;
+  captured_task_scope.Launch([&]() -> Task<void> {
+    try {
+      co_await AwaitCallback<void>([](auto) -> std::function<void()> {
+        throw std::runtime_error("startup failed");
+      });
+    } catch (const std::runtime_error&) {
+      ++caught;
+    }
+    try {
+      co_await AwaitCallback<void>([](auto completion) {
+        completion.Fail(std::make_exception_ptr(std::runtime_error("callback failed")));
+        completion.Complete();
+        return std::function<void()>{};
+      });
+    } catch (const std::runtime_error&) {
+      ++caught;
+    }
+    result = co_await AwaitCallback<int>([](auto completion) -> std::function<void()> {
+      completion.Complete(17);
+      completion.Complete(99);
+      completion.Fail(std::make_exception_ptr(std::runtime_error("late failure")));
+      throw std::runtime_error("startup threw after completion");
+    });
+    co_await AwaitCallback<void>([](auto completion) {
+      REQUIRE_THROWS_AS(completion.Fail({}), std::invalid_argument);
+      completion.Complete();
+      completion.Complete();
+      return std::function<void()>{};
+    });
+    completed = true;
+  });
+  platform.RunPlatformModuleTasks();
+  REQUIRE(caught == 2);
+  REQUIRE(result == 17);
+  REQUIRE(completed);
+}
+
+TEST_CASE("AwaitCallbackDeliversResultStorageExceptionsThroughTheTask") {
+  struct ThrowingValue {
+    ThrowingValue() = default;
+    ThrowingValue(ThrowingValue&&) { throw std::runtime_error("result move failed"); }
+  };
+  TestPlatform platform;
+  UiWindow runtime(TaskScopeApp, platform);
+  runtime.BuildFrame();
+  bool caught = false;
+  captured_task_scope.Launch([&]() -> Task<void> {
+    try {
+      co_await AwaitCallback<ThrowingValue>([](auto completion) {
+        REQUIRE_NOTHROW(completion.Complete(ThrowingValue{}));
+        return std::function<void()>{};
+      });
+    } catch (const std::runtime_error&) {
+      caught = true;
+    }
+  });
+  platform.RunPlatformModuleTasks();
+  REQUIRE(caught);
+}
+
+TEST_CASE("AwaitCallbackCancelsBeforeStartAndBeforeCancellationRegistration") {
+  ThreadSafeTaskQueue queue;
+  TestPlatform platform(queue.Dispatcher());
+  UiWindow runtime(TaskScopeApp, platform);
+  runtime.BuildFrame();
+  const auto ui_thread = std::this_thread::get_id();
+  SECTION("Cancellation on the owning thread") {}
+#if !defined(__EMSCRIPTEN__)
+  bool external_cancel = false;
+  SECTION("Cancellation from another thread") { external_cancel = true; }
+#endif
+  int starts = 0;
+  int cancellations = 0;
+  auto skipped = captured_task_scope.Launch(AwaitCallback<void>([&](auto) {
+    ++starts;
+    return [&] { ++cancellations; };
+  }));
+  skipped.Cancel();
+  queue.Drain();
+  REQUIRE(starts == 0);
+  REQUIRE(cancellations == 0);
+
+  TaskHandle running;
+  bool resumed = false;
+  std::optional<CallbackCompletion<void>> retained;
+  running = captured_task_scope.Launch([&]() -> Task<void> {
+    co_await AwaitCallback<void>([&](auto completion) {
+      ++starts;
+      retained = completion;
+#if !defined(__EMSCRIPTEN__)
+      if (external_cancel) {
+        std::thread cancel([running] { running.Cancel(); });
+        cancel.join();
+      } else
+#endif
+      {
+        running.Cancel();
+      }
+      return [&, completion] {
+        REQUIRE(std::this_thread::get_id() == ui_thread);
+        ++cancellations;
+        completion.Complete();
+      };
+    });
+    resumed = true;
+  });
+  queue.Drain();
+  running.Cancel();
+  retained->Complete();
+  retained->Fail(std::make_exception_ptr(std::runtime_error("late failure")));
+  REQUIRE_THROWS_AS(retained->Fail({}), std::invalid_argument);
+  queue.Drain();
+  REQUIRE(starts == 1);
+  REQUIRE(cancellations == 1);
+  REQUIRE_FALSE(resumed);
+}
+
+TEST_CASE("AwaitCallbackCancellationReleasesInputsAndIgnoresLateCallbacks") {
+  TestPlatform platform;
+  auto runtime = std::make_unique<UiWindow>(TaskScopeApp, platform);
+  runtime->BuildFrame();
+  auto owner = std::make_shared<int>(3);
+  std::weak_ptr<int> weak_owner = owner;
+  std::optional<CallbackCompletion<int>> retained;
+  int cancellations = 0;
+  int resumed = 0;
+  auto pending = AwaitCallback<int>([owner = std::move(owner), &retained, &cancellations](auto completion) {
+    retained = completion;
+    return [owner, completion, &cancellations] {
+      ++cancellations;
+      completion.Complete(*owner);
+    };
+  });
+  TaskHandle handle = captured_task_scope.Launch([task = std::move(pending), &resumed]() mutable -> Task<void> {
+    resumed = co_await std::move(task);
+  });
+  platform.RunPlatformModuleTasks();
+  REQUIRE_FALSE(weak_owner.expired());
+  SECTION("Explicit cancellation") { handle.Cancel(); }
+  SECTION("Window and runtime retirement") { runtime.reset(); }
+  REQUIRE(cancellations == 1);
+  REQUIRE(weak_owner.expired());
+  retained->Complete(42);
+  retained->Fail(std::make_exception_ptr(std::runtime_error("late failure")));
+  platform.RunPlatformModuleTasks();
+  REQUIRE(resumed == 0);
+}
+
+TEST_CASE("AwaitCallbackDoesNotCancelACompletedOperationWhenItsContinuationIsCanceled") {
+  TestPlatform platform;
+  UiWindow runtime(TaskScopeApp, platform);
+  runtime.BuildFrame();
+  std::optional<CallbackCompletion<void>> completion;
+  int cancellations = 0;
+  bool resumed = false;
+  auto handle = captured_task_scope.Launch([&]() -> Task<void> {
+    co_await AwaitCallback<void>([&](auto value) {
+      completion = value;
+      return [&] { ++cancellations; };
+    });
+    resumed = true;
+  });
+  platform.RunPlatformModuleTasks();
+  completion->Complete();
+  handle.Cancel();
+  platform.RunPlatformModuleTasks();
+  REQUIRE(cancellations == 0);
+  REQUIRE_FALSE(resumed);
+}
+
+TEST_CASE("AsyncCallbackStreamsCopyAndFinalizeWhenAwaited", "[stream-callbacks]") {
+  TestPlatform platform;
+  Application application([]() -> View { return {}; });
+  RuntimeLifetime runtime(application, platform);
+  int reads = 0;
+  int closes = 0;
+  int aborts = 0;
+  {
+    auto input = AsyncInputStream::FromReader([&](std::stop_token stop, std::size_t maximum) -> Task<IoResult<Bytes>> {
+      REQUIRE_FALSE(stop.stop_requested());
+      REQUIRE(maximum == 2);
+      ++reads;
+      co_return IoResult<Bytes>(reads == 1 ? Bytes{std::byte{4}} : Bytes{});
+    });
+    Bytes received;
+    auto output = AsyncOutputStream::FromWriter(
+        [&](std::stop_token stop, Bytes data) -> Task<IoResult<void>> {
+          REQUIRE_FALSE(stop.stop_requested());
+          REQUIRE_FALSE(data.empty());
+          received = std::move(data);
+          co_return IoResult<void>::Success();
+        },
+        [&](std::stop_token stop) -> Task<IoResult<void>> {
+          REQUIRE_FALSE(stop.stop_requested());
+          ++closes;
+          co_return IoResult<void>::Success();
+        },
+        [&]() noexcept { ++aborts; });
+
+    {
+      auto pending = input.CopyToAsync(output, 2);
+      REQUIRE_THROWS_AS(input.ReadAsync(2), std::logic_error);
+      REQUIRE_THROWS_AS(output.CloseAsync(), std::logic_error);
+    }
+    REQUIRE(reads == 0);
+    bool completed = false;
+    UseApplicationTaskScope().Launch([&]() -> Task<void> {
+      const auto empty_write = co_await output.WriteAsync({});
+      REQUIRE(empty_write.Succeeded());
+      const auto copied = co_await input.CopyToAsync(output, 2);
+      REQUIRE(copied.Value() == 1);
+      const auto eof = co_await input.ReadAsync(2);
+      REQUIRE(eof.Value().empty());
+      REQUIRE(received == Bytes{std::byte{4}});
+      REQUIRE(closes == 0);
+      const auto closed = co_await output.CloseAsync();
+      REQUIRE(closed.Succeeded());
+      const auto closed_again = co_await output.CloseAsync();
+      REQUIRE(closed_again.Succeeded());
+      completed = true;
+    });
+    platform.RunPlatformModuleTasks();
+    REQUIRE(completed);
+  }
+  REQUIRE(reads == 2);
+  REQUIRE(closes == 1);
+  REQUIRE(aborts == 0);
+}
+
+TEST_CASE("CancelingCopyDuringWriteLeavesTheCallbackReaderUsable", "[stream-callbacks]") {
+  TestPlatform platform;
+  Application application([]() -> View { return {}; });
+  RuntimeLifetime runtime(application, platform);
+  std::stop_token read_stop;
+  std::stop_token write_stop;
+  auto input = AsyncInputStream::FromReader(
+      [&read_stop, next = 1](std::stop_token stop, std::size_t) mutable -> Task<IoResult<Bytes>> {
+        read_stop = stop;
+        co_return IoResult<Bytes>(Bytes{static_cast<std::byte>(next++)});
+      });
+  auto output = AsyncOutputStream::FromWriter([&](std::stop_token stop, Bytes data) -> Task<IoResult<void>> {
+    REQUIRE(data == Bytes{std::byte{1}});
+    write_stop = stop;
+    co_await Delay(std::chrono::seconds(1));
+    co_return IoResult<void>::Success();
+  });
+  auto tasks = UseApplicationTaskScope();
+  auto copy = tasks.Launch([&]() -> Task<void> { PINGCORE_DISCARD(co_await input.CopyToAsync(output, 1)); });
+  platform.RunPlatformModuleTasks();
+  REQUIRE(write_stop.stop_possible());
+
+  copy.Cancel();
+  REQUIRE(write_stop.stop_requested());
+  REQUIRE_FALSE(read_stop.stop_requested());
+
+  Bytes next_chunk;
+  tasks.Launch([&]() -> Task<void> {
+    auto result = co_await input.ReadAsync(1);
+    next_chunk = std::move(result).Value();
+  });
+  platform.RunPlatformModuleTasks();
+  REQUIRE(next_chunk == Bytes{std::byte{2}});
+}
+
+TEST_CASE("AsyncStreamCallbacksReceiveStopBeforeTheirFrameIsDestroyed", "[stream-callbacks]") {
+  TestPlatform platform;
+  Application application([]() -> View { return {}; });
+  RuntimeLifetime runtime(application, platform);
+  int stops = 0;
+  int aborts = 0;
+  bool resumed = false;
+  enum class Operation { Read, Write, Close };
+  const auto operation = GENERATE(Operation::Read, Operation::Write, Operation::Close);
+  auto stop_action = [&]() noexcept { ++stops; };
+  std::optional<CallbackCompletion<void>> pending;
+  auto pause = AwaitCallback<void>([&](auto completion) {
+    pending = completion;
+    return std::function<void()>{};
+  });
+  auto input = AsyncInputStream::FromReader([&](std::stop_token stop, std::size_t) -> Task<IoResult<Bytes>> {
+    const std::stop_callback on_stop(stop, stop_action);
+    co_await std::move(pause);
+    co_return IoResult<Bytes>(Bytes{std::byte{1}});
+  });
+  {
+    auto output = AsyncOutputStream::FromWriter(
+        [&](std::stop_token stop, Bytes) -> Task<IoResult<void>> {
+          const std::stop_callback on_stop(stop, stop_action);
+          co_await std::move(pause);
+          co_return IoResult<void>::Success();
+        },
+        [&](std::stop_token stop) -> Task<IoResult<void>> {
+          const std::stop_callback on_stop(stop, stop_action);
+          co_await std::move(pause);
+          co_return IoResult<void>::Success();
+        },
+        [&]() noexcept { ++aborts; });
+    auto handle = UseApplicationTaskScope().Launch([&]() -> Task<void> {
+      if (operation == Operation::Read) {
+        PINGCORE_DISCARD(co_await input.ReadAsync(1));
+      } else if (operation == Operation::Close) {
+        PINGCORE_DISCARD(co_await output.CloseAsync());
+      } else {
+        PINGCORE_DISCARD(co_await output.WriteAsync(Bytes(1)));
+      }
+      resumed = true;
+    });
+    platform.RunPlatformModuleTasks();
+    REQUIRE(pending.has_value());
+    REQUIRE(stops == 0);
+    handle.Cancel();
+    REQUIRE(stops == 1);
+    REQUIRE(aborts == 0);
+    pending->Complete();
+    platform.RunPlatformModuleTasks();
+    REQUIRE_FALSE(resumed);
+  }
+  REQUIRE(stops == 1);
+  REQUIRE(aborts == 1);
+}
+
+TEST_CASE("AwaitCallbackSettlesHostFailureWithoutAWindowAndCancelsOnRuntimeShutdown") {
+  TestPlatform platform;
+  Application application(TaskScopeApp, {.show_debug_overlay = false});
+  auto runtime = std::make_unique<RuntimeLifetime>(application, platform, std::nullopt);
+  auto tasks = UseApplicationTaskScope();
+  std::optional<CallbackCompletion<void>> completion;
+  bool failed = false;
+  int cancellations = 0;
+  tasks.Launch([&]() -> Task<void> {
+    try {
+      co_await AwaitCallback<void>([&](auto value) {
+        completion = value;
+        return [&] { ++cancellations; };
+      });
+    } catch (const std::runtime_error&) {
+      failed = true;
+    }
+  });
+  platform.RunPlatformModuleTasks();
+  completion->Fail(std::make_exception_ptr(std::runtime_error("host closed")));
+  platform.RunPlatformModuleTasks();
+  REQUIRE(failed);
+  REQUIRE(cancellations == 0);
+  tasks.Launch(AwaitCallback<void>([&](auto value) {
+    completion = value;
+    return [&] { ++cancellations; };
+  }));
+  platform.RunPlatformModuleTasks();
+  runtime.reset();
+  REQUIRE(cancellations == 1);
+  completion->Complete();
+  platform.RunPlatformModuleTasks();
+}
+
+#if !defined(__EMSCRIPTEN__)
+
+TEST_CASE("AwaitCallbackRestoresTheOwningThreadAndEnvironmentFromExternalCompletion") {
+  ThreadSafeTaskQueue queue;
+  TestPlatform platform(queue.Dispatcher());
+  UiWindow runtime(CallbackEnvironmentApp, platform);
+  runtime.BuildFrame();
+  const auto ui_thread = std::this_thread::get_id();
+  std::optional<CallbackCompletion<int>> completion;
+  int resumes = 0;
+  captured_task_scope.Launch([&]() -> Task<void> {
+    int value = co_await AwaitCallback<int>([&](auto endpoint) {
+      REQUIRE(std::this_thread::get_id() == ui_thread);
+      completion = endpoint;
+      return std::function<void()>{};
+    });
+    REQUIRE(std::this_thread::get_id() == ui_thread);
+    REQUIRE(UseService<Resources>()->Configuration().locale.LanguageTag() == "fr-FR");
+    task_value = value;
+    ++resumes;
+  });
+  queue.Drain();
+  std::thread worker([&] { completion->Complete(42); });
+  worker.join();
+  REQUIRE(resumes == 0);
+  queue.Drain();
+  REQUIRE(resumes == 1);
+  REQUIRE(task_value.Get() == 42);
+}
+
+TEST_CASE("AwaitCallbackSerializesConcurrentSubmissionsAndExternalCancellation") {
+  ThreadSafeTaskQueue queue;
+  TestPlatform platform(queue.Dispatcher());
+  UiWindow runtime(TaskScopeApp, platform);
+  runtime.BuildFrame();
+  std::optional<CallbackCompletion<int>> completion;
+  int results = 0;
+  int failures = 0;
+  int cancellations = 0;
+  auto launch = [&] {
+    return captured_task_scope.Launch([&]() -> Task<void> {
+      try {
+        co_await AwaitCallback<int>([&](auto endpoint) {
+          completion = endpoint;
+          return [&] { ++cancellations; };
+        });
+        ++results;
+      } catch (const std::runtime_error&) {
+        ++failures;
+      }
+    });
+  };
+  launch();
+  queue.Drain();
+  std::atomic<bool> ready = false;
+  std::thread value([&] {
+    while (!ready.load()) std::this_thread::yield();
+    completion->Complete(42);
+  });
+  std::thread failure([&] {
+    ready = true;
+    completion->Fail(std::make_exception_ptr(std::runtime_error("failed")));
+  });
+  value.join();
+  failure.join();
+  queue.Drain();
+  REQUIRE(results + failures == 1);
+  REQUIRE(cancellations == 0);
+
+  auto handle = launch();
+  queue.Drain();
+  std::thread cancel([&] { handle.Cancel(); });
+  std::thread complete([&] { completion->Complete(99); });
+  cancel.join();
+  complete.join();
+  queue.Drain();
+  REQUIRE(results + failures == 1);
+  REQUIRE(cancellations <= 1);
+}
+
+#endif
+
+} // namespace pingcore::test

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <application
+        android:name="org.pingcore.examples.SystemTasksApplication"
+        tools:replace="android:name">
+        <meta-data
+            android:name="org.pingcore.local_notification.channel_id"
+            android:value="pingcore.system_tasks" />
+        <meta-data
+            android:name="org.pingcore.local_notification.small_icon"
+            android:resource="@drawable/ic_system_task" />
+        <service
+            android:name="org.pingcore.PingCoreBackgroundJobService"
+            android:exported="true"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
+        <service
+            android:name="org.pingcore.PingCoreForegroundTaskService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync">
+            <meta-data
+                android:name="org.pingcore.system_task.identifiers"
+                android:value="com.pingcore.examples.systemtasks.export,com.pingcore.examples.systemtasks.receive" />
+            <meta-data
+                android:name="org.pingcore.system_task.channel"
+                android:value="pingcore.system_tasks" />
+            <meta-data
+                android:name="org.pingcore.system_task.icon"
+                android:resource="@drawable/ic_system_task" />
+        </service>
+    </application>
+</manifest>

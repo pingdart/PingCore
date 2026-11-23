@@ -1,0 +1,509 @@
+#include "support.h"
+
+using namespace pingcore::cli::test;
+
+TEST_CASE("PingCoreCliCreatesAndroidPlatformShell") {
+  TemporaryDirectory temporary;
+  const auto invocation = Invoke(temporary.Path(),
+      {"create", "app", "Sample-App", "--id", "dev.example.sampleapp", "--platform", "android"});
+  REQUIRE(invocation.result == 0);
+  const auto project = temporary.Path() / "Sample-App";
+  REQUIRE(std::filesystem::is_regular_file(project / "platform/android/settings.gradle"));
+  REQUIRE(std::filesystem::is_regular_file(project / "platform/android/gradlew"));
+  REQUIRE(std::filesystem::is_regular_file(project / "platform/android/gradlew.bat"));
+  REQUIRE(std::filesystem::is_regular_file(project / "platform/android/gradle/wrapper/gradle-wrapper.jar"));
+  REQUIRE(std::filesystem::is_regular_file(project / "platform/android/gradle/wrapper/gradle-wrapper.properties"));
+  const std::filesystem::path android_resource_root = project / "platform/android/app/src/main/res";
+  REQUIRE(std::filesystem::is_regular_file(android_resource_root / "drawable/ic_launcher_foreground.xml"));
+  REQUIRE(std::filesystem::is_regular_file(android_resource_root / "mipmap-anydpi-v26/ic_launcher.xml"));
+  REQUIRE(std::filesystem::is_regular_file(android_resource_root / "mipmap-xxxhdpi/ic_launcher.png"));
+#if !defined(_WIN32)
+  REQUIRE(IsExecutable(project / "platform/android/gradlew"));
+#endif
+  const std::string android_settings = Read(project / "platform/android/settings.gradle");
+  const std::string android_app = Read(project / "platform/android/app/build.gradle");
+  const std::string android_manifest = Read(project / "platform/android/app/src/main/AndroidManifest.xml");
+  const std::string android_properties = Read(project / "platform/android/gradle.properties");
+  REQUIRE(android_app.find("versionName = \"0.1.0\"") != std::string::npos);
+  REQUIRE(android_settings.find("project(\":PingCore\").projectDir") != std::string::npos);
+  REQUIRE(android_settings.find("share/pingcore/platform/android/PingCore.aar") != std::string::npos);
+  REQUIRE(android_settings.find("pingcoreUsesSource") != std::string::npos);
+  REQUIRE(android_settings.find("pingcoreLibraryGraph.libraries.eachWithIndex") != std::string::npos);
+  REQUIRE(android_settings.find("library.sourceRoot") != std::string::npos);
+  REQUIRE(android_settings.find("providers.environmentVariable(\"PINGCORE_HOME\")") != std::string::npos);
+  REQUIRE(android_settings.find("mavenCentral()") != std::string::npos);
+  REQUIRE(android_app.find("implementation project(\":PingCore\")") != std::string::npos);
+  REQUIRE(android_app.find("implementation files(rootProject.gradle.ext.pingcoreAndroidArchive)") != std::string::npos);
+  REQUIRE(android_app.find("implementation project(library.projectPath)") != std::string::npos);
+  REQUIRE(android_app.find("path = file(\"../../../CMakeLists.txt\")") != std::string::npos);
+  REQUIRE(android_app.find("-DPINGCORE_HOME=${pingcoreHome.absolutePath}") != std::string::npos);
+  REQUIRE(android_app.find("compileSdk = pingcoreCompileSdk") != std::string::npos);
+  REQUIRE(android_app.find("PINGCORE_ANDROID_RESOURCE_OUTPUT_ROOT") != std::string::npos);
+  REQUIRE(android_app.find("buildConfig = true") != std::string::npos);
+  REQUIRE(android_app.find("lintOptions {") != std::string::npos);
+  REQUIRE(android_app.find("checkReleaseBuilds = false") != std::string::npos);
+  REQUIRE(android_app.find("abortOnError = false") != std::string::npos);
+  REQUIRE(android_app.find("PINGCORE_ANDROID_APP_INTEGRATION_ROOT") != std::string::npos);
+  REQUIRE(android_app.find("variant.buildConfigFields.put(\"PINGCORE_APP_LIBRARY\", resolveLibrary.map") !=
+          std::string::npos);
+  REQUIRE(android_app.find("variant.artifacts.get(SingleArtifact.MERGED_NATIVE_LIBS.INSTANCE)") != std::string::npos);
+  REQUIRE(android_app.find("inputs.dir(nativeLibraries)") != std::string::npos);
+  REQUIRE(android_app.find("new File(integrationRoot, \"${abiDirectory.name}/app.json\")") != std::string::npos);
+  REQUIRE(android_app.find("new JsonSlurper().parse(planFile)") != std::string::npos);
+  REQUIRE(android_app.find("must match across Android ABIs") != std::string::npos);
+  REQUIRE(android_app.find("new File(abiDirectory, fileName).isFile()") != std::string::npos);
+  REQUIRE(android_app.find("variant.sources.assets.addGeneratedSourceDirectory(stageAssets)") != std::string::npos);
+  REQUIRE(android_app.find("packageDirectories.from(appLibraries.map") != std::string::npos);
+  REQUIRE(android_app.find("assets.srcDir") == std::string::npos);
+  REQUIRE(android_app.find("registerPingCoreResourceStaging") == std::string::npos);
+  REQUIRE(android_app.find("pingcore_app") == std::string::npos);
+  REQUIRE(android_app.find("pingcoreAbis") != std::string::npos);
+  REQUIRE(android_app.find(".cxx") == std::string::npos);
+  REQUIRE(android_app.find("lastModified") == std::string::npos);
+  REQUIRE(android_manifest.find("android:icon=\"@mipmap/ic_launcher\"") != std::string::npos);
+  REQUIRE(android_manifest.find("android:roundIcon=\"@mipmap/ic_launcher\"") != std::string::npos);
+  REQUIRE(
+      ReadBinary(android_resource_root / "mipmap-xxxhdpi/ic_launcher.png")
+          .starts_with(std::string("\x89PNG\r\n\x1a\n", 8))
+  );
+  REQUIRE(android_properties.find("pingcoreBuildNative=false") != std::string::npos);
+  REQUIRE(android_properties.find("pingcoreAppLibrary") == std::string::npos);
+  REQUIRE(android_properties.find("pingcoreCompileSdk=36") != std::string::npos);
+  REQUIRE(android_properties.find("pingcoreNdkVersion=29.0.14206865") != std::string::npos);
+  const std::string wrapper_properties = Read(project / "platform/android/gradle/wrapper/gradle-wrapper.properties");
+  REQUIRE(wrapper_properties.find("gradle-8.13-bin.zip") != std::string::npos);
+  REQUIRE(
+      wrapper_properties.find(
+          "distributionSha256Sum=20f1b1176237254a6fc204d8434196fa11a4cfb387567519c61556e8710aed78"
+      ) != std::string::npos
+  );
+  REQUIRE_FALSE(std::filesystem::exists(project / "platform/android/app/src/main/cpp/CMakeLists.txt"));
+  REQUIRE_FALSE(std::filesystem::exists(project / "platform/android/pingcore.cmake"));
+  REQUIRE(std::filesystem::is_regular_file(
+      project / "platform/android/app/src/main/java/dev/example/sampleapp/MainActivity.java"
+  ));
+
+  const pingcore::cli::PlatformDriver* android = pingcore::cli::FindPlatformDriver("android");
+  REQUIRE(android != nullptr);
+  REQUIRE(android->Diagnose(project / "platform/android").empty());
+  std::filesystem::remove(project / "platform/android/gradle/wrapper/gradle-wrapper.jar");
+  const std::vector<pingcore::cli::Diagnostic> diagnostics = android->Diagnose(project / "platform/android");
+  REQUIRE(std::any_of(diagnostics.begin(), diagnostics.end(), [](const pingcore::cli::Diagnostic& diagnostic) {
+    return diagnostic.error && diagnostic.message == "missing gradle/wrapper/gradle-wrapper.jar";
+  }));}
+
+TEST_CASE("PingCoreCliAndroidEnvironmentDiagnosisOwnsToolChecks") {
+  const pingcore::cli::PlatformDriver* android = pingcore::cli::FindPlatformDriver("android");
+  REQUIRE(android != nullptr);
+  const std::vector<pingcore::cli::EnvironmentDiagnostic> android_diagnostics = android->DiagnoseEnvironment();
+  const auto has_android_diagnostic = [&android_diagnostics](std::string_view id) {
+    return std::any_of(
+        android_diagnostics.begin(),
+        android_diagnostics.end(),
+        [id](const pingcore::cli::EnvironmentDiagnostic& diagnostic) { return diagnostic.id == id; }
+    );
+  };
+  REQUIRE(has_android_diagnostic("java"));
+  // The Gradle shell needs the JDK and the SDK under every build system; only the CMake core needs the NDK.
+  const auto host_toolchain = [&android_diagnostics](std::string_view id) {
+    const auto check = std::ranges::find(android_diagnostics, id, &pingcore::cli::EnvironmentDiagnostic::id);
+    return check != android_diagnostics.end() && check->host_toolchain;
+  };
+  REQUIRE_FALSE(host_toolchain("java"));
+  REQUIRE_FALSE(host_toolchain("android_sdk"));
+  REQUIRE(host_toolchain("android_ndk"));
+  const bool android_host = pingcore::cli::CurrentHostId() == "android";
+  REQUIRE(has_android_diagnostic("sdkmanager") != android_host);
+  REQUIRE(has_android_diagnostic("platform_tools") != android_host);
+  REQUIRE(has_android_diagnostic("aapt2") == android_host);
+  REQUIRE(has_android_diagnostic("termux-open") == android_host);
+  REQUIRE_FALSE(has_android_diagnostic("cmake"));
+  REQUIRE_FALSE(has_android_diagnostic("gradle"));
+
+}
+
+#if !defined(_WIN32)
+TEST_CASE("PingCoreCliKeepsAndroidSetupActionsWhenDeviceDiscoveryFails") {
+  if (pingcore::cli::CurrentHostId() == "android")
+    SKIP("Termux does not support Android device discovery");
+  TemporaryDirectory temporary;
+  REQUIRE(Invoke(temporary.Path(), {"create", "app", "diagnosis_fixture", "--platform", "android"}).result == 0);
+  const auto project = temporary.Path() / "diagnosis_fixture";
+  const auto sdk = temporary.Path() / "Android SDK";
+  const auto adb = sdk / "platform-tools/adb";
+  std::filesystem::create_directories(adb.parent_path());
+  std::ofstream(project / "platform/android/local.properties") << "sdk.dir=" << sdk.string() << '\n';
+  std::ofstream(adb) << "#!/bin/sh\nexit 126\n";
+  std::filesystem::permissions(adb, std::filesystem::perms::owner_exec, std::filesystem::perm_options::add);
+
+  const auto diagnose = [&] {
+    return Invoke(project, {"doctor", "android", "--operation", "run", "--sdk", PINGCORE_TEST_SOURCE_DIRECTORY, "--json"});
+  };
+  const auto broken_adb = diagnose();
+  REQUIRE(broken_adb.result == 1);
+  REQUIRE(broken_adb.output.find("\"id\":\"android.platform_tools\",\"status\":\"missing\"") != std::string::npos);
+  REQUIRE(broken_adb.output.find("\"id\":\"android.install_platform_tools\"") != std::string::npos);
+  REQUIRE(broken_adb.output.find("\"id\":\"android.device\",\"status\":\"blocked\"") != std::string::npos);
+
+  std::ofstream(adb) << "#!/bin/sh\nif [ \"$1\" = version ]; then echo 'Android Debug Bridge version 1.0.41'; exit 0; fi\n"
+                       "exit 126\n";
+  const auto broken_discovery = diagnose();
+  REQUIRE(broken_discovery.result == 1);
+  REQUIRE(broken_discovery.output.find("\"id\":\"android.platform_tools\",\"status\":\"ready\"") != std::string::npos);
+  REQUIRE(broken_discovery.output.find("\"id\":\"android.device\",\"status\":\"blocked\"") != std::string::npos);
+  REQUIRE(broken_discovery.output.find("exit code 126") != std::string::npos);
+  REQUIRE(broken_discovery.output.find("\"id\":\"android.install_android_ndk\"") != std::string::npos);
+}
+
+TEST_CASE("PingCoreCliAndroidSetupRechecksSdkPackagesAndSkipsInstalledOnRetry") {
+  if (pingcore::cli::CurrentHostId() == "android")
+    SKIP("Desktop Android setup uses sdkmanager");
+  TemporaryDirectory temporary;
+  REQUIRE(Invoke(temporary.Path(), {"create", "app", "setup_fixture", "--platform", "android"}).result == 0);
+  const auto project = temporary.Path() / "setup_fixture";
+  const auto sdk = temporary.Path() / "Android SDK";
+  const auto java = temporary.Path() / "JDK 17";
+  const auto manager = sdk / "cmdline-tools/19.0/bin/sdkmanager";
+  const auto compiler = java / "bin/javac";
+  std::filesystem::create_directories(compiler.parent_path());
+  std::filesystem::create_directories(manager.parent_path());
+  std::ofstream(project / "platform/android/local.properties") << "sdk.dir=" << sdk.string() << '\n';
+  std::ofstream(compiler) << "#!/bin/sh\nprintf 'javac 17.0.18\\n'\n";
+  std::ofstream(manager) << R"sh(#!/bin/sh
+set -eu
+if [ "$1" = "--version" ]; then echo 19.0; exit 0; fi
+[ "$(cd "${1#--sdk_root=}" && pwd -P)" = "$(pwd -P)" ]
+[ "$2" = "--install" ]
+[ -x "$JAVA_HOME/bin/javac" ]
+case "$3" in
+  'platforms;android-36') file=platforms/android-36/android.jar ;;
+  'build-tools;35.0.0')
+    [ -f platforms/android-36/android.jar ]
+    [ -f allow-remaining ] || exit 130
+    file=build-tools/35.0.0/source.properties ;;
+  'ndk;29.0.14206865')
+    [ -f build-tools/35.0.0/source.properties ]
+    file=ndk/29.0.14206865/build/cmake/android.toolchain.cmake ;;
+  *) exit 1 ;;
+esac
+mkdir -p "$(dirname "$file")"
+touch "$file"
+printf '%s\n' "$3" >> install-log
+)sh";
+  for (const auto& executable : {manager, compiler}) {
+    std::filesystem::permissions(executable, std::filesystem::perms::owner_exec, std::filesystem::perm_options::add);
+  }
+  const auto java_home = java.string();
+  const auto setup = [&] {
+    return Invoke(project,
+                  {"setup", "android", "--yes", "--sdk", PINGCORE_TEST_SOURCE_DIRECTORY, "--java-home", java_home});
+  };
+
+  const auto partial = setup();
+  INFO(partial.output << partial.error);
+  REQUIRE(partial.result == 3);
+  REQUIRE(Read(sdk / "install-log") == "platforms;android-36\n");
+  std::ofstream(sdk / "allow-remaining") << "resume\n";
+  const auto retried = setup();
+  INFO(retried.output << retried.error);
+  REQUIRE(retried.result == 0);
+  REQUIRE(Read(sdk / "install-log") == "platforms;android-36\nbuild-tools;35.0.0\nndk;29.0.14206865\n");
+}
+#endif
+
+TEST_CASE("PingCoreCliPreservesAndroidLocalSettings") {
+  using namespace pingcore::cli;
+  TemporaryDirectory temporary;
+  const auto local = temporary.Path() / "platform/android/local.properties";
+  PlatformCommandContext context;
+  context.project_root = temporary.Path();
+  context.pingcore_home = PINGCORE_TEST_SOURCE_DIRECTORY;
+  const auto* android = FindPlatformDriver("android");
+  android->UpdateProjectIntegration(context);
+  REQUIRE_FALSE(std::filesystem::exists(local));
+
+  std::filesystem::create_directories(local.parent_path());
+  const std::string original = "sdk.dir=D:/Android/Sdk\n";
+  std::ofstream(local) << original;
+  const auto timestamp = std::filesystem::last_write_time(local);
+  android->UpdateProjectIntegration(context);
+  REQUIRE(Read(local) == original);
+  // Keep Catch2 from formatting filesystem clocks with a non-streamable representation.
+  REQUIRE((std::filesystem::last_write_time(local) == timestamp));
+}
+
+TEST_CASE("PingCoreCliCreatesAndroidBuildCommandsForSourceSdks") {
+  TemporaryDirectory temporary;
+  const pingcore::cli::PlatformDriver* android = pingcore::cli::FindPlatformDriver("android");
+  REQUIRE(android != nullptr);
+  const std::filesystem::path sdk = temporary.Path() / "sdk";
+  const pingcore::cli::PlatformCommandContext context{
+      temporary.Path() / "sample",
+      sdk,
+      temporary.Path() / "sample/.pingcore/build/android/release",
+      {},
+      "release",
+      {},
+  };
+
+  const std::vector<pingcore::cli::ProcessCommand> library_commands =
+      pingcore::cli::detail::AndroidLibraryGraphCommands(context, "windows");
+  const std::vector<pingcore::cli::ProcessCommand> windows_commands =
+      pingcore::cli::detail::AndroidBuildCommands(context, "windows", {});
+  const std::vector<pingcore::cli::ProcessCommand> posix_commands =
+      pingcore::cli::detail::AndroidBuildCommands(context, "linux", {});
+
+  REQUIRE(library_commands.size() == 1);
+  REQUIRE(library_commands[0].executable == "cmake");
+  REQUIRE(library_commands[0].arguments == ExpectedLibraryGraphArguments(context));
+  REQUIRE(windows_commands.size() == 1);
+  REQUIRE(
+      std::filesystem::path(windows_commands[0].executable).generic_string() ==
+      (context.project_root / "platform/android/gradlew.bat").generic_string()
+  );
+  REQUIRE(windows_commands[0].arguments == std::vector<std::string>{"-PpingcoreBuildSystem=cmake", ":app:assembleRelease"});
+  REQUIRE(posix_commands.size() == 1);
+  REQUIRE(
+      std::filesystem::path(posix_commands[0].executable).generic_string() ==
+      (context.project_root / "platform/android/gradlew").generic_string()
+  );
+  REQUIRE(posix_commands[0].arguments == std::vector<std::string>{"-PpingcoreBuildSystem=cmake", ":app:assembleRelease"});
+  REQUIRE(library_commands[0].working_directory == context.project_root);
+  REQUIRE(windows_commands[0].working_directory == context.project_root / "platform/android");
+  REQUIRE(posix_commands[0].working_directory == context.project_root / "platform/android");
+
+  const std::vector<pingcore::cli::ProcessCommand> termux_library_commands =
+      pingcore::cli::detail::AndroidLibraryGraphCommands(context, "android");
+  std::vector<std::string> termux_library_arguments = ExpectedLibraryGraphArguments(context);
+  termux_library_arguments.push_back("-DANDROID_ABI=arm64-v8a");
+  REQUIRE(termux_library_commands.size() == 1);
+  REQUIRE(termux_library_commands[0].arguments == termux_library_arguments);
+
+  const std::filesystem::path termux_aapt2 = "/data/data/com.termux/files/usr/bin/aapt2";
+  const std::vector<pingcore::cli::ProcessCommand> termux_commands =
+      pingcore::cli::detail::AndroidBuildCommands(context, "android", termux_aapt2);
+  REQUIRE(termux_commands.size() == 1);
+  REQUIRE(
+      std::filesystem::path(termux_commands[0].executable).generic_string() ==
+      (context.project_root / "platform" / "android" / "gradlew").generic_string()
+  );
+  REQUIRE(
+      termux_commands[0].arguments ==
+      std::vector<std::string>{
+          "-PpingcoreAbis=arm64-v8a",
+          "-Pandroid.aapt2FromMavenOverride=" + termux_aapt2.string(),
+          "-PpingcoreBuildSystem=cmake",
+          ":app:assembleRelease",
+      }
+  );
+
+  pingcore::cli::PlatformCommandContext explicit_generator = context;
+  explicit_generator.cmake_generator = "Ninja";
+  REQUIRE_THROWS_WITH(
+      android->LibraryGraphCommands(explicit_generator),
+      "Android native builds do not use a CMake generator option"
+  );
+}
+
+TEST_CASE("PingCoreCliBuildsTheMcppCoreThroughTheGradleShell") {
+  pingcore::cli::PlatformCommandContext context;
+  context.project_root = "/work/sample";
+  context.profile = "release";
+  context.abis = {"x86_64", "arm64-v8a"};
+  context.build_system = pingcore::cli::BuildSystem::Mcpp;
+  context.mcpp_options = pingcore::cli::mcpp::CommandOptions{
+      .project_root = context.project_root,
+      .platform = "android",
+      .profile = "release",
+      .profile_name = "release-size",
+      .features = {"pingcore/profiling"},
+  };
+
+  // mcpp writes the library graph and the framework record while it builds, so the first ABI is built before
+  // Gradle reads them; the shell then builds every ABI and finds that one current.
+  const auto graph = pingcore::cli::detail::AndroidLibraryGraphCommands(context, "linux");
+  REQUIRE(graph.size() == 1);
+  REQUIRE(graph[0].executable == "mcpp");
+  REQUIRE(graph[0].arguments == std::vector<std::string>{"build", "--target", "x86_64-linux-android", "--profile",
+                                                        "release-size", "--features", "pingcore/profiling"});
+  REQUIRE(graph[0].working_directory == context.project_root);
+
+  const auto build = pingcore::cli::detail::AndroidBuildCommands(context, "linux", {});
+  REQUIRE(build[0].arguments ==
+          std::vector<std::string>{"-PpingcoreAbis=x86_64,arm64-v8a", "-PpingcoreBuildSystem=mcpp",
+                                   "-PpingcoreMcppProfile=release-size", "-PpingcoreMcppFeatures=pingcore/profiling",
+                                   ":app:assembleRelease"});
+  REQUIRE_THROWS_AS(pingcore::cli::detail::AndroidMcppTriple("armeabi-v7a"), std::invalid_argument);
+}
+
+TEST_CASE("PingCoreCliUsesGradleMetadataToLaunchAndroidApplications") {
+  TemporaryDirectory temporary;
+  const pingcore::cli::PlatformDriver* android = pingcore::cli::FindPlatformDriver("android");
+  REQUIRE(android != nullptr);
+  const std::filesystem::path project = temporary.Path() / "sample";
+  const std::filesystem::path output = project / "platform/android/app/build/outputs/apk/debug";
+  const std::filesystem::path metadata = output / "output-metadata.json";
+  const std::filesystem::path apk = output / "sample-custom.apk";
+  std::filesystem::create_directories(metadata.parent_path());
+  std::ofstream(metadata) << "{\n"
+                             "  \"applicationId\": \"dev.example.sample.debug\",\n"
+                             "  \"elements\": [{\"outputFile\": \"sample-custom.apk\"}]\n"
+                             "}\n";
+  std::ofstream(apk) << "test\n";
+  const pingcore::cli::PlatformCommandContext context{
+      project,
+      temporary.Path() / "sdk",
+      project / ".pingcore/build/android/debug",
+      {},
+      "debug",
+      {},
+  };
+
+  const std::vector<pingcore::cli::ProcessCommand> commands =
+      pingcore::cli::detail::AndroidRunCommands(context, "windows");
+
+  REQUIRE(commands.size() == 2);
+  REQUIRE(commands[0].arguments.size() == 3);
+  REQUIRE(commands[0].arguments[0] == "install");
+  REQUIRE(commands[0].arguments[1] == "-r");
+  REQUIRE(std::filesystem::equivalent(commands[0].arguments[2], apk));
+  REQUIRE(
+      commands[1].arguments ==
+      std::vector<std::string>{"shell", "am", "start", "-n", "dev.example.sample.debug/.MainActivity"}
+  );
+
+  const std::vector<pingcore::cli::ProcessCommand> termux_commands =
+      pingcore::cli::detail::AndroidRunCommands(context, "android");
+  REQUIRE(termux_commands.size() == 1);
+  REQUIRE(termux_commands[0].executable == "termux-open");
+  REQUIRE(termux_commands[0].arguments.size() == 4);
+  REQUIRE(termux_commands[0].arguments[0] == "--view");
+  REQUIRE(termux_commands[0].arguments[1] == "--content-type");
+  REQUIRE(termux_commands[0].arguments[2] == "application/vnd.android.package-archive");
+  REQUIRE(std::filesystem::equivalent(termux_commands[0].arguments[3], apk));
+  const std::vector<pingcore::cli::PackageArtifact> package_artifacts = android->PackageArtifacts(context);
+  REQUIRE(package_artifacts.size() == 1);
+  const pingcore::cli::PackageArtifact expected_package_artifact{apk, apk.filename()};
+  REQUIRE(package_artifacts.front() == expected_package_artifact);
+}
+
+TEST_CASE("PingCoreCliParsesAndroidDeviceStates") {
+  const std::vector<pingcore::cli::PlatformDevice> devices = pingcore::cli::ParseAdbDevices(
+      "List of devices attached\r\n"
+      "emulator-5554 device product:sdk_phone model:Pixel_8 device:emu64x transport_id:1\r\n"
+      "R58M offline transport_id:2\r\n"
+      "ABC unauthorized usb:1-2 transport_id:3\r\n"
+      "???????????? no permissions (user in plugdev group)\r\n"
+  );
+
+  REQUIRE(
+      devices ==
+      std::vector<pingcore::cli::PlatformDevice>{
+          {"emulator-5554", "Pixel_8", pingcore::cli::DeviceState::Ready, pingcore::cli::DeviceKind::Unspecified, {}},
+          {"R58M", {}, pingcore::cli::DeviceState::Offline, pingcore::cli::DeviceKind::Unspecified, {}},
+          {"ABC", {}, pingcore::cli::DeviceState::Unauthorized, pingcore::cli::DeviceKind::Unspecified, {}},
+          {"????????????", {}, pingcore::cli::DeviceState::Unavailable, pingcore::cli::DeviceKind::Unspecified, {}},
+      }
+  );
+}
+
+TEST_CASE("PingCoreCliValidatesJavaHomeOverridesBeforeAndroidBuilds") {
+  TemporaryDirectory temporary;
+  REQUIRE(Invoke(temporary.Path(), {"create", "app", "sample", "--platform", "android"}).result == 0);
+  const std::filesystem::path project = temporary.Path() / "sample";
+  const std::filesystem::path java_home = project / "jdk";
+  std::filesystem::create_directories(java_home);
+  const std::vector<std::string_view> arguments{
+      "build", "android", "--java-home", "jdk", "--sdk", PINGCORE_TEST_SOURCE_DIRECTORY
+  };
+  std::ostringstream output;
+  std::ostringstream error;
+  std::istringstream input;
+
+  const int result = pingcore::cli::Run(
+      arguments,
+      project,
+      {PINGCORE_TEST_SOURCE_DIRECTORY, pingcore::cli::SdkLocationSource::Executable},
+      input,
+      output,
+      error
+  );
+
+  REQUIRE(result == 1);
+#if defined(_WIN32)
+  REQUIRE(error.str().find("Java home does not contain bin/java.exe") != std::string::npos);
+#else
+  REQUIRE(error.str().find("Java home does not contain bin/java") != std::string::npos);
+#endif
+  REQUIRE(error.str().find(java_home.string()) != std::string::npos);
+  REQUIRE(output.str().empty());
+}
+
+TEST_CASE("PingCoreCliRendersAndroidTemplatePathsAndContents") {
+  const pingcore::cli::ProjectTemplateContext context =
+      pingcore::cli::MakeProjectTemplateContext("Sample-App", "dev.example.sample");
+
+  const std::vector<pingcore::cli::GeneratedFile> files = pingcore::cli::RenderTemplateTree(
+      "platform/android/app",
+      context,
+      std::array{
+          pingcore::cli::TemplateReplacement{"@ANDROID_AGP_VERSION@", "8.13.2"},
+          pingcore::cli::TemplateReplacement{"@ANDROID_COMPILE_SDK@", "36"},
+          pingcore::cli::TemplateReplacement{"@ANDROID_MIN_COMPILE_SDK@", "23"},
+          pingcore::cli::TemplateReplacement{"@ANDROID_MIN_SDK@", "23"},
+          pingcore::cli::TemplateReplacement{"@ANDROID_TARGET_SDK@", "36"},
+          pingcore::cli::TemplateReplacement{"@ANDROID_NDK_VERSION@", "29.0.14206865"},
+      }
+  );
+  const auto activity = std::find_if(files.begin(), files.end(), [](const pingcore::cli::GeneratedFile& file) {
+    return file.path == "app/src/main/java/dev/example/sample/MainActivity.java";
+  });
+
+  REQUIRE(activity != files.end());
+  REQUIRE(activity->content.find("package dev.example.sample;") != std::string::npos);
+  REQUIRE(activity->content.find("@PROJECT_") == std::string::npos);
+  const auto application = std::find_if(files.begin(), files.end(), [](const pingcore::cli::GeneratedFile& file) {
+    return file.path == "app/src/main/java/dev/example/sample/MainApplication.java";
+  });
+  REQUIRE(application != files.end());
+  REQUIRE(application->content.find("extends Application") != std::string::npos);
+  REQUIRE(application->content.find("System.loadLibrary(BuildConfig.PINGCORE_APP_LIBRARY)") != std::string::npos);
+  const auto gradle = std::find_if(files.begin(), files.end(), [](const pingcore::cli::GeneratedFile& file) {
+    return file.path == "app/build.gradle";
+  });
+  REQUIRE(gradle != files.end());
+  REQUIRE(gradle->content.find("gradleProperty('pingcoreProfiling').orElse('OFF')") != std::string::npos);
+  const std::vector<pingcore::cli::GeneratedFile> wrapper = pingcore::cli::CopyTemplateTree("platform/android/wrapper");
+  const auto wrapper_jar = std::find_if(wrapper.begin(), wrapper.end(), [](const pingcore::cli::GeneratedFile& file) {
+    return file.path == "gradle/wrapper/gradle-wrapper.jar";
+  });
+  REQUIRE(wrapper_jar != wrapper.end());
+  REQUIRE(wrapper_jar->content.starts_with("PK"));
+}
+
+TEST_CASE("PingCoreCliPassesAndroidBuildOverridesToGradle") {
+  pingcore::cli::PlatformCommandContext context;
+  context.profile = "release";
+  context.optimization = "size";
+  context.lto = false;
+  context.profiling = true;
+  context.abis = {"arm64-v8a", "x86_64"};
+  const auto commands = pingcore::cli::detail::AndroidBuildCommands(context, "windows", {});
+  const auto& arguments = commands.front().arguments;
+  REQUIRE(std::find(arguments.begin(), arguments.end(), "-PpingcoreOptimization=size") != arguments.end());
+  REQUIRE(std::find(arguments.begin(), arguments.end(), "-PpingcoreLto=OFF") != arguments.end());
+  REQUIRE(std::find(arguments.begin(), arguments.end(), "-PpingcoreProfiling=ON") != arguments.end());
+  REQUIRE(std::find(arguments.begin(), arguments.end(), "-PpingcoreAbis=arm64-v8a,x86_64") != arguments.end());
+}
+
+TEST_CASE("PingCoreCliEnablesPrivateDeploymentOnlyForAndroidDebugWatch") {
+  pingcore::cli::PlatformCommandContext context;
+  context.profile = "debug";
+  context.watch = true;
+  const auto debug = pingcore::cli::detail::AndroidBuildCommands(context, "windows", {});
+  REQUIRE(debug.front().arguments.back() == "-PpingcoreWatch=true");
+  context.profile = "release";
+  const auto release = pingcore::cli::detail::AndroidBuildCommands(context, "windows", {});
+  REQUIRE(std::find(release.front().arguments.begin(), release.front().arguments.end(), "-PpingcoreWatch=true") ==
+          release.front().arguments.end());
+}

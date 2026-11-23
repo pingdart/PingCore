@@ -1,0 +1,529 @@
+#include "runtime_test_support.h"
+
+#include <atomic>
+#include <cstddef>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include "io/file_internal.h"
+
+namespace pingcore::test {
+
+namespace {
+
+Bytes BytesFromString(std::string_view value) {
+  Bytes bytes;
+  bytes.reserve(value.size());
+  for (const char character : value) {
+    bytes.push_back(static_cast<std::byte>(character));
+  }
+  return bytes;
+}
+
+class TestFileReferenceBackend final : public detail::FileReferenceBackend {
+public:
+  explicit TestFileReferenceBackend(Bytes bytes) : bytes(std::move(bytes)) {}
+
+  std::function<void()> ReadBytes(detail::FileReferenceBytesCompletion completion) override {
+    ++read_count;
+    completion(IoResult<Bytes>(bytes));
+    return {};
+  }
+
+  std::function<void()>
+  ImportTo(File destination, bool overwrite, detail::FileReferenceCompletion<std::uint64_t> completion) override {
+    imported_to = std::move(destination);
+    imported_with_overwrite = overwrite;
+    completion(import_succeeds ? IoResult<std::uint64_t>(bytes.size()) :
+                                 IoResult<std::uint64_t>(IoError{IoErrorCode::Io, "PingCore test import failed"}));
+    return {};
+  }
+
+  std::function<void()> ReplaceWith(File source, detail::FileReferenceBoolCompletion completion) override {
+    replaced_with = std::move(source);
+    completion(replace_succeeds);
+    return {};
+  }
+
+  Bytes bytes;
+  int read_count = 0;
+  std::optional<File> imported_to;
+  bool imported_with_overwrite = false;
+  bool import_succeeds = true;
+  std::optional<File> replaced_with;
+  bool replace_succeeds = true;
+};
+
+FileReference MakeReference(
+    std::string name = "document.txt",
+    bool can_write = true,
+    std::shared_ptr<TestFileReferenceBackend> backend =
+        std::make_shared<TestFileReferenceBackend>(BytesFromString("content"))
+) {
+  const std::size_t size = backend->bytes.size();
+  return detail::MakeFileReference(
+      {
+          .name = std::move(name),
+          .size = size,
+          .content_type = "text/plain",
+          .can_write = can_write,
+      },
+      std::move(backend)
+  );
+}
+
+class ManualFilePickerTransport final : public detail::FilePickerTransport {
+public:
+  struct OpenCall {
+    FilePickerFilter filter;
+    bool multiple = false;
+    detail::FilePickerOpenCompletion completion;
+    std::shared_ptr<std::atomic<bool>> canceled;
+  };
+
+  struct SaveCall {
+    File source;
+    SaveFileOptions options;
+    detail::FilePickerSaveCompletion completion;
+    std::shared_ptr<std::atomic<bool>> canceled;
+  };
+
+  [[nodiscard]] bool CanOpenFiles() const noexcept override {
+    return can_open_files;
+  }
+
+  [[nodiscard]] bool CanSaveFiles() const noexcept override {
+    return can_save_files;
+  }
+
+  std::function<void()>
+  OpenFiles(FilePickerFilter filter, bool multiple, detail::FilePickerOpenCompletion completion) override {
+    auto canceled = std::make_shared<std::atomic<bool>>(false);
+    open_calls.push_back({std::move(filter), multiple, std::move(completion), canceled});
+    return [canceled] { *canceled = true; };
+  }
+
+  std::function<void()>
+  SaveFile(File source, SaveFileOptions options, detail::FilePickerSaveCompletion completion) override {
+    auto canceled = std::make_shared<std::atomic<bool>>(false);
+    save_calls.push_back({std::move(source), std::move(options), std::move(completion), canceled});
+    return [canceled] { *canceled = true; };
+  }
+
+  void CompleteOpen(std::size_t index, std::vector<FileReference> references) {
+    open_calls.at(index).completion(std::move(references));
+  }
+
+  void CompleteSave(std::size_t index, bool succeeded) {
+    save_calls.at(index).completion(succeeded);
+  }
+
+  bool can_open_files = true;
+  bool can_save_files = true;
+  bool can_open_directories = true;
+  std::vector<bool> directory_requests;
+
+  bool CanOpenDirectories(bool) const noexcept override { return can_open_directories; }
+
+  std::function<void()> OpenDirectory(bool writable, detail::FilePickerOpenCompletion completion) override {
+    directory_requests.push_back(writable);
+    return OpenFiles({}, false, std::move(completion));
+  }
+  std::vector<OpenCall> open_calls;
+  std::vector<SaveCall> save_calls;
+};
+
+class FilePickerTestPlatform final : public TestPlatform {
+public:
+  std::shared_ptr<ManualFilePickerTransport> transport = std::make_shared<ManualFilePickerTransport>();
+
+protected:
+  std::shared_ptr<detail::FilePickerTransport> CreateFilePickerTransport() override {
+    return transport;
+  }
+};
+
+std::shared_ptr<FilePicker> file_picker;
+TaskScope file_picker_tasks;
+std::optional<FileReference> opened_reference;
+std::vector<FileReference> opened_references;
+std::optional<IoResult<std::string>> reference_text;
+bool imported_reference = false;
+bool replaced_reference = false;
+bool saved_file = false;
+bool picker_task_completed = false;
+std::thread::id picker_resume_thread;
+
+View FilePickerApp() {
+  file_picker = UseService<FilePicker>();
+  file_picker_tasks = UseTaskScope();
+  return Text("File picker");
+}
+
+void ResetFilePickerState() {
+  file_picker.reset();
+  file_picker_tasks = {};
+  opened_reference.reset();
+  opened_references.clear();
+  reference_text.reset();
+  imported_reference = false;
+  replaced_reference = false;
+  saved_file = false;
+  picker_task_completed = false;
+  picker_resume_thread = {};
+}
+
+Task<void> CaptureOpenedFile(
+    std::shared_ptr<FilePicker> picker, FilePickerFilter filter = {}, bool capture_resume_thread = false
+) {
+  opened_reference = co_await picker->OpenFileAsync(std::move(filter));
+  if (capture_resume_thread) {
+    picker_resume_thread = std::this_thread::get_id();
+  }
+}
+
+Task<void> CaptureSavedFile(std::shared_ptr<FilePicker> picker, File source, SaveFileOptions options = {}) {
+  saved_file = co_await picker->SaveFileAsync(std::move(source), std::move(options));
+}
+
+Task<void> CaptureOpenedFiles(std::shared_ptr<FilePicker> picker) {
+  opened_references = co_await picker->OpenFilesAsync();
+  picker_task_completed = true;
+}
+
+} // namespace
+
+static_assert(!std::is_default_constructible_v<FileReference>);
+static_assert(std::is_copy_constructible_v<FileReference>);
+static_assert(!std::is_copy_constructible_v<FilePicker>);
+static_assert(std::is_same_v<decltype(std::declval<const FileReference&>().AsFile()), std::optional<File>>);
+
+TEST_CASE("FileReferencesWithoutLocalPathsDoNotInferOrImportOne") {
+  auto backend = std::make_shared<TestFileReferenceBackend>(BytesFromString("content"));
+  const FileReference file = MakeReference("/tmp/document.txt", true, backend);
+  const FileReference directory = detail::MakeFileReference(
+      {.name = "/tmp/project", .can_write = true, .type = FileType::Directory}, backend);
+  REQUIRE_FALSE(file.AsFile().has_value());
+  REQUIRE_FALSE(directory.AsFile().has_value());
+  REQUIRE(backend->read_count == 0);
+  REQUIRE_FALSE(backend->imported_to.has_value());
+  REQUIRE_FALSE(backend->replaced_with.has_value());
+}
+
+TEST_CASE("FileReferenceRetainsItsGrantAndProvidesMetadataAndOperations") {
+  ResetFilePickerState();
+  TestPlatform platform;
+  UiWindow runtime(FilePickerApp, platform);
+  runtime.BuildFrame();
+
+  auto backend = std::make_shared<TestFileReferenceBackend>(BytesFromString("\xEF\xBB\xBFhello"));
+  std::weak_ptr<TestFileReferenceBackend> weak_backend = backend;
+  FileReference reference = MakeReference("report.txt", true, backend);
+  FileReference copy = reference;
+  backend.reset();
+
+  REQUIRE(reference.Name() == "report.txt");
+  REQUIRE(reference.Size() == 8);
+  REQUIRE(reference.ContentType() == "text/plain");
+  REQUIRE(reference.CanWrite());
+  REQUIRE_FALSE(weak_backend.expired());
+
+  file_picker_tasks.Launch([reference, copy]() -> Task<void> {
+    reference_text = co_await reference.ReadStringAsync();
+    imported_reference = co_await copy.ImportToAsync(File("/tmp/imported.txt"), true);
+    replaced_reference = co_await reference.ReplaceWithAsync(File("/tmp/replacement.txt"));
+  });
+  platform.RunPlatformModuleTasks();
+
+  REQUIRE(reference_text.has_value());
+  REQUIRE(reference_text->Succeeded());
+  REQUIRE(reference_text->Value() == "hello");
+  REQUIRE(imported_reference);
+  REQUIRE(replaced_reference);
+  const std::shared_ptr<TestFileReferenceBackend> retained_backend = weak_backend.lock();
+  REQUIRE(retained_backend);
+  REQUIRE(retained_backend->read_count == 1);
+  REQUIRE(retained_backend->imported_to == File("/tmp/imported.txt"));
+  REQUIRE(retained_backend->imported_with_overwrite);
+  REQUIRE(retained_backend->replaced_with == File("/tmp/replacement.txt"));
+}
+
+TEST_CASE("FileReferencesWithUnknownMetadataRemainReadableAndImportable") {
+  ResetFilePickerState();
+  TestPlatform platform;
+  UiWindow runtime(FilePickerApp, platform);
+  runtime.BuildFrame();
+  auto backend = std::make_shared<TestFileReferenceBackend>(BytesFromString("content"));
+  const FileReference reference = detail::MakeFileReference({}, backend);
+  REQUIRE(reference.Name().empty());
+  REQUIRE_FALSE(reference.Size().has_value());
+  REQUIRE_FALSE(reference.ContentType().has_value());
+  REQUIRE_FALSE(reference.CanWrite());
+  const auto payload = PlatformPayload::Decode(PlatformPayload(reference).Encode());
+  const auto retained = payload.AsFileReference();
+  file_picker_tasks.Launch([retained]() -> Task<void> {
+    reference_text = co_await retained.ReadStringAsync();
+    imported_reference = co_await retained.ImportToAsync(File("/tmp/explicit-name.txt"));
+  });
+  platform.RunPlatformModuleTasks();
+  REQUIRE(reference_text.has_value());
+  REQUIRE(reference_text->Succeeded());
+  REQUIRE(reference_text->Value() == "content");
+  REQUIRE(imported_reference);
+  REQUIRE(backend->imported_to == File("/tmp/explicit-name.txt"));
+  REQUIRE_THROWS_AS(detail::MakeFileReference({.name = std::string("bad\0name", 8)}, backend), std::logic_error);
+  REQUIRE_THROWS_AS(detail::MakeFileReference({.name = std::string(1, '\xFF')}, backend), std::logic_error);
+}
+
+TEST_CASE("ReadOnlyFileReferenceRejectsReplacementWithoutCallingThePlatform") {
+  ResetFilePickerState();
+  TestPlatform platform;
+  UiWindow runtime(FilePickerApp, platform);
+  runtime.BuildFrame();
+
+  auto backend = std::make_shared<TestFileReferenceBackend>(BytesFromString("read only"));
+  FileReference reference = MakeReference("readonly.txt", false, backend);
+  file_picker_tasks.Launch([reference]() -> Task<void> {
+    replaced_reference = co_await reference.ReplaceWithAsync(File("/tmp/replacement.txt"));
+    picker_task_completed = true;
+  });
+  platform.RunPlatformModuleTasks();
+
+  REQUIRE(picker_task_completed);
+  REQUIRE_FALSE(replaced_reference);
+  REQUIRE_FALSE(backend->replaced_with.has_value());
+}
+
+TEST_CASE("FileReferenceCallbackBridgePreservesStartupErrorsAndCancellation") {
+  ResetFilePickerState();
+  TestPlatform platform;
+  UiWindow runtime(FilePickerApp, platform);
+  runtime.BuildFrame();
+  std::optional<IoResult<Bytes>> result;
+  file_picker_tasks.Launch([&]() -> Task<void> {
+    result = co_await detail::RunFileReferenceBytesOperation([](auto) -> std::function<void()> {
+      throw std::runtime_error("provider startup failed");
+    });
+  });
+  platform.RunPlatformModuleTasks();
+  REQUIRE(result.has_value());
+  REQUIRE_FALSE(result->Succeeded());
+  REQUIRE(result->Error().code == IoErrorCode::Io);
+
+  result.reset();
+  detail::FileReferenceBytesCompletion completion;
+  int cancellations = 0;
+  auto handle = file_picker_tasks.Launch([&]() -> Task<void> {
+    result = co_await detail::RunFileReferenceBytesOperation([&](auto callback) {
+      completion = std::move(callback);
+      return [&] {
+        ++cancellations;
+        throw std::runtime_error("provider cancellation failed");
+      };
+    });
+  });
+  platform.RunPlatformModuleTasks();
+  handle.Cancel();
+  completion(IoResult<Bytes>(BytesFromString("late")));
+  platform.RunPlatformModuleTasks();
+  REQUIRE(cancellations == 1);
+  REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("RuntimeInstallsAnUnsupportedFilePickerService") {
+  ResetFilePickerState();
+  TestPlatform platform;
+  UiWindow runtime(FilePickerApp, platform);
+  runtime.BuildFrame();
+
+  REQUIRE(file_picker);
+  REQUIRE_FALSE(file_picker->CanOpenFiles());
+  REQUIRE_FALSE(file_picker->CanSaveFiles());
+
+  file_picker_tasks.Launch([picker = file_picker]() -> Task<void> {
+    opened_reference = co_await picker->OpenFileAsync();
+    opened_references = co_await picker->OpenFilesAsync();
+    saved_file = co_await picker->SaveFileAsync(File("/tmp/source.txt"));
+    picker_task_completed = true;
+  });
+  platform.RunPlatformModuleTasks();
+
+  REQUIRE(picker_task_completed);
+  REQUIRE_FALSE(opened_reference.has_value());
+  REQUIRE(opened_references.empty());
+  REQUIRE_FALSE(saved_file);
+}
+
+TEST_CASE("FilePickerValidatesPortableFiltersAndSuggestedNames") {
+  ResetFilePickerState();
+  FilePickerTestPlatform platform;
+  UiWindow runtime(FilePickerApp, platform);
+  runtime.BuildFrame();
+
+  REQUIRE_THROWS_AS(file_picker->OpenFileAsync({.extensions = {"txt"}}), std::invalid_argument);
+  REQUIRE_THROWS_AS(file_picker->OpenFileAsync({.name = "Text", .extensions = {".txt"}}), std::invalid_argument);
+  REQUIRE_THROWS_AS(file_picker->OpenFileAsync({.name = "Text", .extensions = {"t;xt"}}), std::invalid_argument);
+  REQUIRE_THROWS_AS(file_picker->OpenFileAsync({.name = "Text", .extensions = {"t*xt"}}), std::invalid_argument);
+  REQUIRE_THROWS_AS(file_picker->OpenFileAsync({.name = "Text", .extensions = {"t?xt"}}), std::invalid_argument);
+  REQUIRE_THROWS_AS(file_picker->OpenFileAsync({.name = "Text", .content_types = {"text"}}), std::invalid_argument);
+  REQUIRE_THROWS_AS(
+      file_picker->OpenFileAsync({.name = "Text", .content_types = {"te*xt/plain"}}),
+      std::invalid_argument
+  );
+  REQUIRE_NOTHROW(
+      file_picker->OpenFileAsync({.name = "Text", .content_types = {"application/x.test~json", "text/*"}})
+  );
+  REQUIRE_NOTHROW(file_picker->OpenFileAsync({.name = "Any", .content_types = {"*/*"}}));
+  REQUIRE_THROWS_AS(
+      detail::MakeFileReference(
+          {.name = "document.txt", .content_type = "text/*"},
+          std::make_shared<TestFileReferenceBackend>(BytesFromString("content"))
+      ),
+      std::logic_error
+  );
+  REQUIRE_THROWS_AS(
+      file_picker->SaveFileAsync(File("/tmp/source.txt"), {.suggested_name = "nested/file.txt"}),
+      std::invalid_argument
+  );
+  REQUIRE(platform.transport->open_calls.empty());
+  REQUIRE(platform.transport->save_calls.empty());
+}
+
+TEST_CASE("FilePickerSerializesPlatformPresentationAndResumesOnTheUIThread") {
+  ResetFilePickerState();
+  FilePickerTestPlatform platform;
+  UiWindow runtime(FilePickerApp, platform);
+  runtime.BuildFrame();
+  const std::thread::id ui_thread = std::this_thread::get_id();
+
+  file_picker_tasks.Launch(CaptureOpenedFile(
+      file_picker,
+      {
+          .name = "Text",
+          .extensions = {"txt"},
+          .content_types = {"text/plain"},
+      },
+      true
+  ));
+  file_picker_tasks.Launch(CaptureSavedFile(
+      file_picker,
+      File("/tmp/source.txt"),
+      {
+          .suggested_name = "export.txt",
+          .filter = {.name = "Text", .extensions = {"txt"}},
+      }
+  ));
+  platform.RunPlatformModuleTasks();
+
+  REQUIRE(platform.transport->open_calls.size() == 1);
+  REQUIRE_FALSE(platform.transport->open_calls.front().multiple);
+  REQUIRE(platform.transport->open_calls.front().filter.extensions == std::vector<std::string>{"txt"});
+  REQUIRE(platform.transport->save_calls.empty());
+
+#if defined(__EMSCRIPTEN__)
+  platform.transport->CompleteOpen(0, {MakeReference("selected.txt")});
+#else
+  std::thread completion([&platform] { platform.transport->CompleteOpen(0, {MakeReference("selected.txt")}); });
+  completion.join();
+#endif
+  REQUIRE_FALSE(opened_reference.has_value());
+  platform.RunPlatformModuleTasks();
+
+  REQUIRE(opened_reference.has_value());
+  REQUIRE(opened_reference->Name() == "selected.txt");
+  REQUIRE(picker_resume_thread == ui_thread);
+  REQUIRE(platform.transport->save_calls.size() == 1);
+  REQUIRE(platform.transport->save_calls.front().source == File("/tmp/source.txt"));
+  REQUIRE(platform.transport->save_calls.front().options.suggested_name == "export.txt");
+
+  platform.transport->CompleteSave(0, true);
+  platform.RunPlatformModuleTasks();
+  REQUIRE(saved_file);
+}
+
+TEST_CASE("CancelingFilePickerRequestsPreservesPlatformPresentationOrder") {
+  ResetFilePickerState();
+  FilePickerTestPlatform platform;
+  UiWindow runtime(FilePickerApp, platform);
+  runtime.BuildFrame();
+
+  TaskHandle active = file_picker_tasks.Launch(CaptureOpenedFile(file_picker));
+  platform.RunPlatformModuleTasks();
+  REQUIRE(platform.transport->open_calls.size() == 1);
+
+  TaskHandle queued = file_picker_tasks.Launch(CaptureSavedFile(file_picker, File("/tmp/skipped.txt")));
+  platform.RunPlatformModuleTasks();
+  REQUIRE(platform.transport->save_calls.empty());
+
+  active.Cancel();
+  queued.Cancel();
+  REQUIRE(*platform.transport->open_calls.front().canceled);
+  REQUIRE(platform.transport->save_calls.empty());
+
+  file_picker_tasks.Launch(CaptureOpenedFiles(file_picker));
+  platform.RunPlatformModuleTasks();
+  REQUIRE(platform.transport->open_calls.size() == 1);
+
+  platform.transport->CompleteOpen(0, {});
+  platform.RunPlatformModuleTasks();
+  REQUIRE(platform.transport->open_calls.size() == 2);
+  REQUIRE(platform.transport->open_calls.back().multiple);
+  REQUIRE_FALSE(picker_task_completed);
+
+  platform.transport->CompleteOpen(1, {MakeReference("first.txt"), MakeReference("second.txt")});
+  platform.RunPlatformModuleTasks();
+  REQUIRE(picker_task_completed);
+  REQUIRE(opened_references.size() == 2);
+  REQUIRE(opened_references[0].Name() == "first.txt");
+  REQUIRE(opened_references[1].Name() == "second.txt");
+}
+
+TEST_CASE("FilePickerDirectoriesShareThePresentationQueueAndRejectWrongResults") {
+  ResetFilePickerState();
+  FilePickerTestPlatform platform;
+  UiWindow runtime(FilePickerApp, platform);
+  runtime.BuildFrame();
+  REQUIRE(file_picker->CanOpenDirectories());
+  REQUIRE(file_picker->CanOpenDirectories(true));
+  bool completed = false;
+  file_picker_tasks.Launch([&]() -> Task<void> {
+    opened_reference = co_await file_picker->OpenDirectoryAsync();
+    completed = true;
+  });
+  file_picker_tasks.Launch(CaptureOpenedFiles(file_picker));
+  platform.RunPlatformModuleTasks();
+  REQUIRE((platform.transport->directory_requests == std::vector<bool>{false}));
+  REQUIRE(platform.transport->open_calls.size() == 1);
+  REQUIRE_FALSE(platform.transport->open_calls.front().multiple);
+  platform.transport->CompleteOpen(0, {MakeReference()});
+  platform.RunPlatformModuleTasks();
+  REQUIRE(completed);
+  REQUIRE_FALSE(opened_reference);
+  REQUIRE(platform.transport->open_calls.size() == 2);
+  platform.transport->CompleteOpen(1, {});
+  platform.RunPlatformModuleTasks();
+  completed = false;
+  file_picker_tasks.Launch([&]() -> Task<void> {
+    opened_reference = co_await file_picker->OpenDirectoryAsync(true);
+    completed = true;
+  });
+  platform.RunPlatformModuleTasks();
+  auto readonly = detail::MakeFileReference({.name = "directory", .can_write = false, .type = FileType::Directory},
+      std::make_shared<TestFileReferenceBackend>(Bytes{}));
+  platform.transport->CompleteOpen(2, {readonly});
+  platform.RunPlatformModuleTasks();
+  REQUIRE(completed);
+  REQUIRE_FALSE(opened_reference);
+  REQUIRE(platform.transport->directory_requests.back());
+  platform.transport->can_open_directories = false;
+  REQUIRE_FALSE(file_picker->CanOpenDirectories());
+}
+
+} // namespace pingcore::test

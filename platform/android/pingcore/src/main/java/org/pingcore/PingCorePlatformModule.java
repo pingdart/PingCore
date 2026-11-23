@@ -1,0 +1,60 @@
+package org.pingcore;
+
+import android.content.Context;
+
+/**
+ * Implements one nonvisual platform instance created through {@code JavaPlatformModuleFactory}.
+ *
+ * <p>A library normally keeps this Java interface behind a strongly typed C++ service. PingCore creates the Java
+ * instance on the Android UI thread, forwards method calls through {@link PingCorePlatformChannel}, and calls
+ * {@link #dispose()} after requests and events have been detached.</p>
+ *
+ * <pre>{@code
+ * public final class PlatformTimer implements PingCorePlatformModule.Factory {
+ *     @Override
+ *     public PingCorePlatformModule create(
+ *             Context context, PlatformPayload options, PingCorePlatformChannel.Events events) {
+ *         return new TimerInstance(events);
+ *     }
+ * }
+ * }</pre>
+ */
+public interface PingCorePlatformModule {
+    /** Creates a fresh Java platform instance for one C++ PlatformModule open operation. */
+    interface Factory {
+        /**
+         * Creates the platform instance.
+         *
+         * @param context the PingCore host Context; retain only through ordinary Android ownership rules
+         * @param options the immutable construction options encoded by the C++ Module factory
+         * @param events the framework-owned event sink; close or stop retaining it during disposal
+         * @return a new platform instance owned by PingCore
+         */
+        PingCorePlatformModule create(Context context, PlatformPayload options, PingCorePlatformChannel.Events events);
+    }
+
+    /** Creates a module bound to the original native attachment of one PingCoreView. */
+    interface WindowFactory {
+        /**
+         * Creates the platform instance on the main thread.
+         * @param window the originating host; capture needed capabilities now instead of looking up a later attachment
+         * @param options immutable construction options, or Null for an optionless module
+         * @param events the existing framework event sink; stop retaining it during disposal
+         * @return a fresh module instance; the factory must not cache a window or a previously created instance
+         */
+        PingCorePlatformModule create(PingCoreView window, PlatformPayload options,
+                PingCorePlatformChannel.Events events);
+    }
+
+    /**
+     * Handles one asynchronous method invocation.
+     *
+     * <p>Complete or fail {@code result} at most once. Return a cancellation operation when the work can be cancelled,
+     * or {@code null} otherwise. PingCore ignores late results after cancellation or disposal.</p>
+     */
+    PingCorePlatformChannel.Cancellation invoke(
+            String method, PlatformPayload arguments, PingCorePlatformChannel.Result result);
+
+    /** Releases listeners, platform resources, and background work owned by this instance. */
+    void dispose();
+}

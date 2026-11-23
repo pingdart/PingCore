@@ -1,0 +1,132 @@
+#pragma once
+
+#include <algorithm>
+#include <memory>
+#include <map>
+#include <optional>
+#include <tuple>
+#include <utility>
+
+#include <pingcore/window.h>
+
+namespace pingcore {
+
+class Environment;
+class UiWindow;
+
+namespace detail {
+
+struct MountedNode;
+struct ApplicationRuntimeState;
+
+void ValidateWindowOptions(const WindowOptions& options);
+void ValidateWindowSupport(const WindowOptions& options, const WindowCapabilities& support);
+
+inline Size ResolveInitialWindowSize(const WindowOptions& options) noexcept {
+  if (!options.minimum_size.has_value()) {
+    return options.initial_size;
+  }
+  return {
+      std::max(options.initial_size.width, options.minimum_size->width),
+      std::max(options.initial_size.height, options.minimum_size->height),
+  };
+}
+
+struct WindowState {
+  explicit WindowState(const WindowOptions& options)
+      : content_mode(options.content_mode), chrome_mode(options.chrome_mode), caption_labels(options.caption_labels),
+        activatable(options.activatable), resizable(options.resizable) {}
+
+  WindowContentMode content_mode = WindowContentMode::SafeArea;
+  WindowChromeMode chrome_mode = WindowChromeMode::System;
+  WindowCaptionLabels caption_labels;
+  bool activatable;
+  bool resizable;
+  WindowMetrics metrics;
+  SystemBarsAppearance appearance = SystemBarsAppearance::Default();
+  Color caption_foreground = Color::Rgb(32, 32, 32);
+  // This cache suppresses redundant native system-bar updates; the resolved appearance remains the paint authority.
+  std::optional<std::pair<SystemBarContentBrightness, SystemBarContentBrightness>> committed_system_bar_brightness;
+};
+
+class WindowService : public std::enable_shared_from_this<WindowService> {
+public:
+  explicit WindowService(UiWindow& ui_window);
+  explicit WindowService(std::function<void(WindowCommand)> session_command);
+  WindowHandle Handle();
+
+  void Attach(UiWindow& ui_window);
+  void Disconnect() noexcept;
+  void EndSession() noexcept;
+
+  /// Borrows the initialized attachment on the original application's thread without observing window state.
+  static UiWindow* AttachedWindow(const WindowHandle& window);
+
+  [[nodiscard]] bool IsOpen() const;
+  bool IsFullscreen() const;
+  void Open();
+  void BeginClose();
+
+  void Request(WindowCommand command);
+  bool SetAlwaysOnTop(bool enabled);
+  bool SetPointerPassThrough(bool enabled);
+  void RequestKeyboard(bool show);
+  void RequestFullscreen(bool fullscreen);
+  void UpdateFullscreen(bool fullscreen);
+
+  bool HandleShortcut(const KeyEvent& event);
+  std::function<void()> ConnectShortcut(Key key, KeyModifiers modifiers, std::function<bool()> handler);
+
+  [[nodiscard]] bool HandleRequest(WindowCommand command);
+  [[nodiscard]] std::function<void()>
+  ConnectRequest(WindowCommand command, std::function<bool()> handler);
+  void ClearHandlers() noexcept;
+
+  /// Reads the current native window state and subscribes active composition.
+  /// @return This window's state, independent of application foreground aggregation.
+  [[nodiscard]] WindowLifecycleState LifecycleState() const;
+  /// Updates this window and queues distinct transitions through the original application dispatcher.
+  /// @param state Native window/scene state on the application thread; equal values produce no event.
+  /// Recipient identities are captured at submission so later observers do not receive earlier transitions.
+  void UpdateLifecycleState(WindowLifecycleState state);
+  /// Connects one observer to future window transitions.
+  /// @param handler Nonempty application-thread callback; the current value is not replayed.
+  /// @return Idempotent disconnection callback using weak service ownership; retiring the window also drops delivery.
+  [[nodiscard]] std::function<void()> ConnectLifecycle(std::function<void(WindowLifecycleState)> handler);
+
+private:
+  struct RequestHandler {
+    std::function<bool()> handler;
+    std::uint64_t connection = 0;
+  };
+
+  RequestHandler& Handler(WindowCommand command);
+  void DisconnectRequest(WindowCommand command, std::uint64_t connection) noexcept;
+
+  UiWindow* ui_window_ = nullptr;
+  State<bool> open_{false};
+  State<bool> fullscreen_{false};
+  bool handling_minimize_request_ = false;
+  bool handling_close_request_ = false;
+  RequestHandler minimize_handler_;
+  RequestHandler close_handler_;
+  std::map<std::tuple<Key, bool, bool, bool, bool>, std::shared_ptr<std::function<bool()>>> shortcuts_;
+  std::uint64_t next_connection_ = 1;
+  State<WindowLifecycleState> lifecycle_state_{WindowLifecycleState::Background};
+  std::map<std::uint64_t, std::function<void(WindowLifecycleState)>> lifecycle_handlers_;
+  std::weak_ptr<ApplicationRuntimeState> application_;
+  std::function<void(WindowCommand)> session_command_;
+};
+
+View MakeWindowControls(
+    const std::shared_ptr<WindowService>& service,
+    const std::shared_ptr<WindowState>& window,
+    std::shared_ptr<const Environment> environment,
+    bool visible
+);
+bool IsWindowControlsNode(const MountedNode& node) noexcept;
+bool IsValidSystemBarsAppearance(const SystemBarsAppearance& appearance) noexcept;
+
+} // namespace detail
+
+} // namespace pingcore

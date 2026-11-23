@@ -1,0 +1,7 @@
+// The same build program as any PingCore package: the rules generate the
+// interface the [lib] path names from the headers and compile modules/macros.cppm.
+
+import mcpp;
+import pingcore.rules;
+
+int main() { return pingcore::rules::configure({}) ? 0 : 1; }

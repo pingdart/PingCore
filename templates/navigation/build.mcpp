@@ -1,0 +1,14 @@
+// The whole build program for a PingCore application.
+//
+// `pingcore.rules` arrives through the pingcore dependency, which re-exports it,
+// so this file names no package of its own. configure() schedules the
+// composable transform (hcg) and the resource compiler (hrc) as build-graph
+// edges, and hands this package the scope macros and <typeinfo> that
+// `import pingcore;` needs.
+
+import mcpp;
+import pingcore.rules;
+
+int main() {
+    return pingcore::rules::configure({ .resources = "resources" }) ? 0 : 1;
+}

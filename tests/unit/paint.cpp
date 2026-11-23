@@ -1,0 +1,744 @@
+#include <catch2/catch_amalgamated.hpp>
+
+#include <pingcore/paint.h>
+
+#include <concepts>
+#include <limits>
+#include <numbers>
+#include <stdexcept>
+#include <type_traits>
+#include <variant>
+#include <vector>
+
+#include "external_texture_test_support.h"
+#include "image_test_support.h"
+#include "graphics/paint_internal.h"
+#include "graphics/shadow_internal.h"
+
+namespace pingcore::test {
+
+namespace {
+
+ImageAsset TestImage() {
+  return ImageAsset::FromEncoded(MakeTestPng(40, 20), 2.0F);
+}
+
+std::shared_ptr<ExternalTexture> TestExternalTexture() {
+  return MakeTestExternalTexture({20.0F, 10.0F});
+}
+
+} // namespace
+
+static_assert(std::equality_comparable<Color>);
+static_assert(std::equality_comparable<Rect>);
+static_assert(std::equality_comparable<PaintCommand>);
+
+TEST_CASE("ColorDecodesPackedRgbaAndArgbChannels") {
+  STATIC_REQUIRE(std::is_aggregate_v<Color>);
+  constexpr Color expected = Color::Rgb(0x12, 0x34, 0x56, static_cast<float>(0x78) / 255.0F);
+  STATIC_REQUIRE(Color::Rgba32(0x12345678U) == expected);
+  STATIC_REQUIRE(Color::Argb32(0x78123456U) == expected);
+  STATIC_REQUIRE(Color::Rgba32(0x00000000U) == Color::Transparent());
+  STATIC_REQUIRE(Color::Argb32(0xFF000000U) == Color::Black());
+  STATIC_REQUIRE(Color::Rgba32(0xFFFFFFFFU) == Color::White());
+}
+
+TEST_CASE("PaintAggregatesPreserveOmittedImageAndStrokeDefaults") {
+  STATIC_REQUIRE(std::is_aggregate_v<ImageFill>);
+  STATIC_REQUIRE(std::is_aggregate_v<StrokeStyle>);
+
+  const ImageFill fill{.source = TestImage()};
+  REQUIRE_FALSE(fill.tint.has_value());
+  REQUIRE(fill.fit == ImageFit::Fill);
+  REQUIRE(fill.opacity == 1.0F);
+
+  const StrokeStyle stroke{.width = 2.0F};
+  REQUIRE(stroke.width == 2.0F);
+  REQUIRE(stroke.dash_pattern.empty());
+  REQUIRE(stroke.cap == StrokeCap::Butt);
+  REQUIRE(stroke.join == StrokeJoin::Miter);
+
+  const std::vector<GradientStop> stops{{0.0F, Color::Black()}, {1.0F, Color::White()}};
+  REQUIRE(LinearGradient{.stops = stops}.transform == Transform2D{});
+  REQUIRE(RadialGradient{.stops = stops}.transform == Transform2D{});
+}
+
+TEST_CASE("PaintCommandsCompareByValue") {
+  const PaintCommand left = DrawRectCommand{
+      {1.0F, 2.0F, 3.0F, 4.0F},
+      Color::White(),
+      5.0F,
+  };
+  const PaintCommand equal = DrawRectCommand{
+      {1.0F, 2.0F, 3.0F, 4.0F},
+      Color::White(),
+      5.0F,
+  };
+  const PaintCommand different = DrawRectCommand{
+      {1.0F, 2.0F, 3.0F, 4.0F},
+      Color::Black(),
+      5.0F,
+  };
+
+  REQUIRE(left == equal);
+  REQUIRE(left != different);
+}
+
+TEST_CASE("PaintContextBuildsAnImmutableLocalSequence") {
+  PaintSequence sequence;
+  REQUIRE(sequence.Revision() == 0);
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 100.0F, 80.0F}};
+  context.DrawRect({10.0F, 20.0F, 30.0F, 15.0F}, Color::White(), 4.0F);
+  context.DrawBorder({5.0F, 10.0F, 20.0F, 20.0F}, Color::Black(), StrokeStyle{.width = 2.0F});
+  context.Finish();
+
+  REQUIRE(sequence.Revision() == 1);
+  REQUIRE_FALSE(sequence.HasExternalTextureCommands());
+  REQUIRE(sequence.Commands().size() == 2);
+  REQUIRE(std::holds_alternative<DrawRectCommand>(sequence.Commands()[0]));
+  REQUIRE(std::holds_alternative<DrawBorderCommand>(sequence.Commands()[1]));
+  REQUIRE(sequence.Bounds().x == 4.0F);
+  REQUIRE(sequence.Bounds().y == 9.0F);
+  REQUIRE(sequence.Bounds().width == 36.0F);
+  REQUIRE(sequence.Bounds().height == 26.0F);
+  REQUIRE_THROWS_AS(context.DrawRect({}, Color::White()), std::logic_error);
+}
+
+TEST_CASE("PaintContextKeepsTextParagraphOffsetsInsideFixedCommandBounds") {
+  const Rect bounds{10.0F, 20.0F, 80.0F, 24.0F};
+  PaintSequence sequence;
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 100.0F, 80.0F}};
+  context.DrawText(bounds, "Scrollable text", TextStyle{}, {}, {-12.0F, 0.0F});
+  REQUIRE_THROWS_AS(
+      context.DrawText(bounds, "Invalid", TextStyle{}, {}, {std::numeric_limits<float>::infinity(), 0.0F}),
+      std::invalid_argument
+  );
+  context.Finish();
+
+  REQUIRE(sequence.Commands().size() == 1);
+  const DrawTextCommand& command = std::get<DrawTextCommand>(sequence.Commands().front());
+  REQUIRE(command.rect == bounds);
+  REQUIRE(command.paragraph_offset == (Point{-12.0F, 0.0F}));
+  REQUIRE(sequence.Bounds() == bounds);
+}
+
+TEST_CASE("IndependentPaintContextLeavesDefaultTextShapingLocaleEmpty") {
+  PaintSequence sequence;
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 100.0F, 80.0F}};
+  context.DrawText({0.0F, 0.0F, 80.0F, 20.0F}, "paragraph", TextStyle{});
+  context.DrawTextRun({0.0F, 20.0F, 40.0F, 20.0F}, {0.0F, 35.0F}, "run", TextStyle{});
+  context.DrawTextRuns({
+      TextRun{{0.0F, 40.0F, 40.0F, 20.0F}, {0.0F, 55.0F}, "batch", TextStyle{}, {}},
+  });
+  context.Finish();
+
+  REQUIRE(sequence.Commands().size() == 2);
+  REQUIRE(std::get<DrawTextCommand>(sequence.Commands()[0]).options.shaping.locale.empty());
+  const auto& runs = std::get<DrawTextRunsCommand>(sequence.Commands()[1]).runs;
+  REQUIRE(runs.size() == 2);
+  REQUIRE(runs[0].shaping.locale.empty());
+  REQUIRE(runs[1].shaping.locale.empty());
+}
+
+TEST_CASE("PaintContextNormalizesRoundedGeometryAgainstConcreteBounds") {
+  const Rect pill{10.0F, 20.0F, 120.0F, 20.0F};
+  const LinearGradient linear{
+      .stops = {{0.0F, Color::Black()}, {1.0F, Color::White()}},
+  };
+  const RadialGradient radial{
+      .radius = {0.5F, 0.5F},
+      .stops = {{0.0F, Color::White()}, {1.0F, Color::Black()}},
+  };
+  PaintSequence sequence;
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 160.0F, 80.0F}};
+  context.DrawRect(pill, Color::White(), CornerRadii{10000.0F});
+  context.DrawRect(pill, linear, CornerRadii{10000.0F});
+  context.DrawRect(pill, radial, CornerRadii{10000.0F});
+  context.DrawBorder(pill, Color::Black(), StrokeStyle{.width = 2.0F}, CornerRadii{10000.0F});
+  context.DrawShadow(pill, Color::Black(), {}, 4.0F, 2.0F, CornerRadii{10000.0F});
+  context.PushClip(pill, CornerRadii{10000.0F});
+  context.PopClip();
+  context.Finish();
+
+  REQUIRE(sequence.Commands().size() == 7);
+  REQUIRE(std::get<DrawRectCommand>(sequence.Commands()[0]).corner_radius == 10.0F);
+  REQUIRE(std::get<DrawRectCommand>(sequence.Commands()[1]).corner_radius == 10.0F);
+  REQUIRE(std::get<DrawRectCommand>(sequence.Commands()[2]).corner_radius == 10.0F);
+  REQUIRE(std::get<DrawBorderCommand>(sequence.Commands()[3]).corner_radius == 10.0F);
+  REQUIRE(detail::ResolveShadow(std::get<DrawShadowCommand>(sequence.Commands()[4])).corner_radius == 12.0F);
+  REQUIRE(std::get<PushClipCommand>(sequence.Commands()[5]).corner_radius == 10.0F);
+  REQUIRE(std::holds_alternative<PopClipCommand>(sequence.Commands()[6]));
+}
+
+TEST_CASE("PaintContextRecordsPlatformNeutralBrushes") {
+  const LinearGradient linear{
+      .start = {0.0F, 0.0F},
+      .end = {1.0F, 1.0F},
+      .stops = {{0.0F, Color::Black()}, {1.0F, Color::White()}},
+      .transform = {0.8F, 0.2F, -0.3F, 1.1F, 0.1F, -0.2F},
+  };
+  const RadialGradient radial{
+      .center = {0.5F, 0.5F},
+      .radius = {0.5F, 0.25F},
+      .stops = {{0.0F, Color::White()}, {1.0F, Color::Transparent()}},
+      .transform = {0.0F, 1.0F, -1.0F, 0.0F, 1.0F, 0.0F},
+  };
+  PaintSequence sequence;
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 100.0F, 80.0F}};
+  context.DrawRect({10.0F, 12.0F, 40.0F, 20.0F}, linear, CornerRadii{6.0F});
+  context.DrawRect({20.0F, 30.0F, 50.0F, 30.0F}, radial, CornerRadii{8.0F});
+  context.Finish();
+
+  REQUIRE(sequence.Commands().size() == 2);
+  const auto& linear_command = std::get<DrawRectCommand>(sequence.Commands()[0]);
+  const auto& radial_command = std::get<DrawRectCommand>(sequence.Commands()[1]);
+  REQUIRE(std::get<LinearGradient>(linear_command.brush.Get()) == linear);
+  REQUIRE(linear_command.corner_radius == 6.0F);
+  REQUIRE(std::get<RadialGradient>(radial_command.brush.Get()) == radial);
+  REQUIRE(radial_command.corner_radius == 8.0F);
+  REQUIRE(sequence.Bounds() == Rect{10.0F, 12.0F, 60.0F, 48.0F});
+}
+
+TEST_CASE("PaintContextLowersAsymmetricBrushCornersToOnePathFill") {
+  PaintSequence sequence;
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 100.0F, 80.0F}};
+  context.DrawRect(
+      {10.0F, 12.0F, 40.0F, 20.0F},
+      LinearGradient{.stops = {{0.0F, Color::Black()}, {1.0F, Color::White()}}},
+      CornerRadii{8.0F, 4.0F, 2.0F, 0.0F}
+  );
+  context.Finish();
+
+  REQUIRE(sequence.Commands().size() == 1);
+  const auto& command = std::get<FillPathCommand>(sequence.Commands()[0]);
+  REQUIRE(command.brush_bounds == Rect{10.0F, 12.0F, 40.0F, 20.0F});
+  REQUIRE(std::holds_alternative<LinearGradient>(command.brush.Get()));
+}
+
+TEST_CASE("GradientTransformsResolveThroughOneNormalizedDestinationMapping") {
+  const Rect destination{10.0F, 20.0F, 100.0F, 50.0F};
+  const LinearGradient linear{
+      .transform = {0.0F, 1.0F, -1.0F, 0.0F, 1.0F, 0.0F},
+  };
+  REQUIRE(detail::ResolveGradientTransform(destination, linear) ==
+          Transform2D{0.0F, 50.0F, -100.0F, 0.0F, 110.0F, 20.0F});
+
+  const RadialGradient radial{
+      .center = {0.25F, 0.75F},
+      .radius = {0.5F, 0.25F},
+  };
+  REQUIRE(detail::ResolveGradientTransform(destination, radial) ==
+          Transform2D{100.0F, 0.0F, 0.0F, 25.0F, 10.0F, 38.75F});
+}
+
+TEST_CASE("PaintContextValidatesGradientGeometryAndStops") {
+  PaintSequence sequence;
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 100.0F, 80.0F}};
+  REQUIRE_THROWS_AS(context.DrawRect({}, LinearGradient{}), std::invalid_argument);
+  REQUIRE_THROWS_AS(
+      context.DrawRect(
+          {},
+          LinearGradient{.stops = {{0.8F, Color::White()}, {0.2F, Color::Black()}}}
+      ),
+      std::invalid_argument
+  );
+  REQUIRE_THROWS_AS(
+      context.DrawRect(
+          {},
+          RadialGradient{.radius = {0.0F, 0.5F}, .stops = {{0.0F, Color::White()}}}
+      ),
+      std::invalid_argument
+  );
+  REQUIRE_THROWS_AS(
+      context.DrawRect(
+          {},
+          LinearGradient{
+              .stops = {{0.0F, Color::Black()}, {1.0F, Color::White()}},
+              .transform = {0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F},
+          }
+      ),
+      std::invalid_argument
+  );
+  REQUIRE_THROWS_AS(
+      context.DrawRect(
+          {},
+          RadialGradient{
+              .stops = {{0.0F, Color::Black()}, {1.0F, Color::White()}},
+              .transform = {1.0F, 0.0F, 0.0F, 1.0F, std::numeric_limits<float>::infinity(), 0.0F},
+          }
+      ),
+      std::invalid_argument
+  );
+  REQUIRE(sequence.Commands().empty());
+}
+
+TEST_CASE("PaintContextRejectsUnbalancedCommandStacks") {
+  PaintSequence sequence;
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 100.0F, 80.0F}};
+  REQUIRE_THROWS_AS(context.PopClip(), std::logic_error);
+  context.PushClip({0.0F, 0.0F, 10.0F, 10.0F});
+  REQUIRE_THROWS_AS(context.Finish(), std::logic_error);
+}
+
+TEST_CASE("PaintContextRejectsCrossedCommandStacks") {
+  PaintSequence sequence;
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 100.0F, 80.0F}};
+  context.PushClip({0.0F, 0.0F, 10.0F, 10.0F});
+  context.PushTransform(Transform2D{});
+  REQUIRE_THROWS_AS(context.PopClip(), std::logic_error);
+}
+
+TEST_CASE("PaintContextCoalescesAdjacentTextRuns") {
+  PaintSequence sequence;
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 100.0F, 80.0F}};
+  const TextStyle style{Font::Monospace(14.0F), Color::White(), TextDecoration::Underline};
+  context.DrawTextRun({10.0F, 12.0F, 20.0F, 16.0F}, {10.0F, 24.0F}, "first", style);
+  context.DrawTextRun({30.0F, 12.0F, 24.0F, 16.0F}, {30.0F, 24.0F}, "second", style);
+  context.DrawTextRuns({TextRun{{54.0F, 12.0F, 12.0F, 16.0F}, {54.0F, 24.0F}, "third", style, {}}});
+  context.Finish();
+
+  REQUIRE(sequence.Commands().size() == 1);
+  const auto* command = std::get_if<DrawTextRunsCommand>(&sequence.Commands().front());
+  REQUIRE(command != nullptr);
+  REQUIRE(command->runs.size() == 3);
+  REQUIRE(command->runs[0].baseline_origin == Point{10.0F, 24.0F});
+  REQUIRE(command->runs[1].bounds == Rect{30.0F, 12.0F, 24.0F, 16.0F});
+  REQUIRE(sequence.Bounds() == Rect{10.0F, 12.0F, 56.0F, 16.0F});
+}
+
+TEST_CASE("PaintContextRecordsResolvedImageGeometry") {
+  PaintSequence sequence;
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 100.0F, 80.0F}};
+  context
+      .DrawImageRect(TestImage(), {2.0F, 1.0F, 8.0F, 4.0F}, {10.0F, 20.0F, 40.0F, 20.0F}, ImageSampling::Nearest, 0.5F);
+  context.Finish();
+
+  REQUIRE(sequence.Commands().size() == 1);
+  const auto& command = std::get<DrawImageCommand>(sequence.Commands().front());
+  REQUIRE(command.source == Rect{2.0F, 1.0F, 8.0F, 4.0F});
+  REQUIRE(command.destination == Rect{10.0F, 20.0F, 40.0F, 20.0F});
+  REQUIRE(command.sampling == ImageSampling::Nearest);
+  REQUIRE(command.opacity == 0.5F);
+  REQUIRE(sequence.Bounds() == command.destination);
+}
+
+TEST_CASE("PaintContextRecordsBitmapUsingLogicalSourceGeometry") {
+  const auto bitmap = Bitmap::FromRgba8(4, 2, Bytes(32), 2.0F);
+  PaintSequence sequence;
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 40.0F, 20.0F}};
+  context.DrawImage(bitmap, {0.0F, 0.0F, 40.0F, 20.0F});
+  context.Finish();
+
+  REQUIRE(sequence.Commands().size() == 1);
+  const auto& command = std::get<DrawImageCommand>(sequence.Commands().front());
+  REQUIRE(std::get<Bitmap>(command.image) == bitmap);
+  REQUIRE(command.source == Rect{0.0F, 0.0F, 2.0F, 1.0F});
+}
+
+TEST_CASE("PaintContextValidatesImageSourceAndOpacity") {
+  PaintSequence sequence;
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 100.0F, 80.0F}};
+  REQUIRE_THROWS_AS(context.DrawImageRect(TestImage(), {19.0F, 0.0F, 2.0F, 2.0F}, {}), std::invalid_argument);
+  REQUIRE_THROWS_AS(
+      context.DrawImage(TestImage(), {0.0F, 0.0F, 10.0F, 10.0F}, ImageSampling::Linear, 1.1F),
+      std::invalid_argument
+  );
+}
+
+TEST_CASE("PaintContextRecordsExternalTexturesWithoutFlatteningThemToImages") {
+  const std::shared_ptr<ExternalTexture> texture = TestExternalTexture();
+  PaintSequence sequence;
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 100.0F, 80.0F}};
+  context.DrawImageRect(
+      texture,
+      {2.0F, 1.0F, 8.0F, 4.0F},
+      {10.0F, 20.0F, 40.0F, 20.0F},
+      ImageSampling::Nearest,
+      0.5F
+  );
+  context.Finish();
+
+  REQUIRE(sequence.Commands().size() == 1);
+  REQUIRE(sequence.HasExternalTextureCommands());
+  const auto& command = std::get<DrawExternalTextureCommand>(sequence.Commands().front());
+  REQUIRE(command.texture == texture);
+  REQUIRE(command.source == Rect{2.0F, 1.0F, 8.0F, 4.0F});
+  REQUIRE(command.destination == Rect{10.0F, 20.0F, 40.0F, 20.0F});
+  REQUIRE(command.sampling == ImageSampling::Nearest);
+  REQUIRE(command.opacity == 0.5F);
+  REQUIRE(sequence.Bounds() == command.destination);
+}
+
+TEST_CASE("PaintContextValidatesExternalTextureAndOpacity") {
+  PaintSequence sequence;
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 100.0F, 80.0F}};
+  REQUIRE_THROWS_AS(
+      context.DrawImageRect(TestExternalTexture(), {19.0F, 0.0F, 2.0F, 2.0F}, {}),
+      std::invalid_argument
+  );
+  REQUIRE_THROWS_AS(
+      context.DrawImage(TestExternalTexture(), {0.0F, 0.0F, 10.0F, 10.0F}, ImageSampling::Linear, 1.1F),
+      std::invalid_argument
+  );
+  REQUIRE_THROWS_AS(context.DrawImage(std::shared_ptr<ExternalTexture>{}, {}), std::invalid_argument);
+}
+
+TEST_CASE("PaintContextRejectsMandatoryLineBreaksInTextRuns") {
+  PaintSequence sequence;
+  const Rect bounds{0.0F, 0.0F, 100.0F, 80.0F};
+  const Point baseline{0.0F, 24.0F};
+  const TextStyle style{};
+  PaintContext context{sequence, bounds};
+  for (const auto* text : {"a\rb", "a\nb", "a\r\nb", "a\vb", "a\fb", "a\u0085b", "a\u2028b", "a\u2029b"}) {
+    const TextRun run{bounds, baseline, text, style, {}};
+    CHECK_THROWS_AS(context.DrawTextRun(bounds, baseline, text, style), std::invalid_argument);
+    CHECK_THROWS_AS(context.DrawTextRuns({run}), std::invalid_argument);
+  }
+  CHECK(sequence.Commands().empty());
+
+  const std::string text = "\u00A9 \u2026 \U0001F642 \u4E2D";
+  context.DrawTextRun(bounds, baseline, text, style);
+  context.Finish();
+  REQUIRE(sequence.Commands().size() == 1);
+  CHECK(std::get<DrawTextRunsCommand>(sequence.Commands().front()).runs.front().text == text);
+}
+
+TEST_CASE("PaintContextOmitsTextRunsWithoutVisibleBounds") {
+  PaintSequence sequence;
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 100.0F, 80.0F}};
+  const TextStyle style{Font::Monospace(14.0F), Color::White()};
+  context.DrawTextRun({}, {10.0F, 24.0F}, "hidden", style);
+  context.DrawTextRuns({
+      TextRun{{10.0F, 12.0F, 20.0F, 16.0F}, {10.0F, 24.0F}, "visible", style, {}},
+      TextRun{{30.0F, 12.0F, 0.0F, 16.0F}, {30.0F, 24.0F}, "hidden", style, {}},
+  });
+  context.Finish();
+
+  REQUIRE(sequence.Commands().size() == 1);
+  const auto& command = std::get<DrawTextRunsCommand>(sequence.Commands().front());
+  REQUIRE(command.runs.size() == 1);
+  REQUIRE(command.runs.front().text == "visible");
+  REQUIRE(sequence.Bounds() == Rect{10.0F, 12.0F, 20.0F, 16.0F});
+}
+
+TEST_CASE("PaintContextTracksTransformedAndClippedBounds") {
+  PaintSequence sequence;
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 100.0F, 80.0F}};
+  context.PushTransform(Transform2D{1.0F, 0.0F, 0.0F, 1.0F, 40.0F, 20.0F});
+  context.PushClip({0.0F, 0.0F, 20.0F, 20.0F});
+  context.DrawRect({10.0F, 10.0F, 30.0F, 30.0F}, Color::White());
+  context.PopClip();
+  context.PopTransform();
+  context.Finish();
+
+  REQUIRE(sequence.Bounds() == Rect{50.0F, 30.0F, 10.0F, 10.0F});
+}
+
+TEST_CASE("PaintContextIncludesSquareArcCapsInBounds") {
+  PaintSequence sequence;
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 100.0F, 80.0F}};
+  context.DrawArc({50.0F, 40.0F}, 10.0F, 0.0F, std::numbers::pi_v<float> * 0.5F, Color::White(),
+                  StrokeStyle{.width = 4.0F, .cap = StrokeCap::Square});
+  context.Finish();
+
+  REQUIRE(sequence.Bounds().x < 38.0F);
+  REQUIRE(sequence.Bounds().y < 28.0F);
+  REQUIRE(sequence.Bounds().x + sequence.Bounds().width > 62.0F);
+  REQUIRE(sequence.Bounds().y + sequence.Bounds().height > 52.0F);
+}
+
+TEST_CASE("PaintContextRecordsShadowOverflowBounds") {
+  PaintSequence sequence;
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 100.0F, 80.0F}};
+  context.DrawShadow({10.0F, 20.0F, 30.0F, 15.0F}, Color::Rgb(0, 0, 0, 0.25F), {4.0F, 6.0F}, 8.0F, 2.0F, 5.0F);
+  context.Finish();
+
+  REQUIRE(sequence.Commands().size() == 1);
+  const auto* shadow = std::get_if<DrawShadowCommand>(&sequence.Commands().front());
+  REQUIRE(shadow != nullptr);
+  REQUIRE(shadow->offset == Point{4.0F, 6.0F});
+  REQUIRE(sequence.Bounds() == Rect{4.0F, 16.0F, 50.0F, 35.0F});
+}
+
+TEST_CASE("PaintContextAllowsNegativeShadowSpread") {
+  PaintSequence sequence;
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 100.0F, 80.0F}};
+  context.DrawShadow({10.0F, 20.0F, 30.0F, 15.0F}, Color::Black(), {4.0F, 6.0F}, 8.0F, -2.0F, 5.0F);
+  context.Finish();
+
+  REQUIRE(sequence.Bounds() == Rect{8.0F, 20.0F, 42.0F, 27.0F});
+}
+
+TEST_CASE("ShadowResolutionClampsCornerRadiusAndRejectsCollapsedCasters") {
+  const detail::ResolvedShadow expanded = detail::ResolveShadow(
+      DrawShadowCommand{
+          .rect = {10.0F, 20.0F, 20.0F, 10.0F},
+          .color = Color::Black(),
+          .blur_radius = 6.0F,
+          .spread = 3.0F,
+          .corner_radius = 4.0F,
+      }
+  );
+  REQUIRE(expanded.caster == Rect{7.0F, 17.0F, 26.0F, 16.0F});
+  REQUIRE(expanded.corner_radius == 7.0F);
+  REQUIRE(expanded.standard_deviation == 2.0F);
+
+  const detail::ResolvedShadow collapsed = detail::ResolveShadow(
+      DrawShadowCommand{
+          .rect = {0.0F, 0.0F, 10.0F, 10.0F},
+          .color = Color::Black(),
+          .spread = -5.0F,
+          .corner_radius = 8.0F,
+      }
+  );
+  REQUIRE(collapsed.IsEmpty());
+  REQUIRE(collapsed.bounds.IsEmpty());
+}
+
+TEST_CASE("PaintContextRejectsInvalidDrawingParameters") {
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+
+  PaintSequence sequence;
+  REQUIRE_THROWS_AS(PaintContext(sequence, Rect{0.0F, 0.0F, -1.0F, 20.0F}), std::invalid_argument);
+
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 100.0F, 80.0F}};
+  REQUIRE_THROWS_AS(context.DrawRect({0.0F, 0.0F, nan, 10.0F}, Color::White()), std::invalid_argument);
+  REQUIRE_THROWS_AS(Font::System(0.0F), std::invalid_argument);
+  REQUIRE_THROWS_AS(context.DrawCircle({}, -1.0F, Color::White()), std::invalid_argument);
+  REQUIRE_THROWS_AS(context.DrawLine({nan, 0.0F}, {}, Color::White(), StrokeStyle{}), std::invalid_argument);
+  REQUIRE_THROWS_AS(
+      context.DrawArc({}, 10.0F, 0.0F, nan, Color::White(), StrokeStyle{.width = 1.0F}), std::invalid_argument);
+  REQUIRE_THROWS_AS(context.DrawBorder({}, Color::White(), StrokeStyle{.width = -1.0F}), std::invalid_argument);
+  REQUIRE_THROWS_AS(context.DrawShadow({}, Color::Black(), {}, -1.0F), std::invalid_argument);
+  REQUIRE_THROWS_AS(context.DrawShadow({}, Color::Black(), {}, nan), std::invalid_argument);
+  REQUIRE_THROWS_AS(context.DrawShadow({}, Color::Black(), {nan, 0.0F}, 1.0F), std::invalid_argument);
+  REQUIRE_THROWS_AS(context.DrawShadow({}, Color::Black(), {}, 1.0F, nan), std::invalid_argument);
+  REQUIRE_THROWS_AS(context.PushClip({}, -1.0F), std::invalid_argument);
+  REQUIRE_THROWS_AS(context.PushTransform(Transform2D{1.0F, 0.0F, 0.0F, 1.0F, nan, 0.0F}), std::invalid_argument);
+  context.Finish();
+}
+
+TEST_CASE("PaintContextRecordsPathCommandsAndBounds") {
+  Path path;
+  path.MoveTo({10.0F, 20.0F}).LineTo({40.0F, 20.0F}).LineTo({25.0F, 50.0F}).Close();
+
+  PaintSequence sequence;
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 100.0F, 80.0F}};
+  context.FillPath(path, Color::White(), PathFillRule::EvenOdd);
+  context.StrokePath(path, Color::Black(),
+                     StrokeStyle{.width = 2.0F, .cap = StrokeCap::Round, .join = StrokeJoin::Round});
+  context.DrawPathShadow(path, Color::Rgb(0, 0, 0, 0.25F), {4.0F, 6.0F}, 8.0F);
+  context.PushPathClip(path);
+  context.DrawRect({0.0F, 0.0F, 100.0F, 80.0F}, Color::White());
+  context.PopClip();
+  context.Finish();
+
+  REQUIRE(sequence.Commands().size() == 6);
+  REQUIRE(std::holds_alternative<FillPathCommand>(sequence.Commands()[0]));
+  REQUIRE(std::holds_alternative<StrokePathCommand>(sequence.Commands()[1]));
+  REQUIRE(std::holds_alternative<DrawPathShadowCommand>(sequence.Commands()[2]));
+  REQUIRE(std::holds_alternative<PushPathClipCommand>(sequence.Commands()[3]));
+  REQUIRE(std::holds_alternative<PopClipCommand>(sequence.Commands()[5]));
+  REQUIRE(sequence.Bounds() == Rect{6.0F, 18.0F, 46.0F, 46.0F});
+}
+
+TEST_CASE("PaintContextRecordsAtomicBrushPathFills") {
+  const Path path = Path{}.MoveTo({10.0F, 20.0F}).LineTo({50.0F, 20.0F}).LineTo({30.0F, 60.0F}).Close();
+  const LinearGradient linear{
+      .start = {0.0F, 0.0F},
+      .end = {1.0F, 1.0F},
+      .stops = {{0.0F, Color::Black()}, {1.0F, Color::White()}},
+      .transform = {1.0F, 0.25F, -0.1F, 1.0F, 0.2F, 0.0F},
+  };
+  const RadialGradient radial{
+      .center = {0.25F, 0.75F},
+      .radius = {0.5F, 0.25F},
+      .stops = {{0.0F, Color::White()}, {1.0F, Color::Black()}},
+      .transform = {0.75F, 0.0F, 0.2F, 1.0F, 0.0F, 0.1F},
+  };
+
+  PaintSequence sequence;
+  PaintContext context(sequence, {0.0F, 0.0F, 100.0F, 80.0F});
+  context.FillPath(path, linear, PathFillRule::EvenOdd);
+  context.FillPath(path, radial, {0.0F, 0.0F, 100.0F, 80.0F});
+  context.Finish();
+
+  REQUIRE(sequence.Commands().size() == 2);
+  const auto& linear_fill = std::get<FillPathCommand>(sequence.Commands()[0]);
+  REQUIRE(linear_fill.brush_bounds == path.Bounds());
+  REQUIRE(std::get<LinearGradient>(linear_fill.brush.Get()) == linear);
+  REQUIRE(linear_fill.fill_rule == PathFillRule::EvenOdd);
+  const auto& radial_fill = std::get<FillPathCommand>(sequence.Commands()[1]);
+  REQUIRE(radial_fill.brush_bounds == Rect{0.0F, 0.0F, 100.0F, 80.0F});
+  REQUIRE(std::get<RadialGradient>(radial_fill.brush.Get()) == radial);
+  REQUIRE(sequence.Bounds() == path.Bounds());
+}
+
+TEST_CASE("PaintContextValidatesGradientPathFillsBeforeRecording") {
+  const Path path = Path{}.MoveTo({0.0F, 0.0F}).LineTo({20.0F, 0.0F}).LineTo({10.0F, 10.0F}).Close();
+  PaintSequence sequence;
+  PaintContext context(sequence, {0.0F, 0.0F, 20.0F, 10.0F});
+
+  REQUIRE_THROWS_AS(context.FillPath(path, LinearGradient{}), std::invalid_argument);
+  REQUIRE_THROWS_AS(
+      context.FillPath(path,
+                       RadialGradient{.radius = {},
+                                      .stops = {{0.0F, Color::Black()}, {1.0F, Color::White()}}}),
+      std::invalid_argument
+  );
+  REQUIRE(sequence.Commands().empty());
+
+  context.FillPath(path,
+                   LinearGradient{.stops = {{0.0F, Color::Black()}, {1.0F, Color::White()}}},
+                   {0.0F, 0.0F, 0.0F, 10.0F});
+  context.Finish();
+  REQUIRE(sequence.Commands().empty());
+  REQUIRE(sequence.Bounds().IsEmpty());
+}
+
+TEST_CASE("PaintContextRecordsAtomicBrushPathStrokes") {
+  const Path path = Path{}.MoveTo({10.0F, 20.0F}).LineTo({50.0F, 20.0F}).LineTo({30.0F, 60.0F}).Close();
+  const LinearGradient linear{
+      .start = {0.0F, 0.0F},
+      .end = {1.0F, 1.0F},
+      .stops = {{0.0F, Color::Black()}, {1.0F, Color::White()}},
+      .transform = {1.0F, 0.25F, -0.1F, 1.0F, 0.2F, 0.0F},
+  };
+  const RadialGradient radial{
+      .center = {0.25F, 0.75F},
+      .radius = {0.5F, 0.25F},
+      .stops = {{0.0F, Color::White()}, {1.0F, Color::Black()}},
+      .transform = {0.75F, 0.0F, 0.2F, 1.0F, 0.0F, 0.1F},
+  };
+  const StrokeStyle style{
+      .width = 4.0F,
+      .cap = StrokeCap::Round,
+      .join = StrokeJoin::Bevel,
+      .dash_pattern = {6.0F, 2.0F},
+  };
+
+  PaintSequence sequence;
+  PaintContext context(sequence, {0.0F, 0.0F, 100.0F, 80.0F});
+  context.StrokePath(path, linear, style);
+  context.StrokePath(path, radial, {0.0F, 0.0F, 100.0F, 80.0F}, style);
+  context.Finish();
+
+  REQUIRE(sequence.Commands().size() == 2);
+  const auto& linear_stroke = std::get<StrokePathCommand>(sequence.Commands()[0]);
+  REQUIRE(linear_stroke.brush_bounds == path.Bounds());
+  REQUIRE(std::get<LinearGradient>(linear_stroke.brush.Get()) == linear);
+  REQUIRE(linear_stroke.style == style);
+  const auto& radial_stroke = std::get<StrokePathCommand>(sequence.Commands()[1]);
+  REQUIRE(radial_stroke.brush_bounds == Rect{0.0F, 0.0F, 100.0F, 80.0F});
+  REQUIRE(std::get<RadialGradient>(radial_stroke.brush.Get()) == radial);
+  REQUIRE(radial_stroke.style == style);
+  REQUIRE(sequence.Bounds() == Rect{8.0F, 18.0F, 44.0F, 44.0F});
+}
+
+TEST_CASE("PaintContextValidatesGradientPathStrokesBeforeRecording") {
+  const Path path = Path{}.MoveTo({0.0F, 0.0F}).LineTo({20.0F, 0.0F}).LineTo({10.0F, 10.0F}).Close();
+  const LinearGradient gradient{.stops = {{0.0F, Color::Black()}, {1.0F, Color::White()}}};
+  PaintSequence sequence;
+  PaintContext context(sequence, {0.0F, 0.0F, 20.0F, 10.0F});
+
+  REQUIRE_THROWS_AS(context.StrokePath(Path{}, LinearGradient{}, StrokeStyle{.width = 1.0F}), std::invalid_argument);
+  REQUIRE_THROWS_AS(context.StrokePath(path, gradient, StrokeStyle{.width = -1.0F}), std::invalid_argument);
+  REQUIRE_THROWS_AS(
+      context.StrokePath(path, gradient, {0.0F, 0.0F, -1.0F, 10.0F}, StrokeStyle{.width = 1.0F}),
+      std::invalid_argument
+  );
+  REQUIRE(sequence.Commands().empty());
+
+  context.StrokePath(path, gradient, {0.0F, 0.0F, 0.0F, 10.0F}, StrokeStyle{.width = 1.0F});
+  context.StrokePath(path, gradient, StrokeStyle{.width = 0.0F});
+  context.StrokePath(Path{}, gradient, StrokeStyle{.width = 1.0F});
+  context.Finish();
+
+  REQUIRE(sequence.Commands().empty());
+  REQUIRE(sequence.Bounds().IsEmpty());
+}
+
+TEST_CASE("PaintContextUsesPathCommandsForAsymmetricCornerRadii") {
+  PaintSequence sequence;
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 100.0F, 80.0F}};
+  const CornerRadii corners = CornerRadii::Top(16.0F);
+  context.DrawShadow({10.0F, 10.0F, 60.0F, 40.0F}, Color::Black(), {}, 4.0F, 0.0F, corners);
+  context.DrawRect({10.0F, 10.0F, 60.0F, 40.0F}, Color::White(), corners);
+  context.DrawBorder({10.0F, 10.0F, 60.0F, 40.0F}, Color::Black(), StrokeStyle{.width = 1.0F}, corners);
+  context.PushClip({10.0F, 10.0F, 60.0F, 40.0F}, corners);
+  context.PopClip();
+  context.Finish();
+
+  REQUIRE(std::holds_alternative<DrawPathShadowCommand>(sequence.Commands()[0]));
+  REQUIRE(std::holds_alternative<FillPathCommand>(sequence.Commands()[1]));
+  REQUIRE(std::holds_alternative<StrokePathCommand>(sequence.Commands()[2]));
+  const auto* border = std::get_if<StrokePathCommand>(&sequence.Commands()[2]);
+  REQUIRE(border != nullptr);
+  REQUIRE(border->path.Bounds() == Rect{10.5F, 10.5F, 59.0F, 39.0F});
+  REQUIRE(std::holds_alternative<PushPathClipCommand>(sequence.Commands()[3]));
+  REQUIRE(std::holds_alternative<PopClipCommand>(sequence.Commands()[4]));
+}
+
+TEST_CASE("PaintContextNormalizesStrokeStylesAcrossCommands") {
+  Path path;
+  path.MoveTo({10.0F, 60.0F}).LineTo({70.0F, 60.0F});
+  const StrokeStyle style{
+      .width = 3.0F,
+      .cap = StrokeCap::Round,
+      .join = StrokeJoin::Bevel,
+      .miter_limit = 2.0F,
+      .dash_pattern = {4.0F, 2.0F, 1.0F},
+      .dash_offset = -1.0F,
+  };
+
+  PaintSequence sequence;
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 100.0F, 80.0F}};
+  context.DrawLine({10.0F, 10.0F}, {90.0F, 10.0F}, Color::White(), style);
+  context.DrawArc({30.0F, 30.0F}, 10.0F, 0.0F, std::numbers::pi_v<float>, Color::White(), style);
+  context.DrawBorder({50.0F, 20.0F, 30.0F, 20.0F}, Color::White(), style);
+  context.StrokePath(path, Color::White(), style);
+  context.Finish();
+
+  const StrokeStyle expected{
+      .width = 3.0F,
+      .cap = StrokeCap::Round,
+      .join = StrokeJoin::Bevel,
+      .miter_limit = 2.0F,
+      .dash_pattern = {4.0F, 2.0F, 1.0F, 4.0F, 2.0F, 1.0F},
+      .dash_offset = 13.0F,
+  };
+  REQUIRE(std::get<DrawLineCommand>(sequence.Commands()[0]).style == expected);
+  REQUIRE(std::get<DrawArcCommand>(sequence.Commands()[1]).style == expected);
+  REQUIRE(std::get<DrawBorderCommand>(sequence.Commands()[2]).style == expected);
+  REQUIRE(std::get<StrokePathCommand>(sequence.Commands()[3]).style == expected);
+}
+
+TEST_CASE("PaintContextValidatesAndCanonicalizesStrokeStyles") {
+  const float infinity = std::numeric_limits<float>::infinity();
+  PaintSequence sequence;
+  PaintContext context{sequence, Rect{0.0F, 0.0F, 100.0F, 80.0F}};
+
+  REQUIRE_THROWS_AS(
+      context.DrawLine({}, {}, Color::White(), StrokeStyle{.dash_pattern = {-1.0F, 1.0F}}), std::invalid_argument);
+  REQUIRE_THROWS_AS(
+      context.DrawLine({}, {}, Color::White(), StrokeStyle{.dash_pattern = {infinity, 1.0F}}),
+      std::invalid_argument);
+  REQUIRE_THROWS_AS(context.DrawLine({}, {}, Color::White(), StrokeStyle{.dash_offset = infinity}),
+                    std::invalid_argument);
+  REQUIRE_THROWS_AS(context.DrawLine({}, {}, Color::White(), StrokeStyle{.miter_limit = 0.5F}),
+                    std::invalid_argument);
+  REQUIRE_THROWS_AS(context.DrawLine({}, {}, Color::White(), StrokeStyle{.cap = static_cast<StrokeCap>(99)}),
+                    std::invalid_argument);
+  REQUIRE_THROWS_AS(context.DrawLine({}, {}, Color::White(), StrokeStyle{.join = static_cast<StrokeJoin>(99)}),
+                    std::invalid_argument);
+
+  context.DrawLine({10.0F, 10.0F}, {20.0F, 10.0F}, Color::White(),
+                   StrokeStyle{.miter_limit = 1.0F, .dash_pattern = {0.0F, 0.0F}, .dash_offset = 12.0F});
+  context.Finish();
+  const StrokeStyle& style = std::get<DrawLineCommand>(sequence.Commands().back()).style;
+  REQUIRE(style.miter_limit == 1.0F);
+  REQUIRE(style.dash_pattern.empty());
+  REQUIRE(style.dash_offset == 0.0F);
+}
+
+} // namespace pingcore::test
